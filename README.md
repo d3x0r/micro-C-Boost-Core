@@ -175,13 +175,13 @@ CMake build system for SACK takes care of these typically...
 
 | Flag | Usage |
 |-----|------|
-| __LINUX__ | compile for posix type system.  This should be defaulted if not _WIN32 |
+| \_\_LINUX__ | compile for posix type system.  This should be defaulted if not _WIN32 |
 | _WIN32 | compile for windows platform |
-| __ARM__ | compile targeting arm (some assembly otherwise available is replaced |
-| __MAC__ | comppile targeting Mac; minor differences in SockAddr structure |
-| __NO_LOGGING__ | Disable any internal logging; compiles to `(0);` |
-| __64__ | This should have a good default set; but this sets 64 bit platform target |
-| __ANDROID__ | certain changes for android system |
+| \_\_ARM__ | compile targeting arm (some assembly otherwise available is replaced |
+| \_\_MAC__ | comppile targeting Mac; minor differences in SockAddr structure |
+| \_\_NO_LOGGING__ | Disable any internal logging; compiles to `(0);` |
+| \_\_64__ | This should have a good default set; but this sets 64 bit platform target |
+| \_\_ANDROID__ | certain changes for android system |
 
 ## Behavior
 
