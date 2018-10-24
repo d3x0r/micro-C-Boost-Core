@@ -6,10 +6,17 @@ Tried to host this as a gist; but that didn't work out so well.
 Other Amalgamations
  - [Minimal; just types](https://github.com/d3x0r/micro-C-Boost-Types)
  - [System(Tasks) and File System](https://github.com/d3x0r/micro-C-Boost-FileSystem)
+ - [Netowrking](https://github.com/d3x0r/micro-C-Boost-Network)
+ - [Full Core](https://github.com/d3x0r/micro-C-Boost-Core)
 
-# Metworking
+# Full Core
 
-This includes all of sack_ucb_filelib plus networking.
+This includes all of sack_ucb_filelib plus networking, plus SQL, plus interface
+and virtual file system support.  Includes everything except the image/render libaries and PSI GUI Subsystem.
+
+But those additional peices may be candidates for additional modular builds... The problem with that
+is the inclusion of freetype (does NOT amalgamate), PNG (does not amalgamate), JPEG, zlib, expat, genx.
+
 
 Event based networking abstraction.  Events come in asynchrounsly with the main
 thread. 
@@ -24,6 +31,7 @@ on Windows
  - winmm  - for timeGetTime() (millisecond accurate clock)
  - psapi   - system process info
  - ntdll   - system dll info
+ - odbc32  - Open Data base Connectivity standard DB Interface (SQLite Interface; requires sqlite amalgam)
  - ole32   - file system utility initialization (CoInitialize)
  - ws2_32  - systemlog UDP logging to a syslog receiver uses sockets.
  - iphlpapi - get mac address
@@ -34,7 +42,9 @@ on Linux
  - m
  - dl
  - pthread
- - (openssl)
+ - unixodbc
+ - ext2utils (uuid)
+ - (openssl/libressl)
 
 
 ## Rough Source List / Build Script
