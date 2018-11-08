@@ -136,6 +136,12 @@
 #  if defined( WIN32 ) && defined( NEED_SHLOBJ )
 #    include <shlobj.h>
 #  endif
+#  if _MSC_VER > 1500
+#    define mkdir _mkdir
+#    define fileno _fileno
+#    define stricmp _stricmp
+#    define strdup _strdup
+#  endif
 //#  include <windowsx.h>
 // we like timeGetTime() instead of GetTickCount()
 //#  include <mmsystem.h>
@@ -232,7 +238,8 @@ extern __sighandler_t bsd_signal(int, __sighandler_t);
 #    define max(a,b) (((a)>(b))?(a):(b))
 #  endif
 #endif
-/* please Include sthdrs.h */
+#ifndef SACK_PRIMITIVE_TYPES_INCLUDED
+#define SACK_PRIMITIVE_TYPES_INCLUDED
 /* Define most of the sack core types on which everything else is
    based. Also defines some of the primitive container
    structures. We also handle a lot of platform/compiler
@@ -1066,7 +1073,8 @@ SACK_NAMESPACE
 // cannot declare _0 since that overloads the
 // vector library definition for origin (0,0,0,0,...)
 //typedef void             _0; // totally unusable to declare 0 size things.
-/* the only type other than when used in a function declaration that void is valid is as a pointer to void. no _0 type exists (it does, but it's in vectlib, and is an origin vector)*/
+/* the only type other than when used in a function declaration that void is valid is as a pointer to void. no _0 type exists
+	 (it does, but it's in vectlib, and is an origin vector)*/
 typedef void             *P_0;
 /*
  * several compilers are rather picky about the types of data
@@ -1081,9 +1089,11 @@ typedef unsigned int  BIT_FIELD;
  */
 typedef int  SBIT_FIELD;
 // have to do this on a per structure basis - otherwise
-// any included headers with structures to use will get FUCKED
+// any included headers with structures to use will get
+// padded as normal; this is appended to a strcture
+// and is ued on GCC comiplers for __attribute__((packed))
 #ifndef PACKED
-#define PACKED
+#  define PACKED
 #endif
 /* An pointer to a volatile unsigned integer type that is 64 bits long. */
 //typedef volatile uint64_t  *volatile int64_t*;
@@ -1371,46 +1381,108 @@ SACK_NAMESPACE
 typedef uint64_t THREAD_ID;
 #define GetMyThreadIDNL GetMyThreadID
 #if defined( _WIN32 ) || defined( __CYGWIN__ )
-#define _GetMyThreadID()  ( (( ((uint64_t)GetCurrentProcessId()) << 32 ) | ( (uint64_t)GetCurrentThreadId() ) ) )
-#define GetMyThreadID()  (GetThisThreadID())
+#  define _GetMyThreadID()  ( (( ((uint64_t)GetCurrentProcessId()) << 32 ) | ( (uint64_t)GetCurrentThreadId() ) ) )
+#  define GetMyThreadID()  (GetThisThreadID())
 #else
 // this is now always the case
 // it's a safer solution anyhow...
-#ifndef GETPID_RETURNS_PPID
-#define GETPID_RETURNS_PPID
+#  ifndef GETPID_RETURNS_PPID
+#    define GETPID_RETURNS_PPID
+#  endif
+#  ifdef GETPID_RETURNS_PPID
+#    ifdef __ANDROID__
+#      define GetMyThreadID()  (( ((uint64_t)getpid()) << 32 ) | ( (uint64_t)(gettid()) ) )
+#    else
+#      define GetMyThreadID()  (( ((uint64_t)getpid()) << 32 ) | ( (uint64_t)(pthread_self()) ) )
+#    endif
+#  else
+#    define GetMyThreadID()  (( ((uint64_t)getppid()) << 32 ) | ( (uint64_t)(getpid()|0x40000000)) )
+#  endif
+#    define _GetMyThreadID GetMyThreadID
 #endif
-#ifdef GETPID_RETURNS_PPID
-#ifdef __ANDROID__
-#define GetMyThreadID()  (( ((uint64_t)getpid()) << 32 ) | ( (uint64_t)(gettid()) ) )
-#else
-#define GetMyThreadID()  (( ((uint64_t)getpid()) << 32 ) | ( (uint64_t)(pthread_self()) ) )
-#endif
-#else
-#define GetMyThreadID()  (( ((uint64_t)getppid()) << 32 ) | ( (uint64_t)(getpid()|0x40000000)) )
-#endif
-#define _GetMyThreadID GetMyThreadID
-#endif
-//#error blah
-// general macros for linking lists using
+//---------------------- Declare Link; 'single and a half'ly-linked lists -----------------------
+// Thse macros are for linking and unlininking things in a linked list.
+// The list is basically a singly-linked list, but also references the pointer that
+// is pointing at the current node.  This simplifies insert/remove operations, because
+// the specific list that the node is in, is not required.
+// List heads will always be updated correctly.
+//
+// A few 'tricks' are available, such as
+//     0) These are deemed dangerous; and uncomprehendable by anyone but the maintainer.
+//        use at your own time and expense required to explain WHY these work.
+//     1) when declaring a root node, include another node before it, and it's
+//        simple to make this a circularly linked list.
+//     2) defining DeclareLink at the start of the strcture, the 'me' pointer
+//        also happens to be 'prior', so you can step through the list in both
+//        directions.
+//
+//
+//
+// struct my_node {
+//    DeclareLink( struct my_node );
+//    // ...
+// };
+//
+// that declares
+//      struct my_node *next;  // the next node in list.
+//      struct my_node **me;   // address of the pointer pointing to 'me';
+//
+//
+//  struct my_node *root; // a root of a list of my_node.  It should be initialized to NULL.
+//
+//  struct my_node *newNode = (struct my_node*)malloc( sizeof( *newNode ) );
+//     // does not require next or me to be initiialized.
+//  LinkThing( root, newNode );
+//     // now newNode is in the list.
+//
+//  to remove from a list
+//
+//  struct my_node *someNode; // this should be a pointer to some valid node.
+//  UnlinkThing( someNode );
+//     The new node is now not in the list.
+//
+//  To move one node from one list to another
+//
+//   struct my_node *rootAvail;  // available nodes
+//   struct my_node *rootUsed;   // nodes in use
+//
+//   struct my_node *someNode; // some node in a list
+//   someNode = rootAvail; // get first available.
+//   if( !someNode ) ; // create a new one or abort
+//   RelinkThing( rootUsed, someNode );
+//      'someNode' is removed from its existing list, and added to the 'rootUsed' list.
+//
+// For Declaring the link structure members for lists
 #define DeclareLink( type )  type *next;type **me
-#define RelinkThing( root, node )	   ((( node->me && ( (*node->me)=node->next ) )?	  node->next->me = node->me:0),(node->next = NULL),(node->me = NULL),node),	 ((( node->next = root )?	        (root->me = &node->next):0),	  (node->me = &root),	             (root = node) )
 /* Link a new node into the list.
    Example
    struct mynode
    {
-   DeclareLink( struct mynode );
+       DeclareLink( struct mynode );
    } *node;
-   struct mynode *list;
-   LinkThing( list_root, node );  */
+	struct mynode *list;
+   // node allocation not shown.
+	LinkThing( list_root, node );
+*/
 #define LinkThing( root, node )		     ((( (node)->next = (root) )?	        (((root)->me) = &((node)->next)):0),	  (((node)->me) = &(root)),	             ((root) = (node)) )
-/* Link a node to the end of a list. Link thing inserts the new
-   node as the new head of the list.                            */
+/* Link a node to the end of a list. LinkThing() inserts the new
+ node as the new head of the list.
+ this has to scan the list to find the end, so it is a O(n) operation.
+ All other linked list operations are O(1)
+ */
 #define LinkLast( root, type, node ) if( node ) do { if( !root )	 { root = node; (node)->me=&root; }	 else { type tmp;	 for( tmp = root; tmp->next; tmp = tmp->next );	 tmp->next = (node);	 (node)->me = &tmp->next;	 } } while (0)
 // put 'Thing' after 'node'
+// inserts 'node' after Thing
 #define LinkThingAfter( node, thing )	 ( ( (thing)&&(node))	   ?(((((thing)->next = (node)->next))?((node)->next->me = &(thing)->next):0)	  ,((thing)->me = &(node)->next), ((node)->next = thing))	  :((node)=(thing)) )
 //
 // put 'Thing' before 'node'... so (*node->me) = thing
+// similar to LinkThingAfter but puts the new 'thing'
+// before the 'node' specified.
 #define LinkThingBefore( node, thing )	 {  thing->next = (*node->me);	(*node->me) = thing;    thing->me = node->me;       node->me = &thing->next;     }
+// move a list from one list to another.
+// unlinks node from where it was, inserts at the head of another.
+// this can also be use to reproiritize within the same list.
+#define RelinkThing( root, node )	   ((( node->me && ( (*node->me)=node->next ) )?	  node->next->me = node->me:0),(node->next = NULL),(node->me = NULL),node),	 ((( node->next = root )?	        (root->me = &node->next):0),	  (node->me = &root),	             (root = node) )
 /* Remove a node from a list. Requires only the node. */
 #define UnlinkThing( node )	                      ((( (node) && (node)->me && ( (*(node)->me)=(node)->next ) )?	  (node)->next->me = (node)->me:0),((node)->next = NULL),((node)->me = NULL),(node))
 // this has two expressions duplicated...
@@ -1418,18 +1490,18 @@ typedef uint64_t THREAD_ID;
 // the self-circular link needs to be duplicated.
 // GrabThing is used for nodes which are circularly bound
 #define GrabThing( node )	    ((node)?(((node)->me)?(((*(node)->me)=(node)->next)?	 ((node)->next->me=(node)->me),((node)->me=&(node)->next):NULL):((node)->me=&(node)->next)):NULL)
-/* Go to the next node with links declared by DeclareLink */
+/* Go to the next node with links declared by DeclareLink
+ safe iterator macro that tests if node is valid, which returns
+ the next item in the list, else returns NULL
+ */
 #define NextLink(node) ((node)?(node)->next:NULL)
 // everything else is called a thing... should probably migrate to using this...
 #define NextThing(node) ((node)?(node)->next:NULL)
-//#ifndef FALSE
-//#define FALSE 0
-//#endif
-//#ifndef TRUE
-//#define TRUE (!FALSE)
-//#endif
-/* the default type to use for flag sets - flag sets are arrays of bits which can be toggled on and off by an index. */
-#define FLAGSETTYPE uint32_t
+//----------- FLAG SETS (single bit fields) -----------------
+/* the default type to use for flag sets - flag sets are arrays of bits
+ which can be set/read with/as integer values an index.
+ All of the fields in a maskset are the same width */
+#define FLAGSETTYPE uintmax_t
 /* the number of bits a specific type is.
    Example
    int bit_size_int = FLAGTYPEBITS( int ); */
@@ -1443,17 +1515,33 @@ typedef uint64_t THREAD_ID;
 // declare a set of flags...
 #define FLAGSET(v,n)   FLAGSETTYPE (v)[((n)+FLAGROUND(FLAGSETTYPE))/FLAGTYPEBITS(FLAGSETTYPE)]
 // set a single flag index
-#define SETFLAG(v,n)   ( (v)[(n)/FLAGTYPEBITS((v)[0])] |= 1 << ( (n) & FLAGROUND((v)[0]) ))
+#define SETFLAG(v,n)   ( ( (v)[(n)/FLAGTYPEBITS((v)[0])] |= (FLAGSETTYPE)1 << ( (n) & FLAGROUND((v)[0]) )),1)
 // clear a single flag index
-#define RESETFLAG(v,n) ( (v)[(n)/FLAGTYPEBITS((v)[0])] &= ~( 1 << ( (n) & FLAGROUND((v)[0]) ) ) )
+#define RESETFLAG(v,n) ( ( (v)[(n)/FLAGTYPEBITS((v)[0])] &= ~( (FLAGSETTYPE)1 << ( (n) & FLAGROUND((v)[0]) ) ) ),0)
 // test if a flags is set
-#define TESTFLAG(v,n)  ( (v)[(n)/FLAGTYPEBITS((v)[0])] & ( 1 << ( (n) & FLAGROUND((v)[0]) ) ) )
+//  result is 0 or not; the value returned is the bit shifted within the word, and not always '1'
+#define TESTFLAG(v,n)  ( (v)[(n)/FLAGTYPEBITS((v)[0])] & ( (FLAGSETTYPE)1 << ( (n) & FLAGROUND((v)[0]) ) ) )
 // reverse a flag from 1 to 0 and vice versa
-#define TOGGLEFLAG(v,n)   ( (v)[(n)/FLAGTYPEBITS((v)[0])] ^= 1 << ( (n) & FLAGROUND((v)[0]) ))
+// return value is undefined... and is a whole bunch of flags from some offset...
+// if you want ot toggle and flag and test the result, use TESTGOGGLEFLAG() instead.
+#define TOGGLEFLAG(v,n)   ( (v)[(n)/FLAGTYPEBITS((v)[0])] ^= (FLAGSETTYPE)1 << ( (n) & FLAGROUND((v)[0]) ))
+// Toggle a bit, return the state of the bit after toggling.
+#define TESTTOGGLEFLAG(v,n)  ( TOGGLEFLAG(v,n), TESTFLAG(v,n) )
+//----------- MASK SETS -----------------
+//  MASK Sets are arrays of bit-fields of some bit-width (5, 3, ... )
+//  they are set/returned as integer values.
+//  They are stored-in/accessed via a uint8_t which gives byte-offset calculations.
+// they return their value as uintmax_t from the offset memory address directly;
+//   Some platforms(Arm) may SIGBUS because of wide offset accesses spanning word boundaries.
+//   This issue may be fixed by rounding, grabbing the word aligned values and shifting manually
+// Declarataion/Instantiation of a mask set is done with MASKSET macro below
 // 32 bits max for range on mask
-#define MASK_MAX_LENGTH 32
-// gives a 32 bit mask possible from flagset..
-#define MASKSET_READTYPE uint32_t
+#define MASK_MAX_LENGTH (sizeof(MASKSET_READTYPE)*CHAR_BIT)
+/* gives a 32 bit mask possible from flagset..
+ - updated; return max int possible; but only the low N bits will be set
+ - mask sets are meant for small values, but could be used for like 21 bit fields. (another form of unicode encoding I suppose)
+ */
+#define MASKSET_READTYPE uintmax_t
 // gives byte index...
 #define MASKSETTYPE uint8_t
 /* how many bits the type specified can hold
@@ -1484,38 +1572,27 @@ typedef uint64_t THREAD_ID;
 #define MASK_MASK(n,length)   (MASK_TOP_MASK(length) << (((n)*(length))&0x7) )
 // masks value with the mask size, then applies that mask back to the correct word indexing
 #define MASK_MASK_VAL(n,length,val)   (MASK_TOP_MASK_VAL(length,val) << (((n)*(length))&0x7) )
-/* declare a mask set. */
+/* declare a mask set.
+ MASKSET( maskVariableName
+        , 32 //number of items
+		  , 5 // number of bits per field
+		  );
+   declares
+	uint8_t maskVariableName[ (32*5 +(CHAR_BIT-1))/CHAR_BIT ];  //data array used for storage.
+   const int askVariableName_mask_size = 5;  // used aautomatically by macros
+*/
 #define MASKSET(v,n,r)  MASKSETTYPE  (v)[(((n)*(r))+MASK_MAX_ROUND())/MASKTYPEBITS(MASKSETTYPE)]; const int v##_mask_size = r;
-// set a field index to a value
+/* set a field index to a value
+    SETMASK( askVariableName, 3, 13 );  // set set member 3 to the value '13'
+ */
 #define SETMASK(v,n,val)    (((MASKSET_READTYPE*)((v)+((n)*(v##_mask_size))/MASKTYPEBITS((v)[0])))[0] =    ( ((MASKSET_READTYPE*)((v)+((n)*(v##_mask_size))/MASKTYPEBITS(uint8_t)))[0]                                  & (~(MASK_MASK(n,v##_mask_size))) )	                                                                           | MASK_MASK_VAL(n,v##_mask_size,val) )
-// get the value of a field
-#define GETMASK(v,n)  ( ( ((MASKSET_READTYPE*)((v)+((n)*(v##_mask_size))/MASKTYPEBITS((v)[0])))[0]                                  & MASK_MASK(n,v##_mask_size) )	                                                                           >> (((n)*(v##_mask_size))&0x7))
+/* get the value of a field
+     GETMASK( maskVariableName, 3 );   // returns '13' given the SETMASK() example code.
+ */
+#define GETMASK(v,n)  ( ( ((MASKSET_READTYPE*)((v)+((n)*(v##_mask_size))/MASKTYPEBITS((v)[0])))[0]         & MASK_MASK(n,v##_mask_size) )	                                                                           >> (((n)*(v##_mask_size))&0x7))
 /* This type stores data, it has a self-contained length in
    bytes of the data stored.  Length is in characters       */
 _CONTAINER_NAMESPACE
-#define DECLDATA(name,length) struct {size_t size; TEXTCHAR data[length];} name
-// Hmm - this can be done with MemLib alone...
-// although this library is not nessecarily part of that?
-// and it's not nessecarily allocated.
-typedef struct SimpleDataBlock {
-   size_t size;
-/* unsigned size; size is sometimes a pointer value... this
-                    means bad thing when we change platforms... Defined as
-                    uintptr_t now, so it's relative to the size of the platform
-                    anyhow.                                                    */
-#ifdef _MSC_VER
-#pragma warning (disable:4200)
-#endif
-   uint8_t  data[
-#ifndef __cplusplus
-   1
-#endif
- // beginning of var data - this is created size+sizeof(uint8_t)
-   ];
-#ifdef _MSC_VER
-#pragma warning (default:4200)
-#endif
-} DATA, *PDATA;
 /* This is a slab array of pointers, each pointer may be
    assigned to point to any user data.
    Remarks
@@ -2968,6 +3045,9 @@ enum TextFlags {
 // flag combinatoin which represents actual data is present even with 0 size
 // extended format operations (position, ops) are also considered data.
 #define IS_DATA_FLAGS (TF_QUOTE|TF_SQUOTE|TF_BRACKET|TF_BRACE|                              TF_PAREN|TF_TAG|TF_FORMATEX|TF_FORMATABS|TF_FORMATREL)
+// this THis defines/initializes the data part of a PTEXT/TEXT structure.
+// used with DECLTEXTSZTYPE
+#define DECLDATA(name,length) struct {size_t size; TEXTCHAR data[length];} name
 #define DECLTEXTSZTYPE( name, size ) struct {    uint32_t flags;    struct text_segment_tag *Next, *Prior;    FORMAT format;    DECLDATA(data, size); } name
 /* A macro to declare a structure which is the same physically
    as a PTEXT, (for declaring static buffers). Has to be cast to
@@ -4966,6 +5046,7 @@ using namespace sack;
 using namespace sack::containers;
 #endif
 #endif
+#endif
 // incldue this first so we avoid a conflict.
 // hopefully this comes from sack system?
 /*
@@ -5103,7 +5184,7 @@ SYSTEM_PROC( void, DeAttachThreadToLibraries )( LOGICAL attach );
 #define LoadFunction(l,f) LoadFunctionEx(l,f DBG_SRC )
 SYSTEM_PROC( generic_function, LoadPrivateFunctionEx )( CTEXTSTR libname, CTEXTSTR funcname DBG_PASS );
 #define LoadPrivateFunction(l,f) LoadPrivateFunctionEx(l,f DBG_SRC )
-#define OnLibraryLoad(name)	  __DefineRegistryMethod(WIDE("SACK"),_OnLibraryLoad,WIDE("system/library"),WIDE("load_event"),name WIDE("_LoadEvent"),void,(void), __LINE__)
+#define OnLibraryLoad(name)	  DefineRegistryMethod(WIDE("SACK"),_OnLibraryLoad,WIDE("system/library"),WIDE("load_event"),name WIDE("_LoadEvent"),void,(void), __LINE__)
 // the callback passed will be called during LoadLibrary to allow an external
 // handler to download or extract the library; the resulting library should also
 // be loaded by the callback using the standard 'LoadFunction' methods
@@ -5385,6 +5466,9 @@ struct critical_section_tag {
  // ID of thread waiting for this..
 	THREAD_ID dwThreadWaiting;
 #ifdef DEBUG_CRITICAL_SECTIONS
+	// these are not included without a special compile flag
+	// only required by low level deveopers who may be against
+   // undefined behavior.
 #define MAX_SECTION_LOG_QUEUE 16
 	uint32_t bCollisions ;
 	CTEXTSTR pFile[16];
@@ -7081,6 +7165,12 @@ namespace sack {
 #  if defined( WIN32 ) && defined( NEED_SHLOBJ )
 #    include <shlobj.h>
 #  endif
+#  if _MSC_VER > 1500
+#    define mkdir _mkdir
+#    define fileno _fileno
+#    define stricmp _stricmp
+#    define strdup _strdup
+#  endif
 //#  include <windowsx.h>
 // we like timeGetTime() instead of GetTickCount()
 //#  include <mmsystem.h>
@@ -7177,7 +7267,8 @@ extern __sighandler_t bsd_signal(int, __sighandler_t);
 #    define max(a,b) (((a)>(b))?(a):(b))
 #  endif
 #endif
-/* please Include sthdrs.h */
+#ifndef SACK_PRIMITIVE_TYPES_INCLUDED
+#define SACK_PRIMITIVE_TYPES_INCLUDED
 /* Define most of the sack core types on which everything else is
    based. Also defines some of the primitive container
    structures. We also handle a lot of platform/compiler
@@ -8012,7 +8103,8 @@ SACK_NAMESPACE
 // cannot declare _0 since that overloads the
 // vector library definition for origin (0,0,0,0,...)
 //typedef void             _0; // totally unusable to declare 0 size things.
-/* the only type other than when used in a function declaration that void is valid is as a pointer to void. no _0 type exists (it does, but it's in vectlib, and is an origin vector)*/
+/* the only type other than when used in a function declaration that void is valid is as a pointer to void. no _0 type exists
+	 (it does, but it's in vectlib, and is an origin vector)*/
 typedef void             *P_0;
 /*
  * several compilers are rather picky about the types of data
@@ -8027,9 +8119,11 @@ typedef unsigned int  BIT_FIELD;
  */
 typedef int  SBIT_FIELD;
 // have to do this on a per structure basis - otherwise
-// any included headers with structures to use will get FUCKED
+// any included headers with structures to use will get
+// padded as normal; this is appended to a strcture
+// and is ued on GCC comiplers for __attribute__((packed))
 #ifndef PACKED
-#define PACKED
+#  define PACKED
 #endif
 /* An pointer to a volatile unsigned integer type that is 64 bits long. */
 //typedef volatile uint64_t  *volatile int64_t*;
@@ -8317,46 +8411,108 @@ SACK_NAMESPACE
 typedef uint64_t THREAD_ID;
 #define GetMyThreadIDNL GetMyThreadID
 #if defined( _WIN32 ) || defined( __CYGWIN__ )
-#define _GetMyThreadID()  ( (( ((uint64_t)GetCurrentProcessId()) << 32 ) | ( (uint64_t)GetCurrentThreadId() ) ) )
-#define GetMyThreadID()  (GetThisThreadID())
+#  define _GetMyThreadID()  ( (( ((uint64_t)GetCurrentProcessId()) << 32 ) | ( (uint64_t)GetCurrentThreadId() ) ) )
+#  define GetMyThreadID()  (GetThisThreadID())
 #else
 // this is now always the case
 // it's a safer solution anyhow...
-#ifndef GETPID_RETURNS_PPID
-#define GETPID_RETURNS_PPID
+#  ifndef GETPID_RETURNS_PPID
+#    define GETPID_RETURNS_PPID
+#  endif
+#  ifdef GETPID_RETURNS_PPID
+#    ifdef __ANDROID__
+#      define GetMyThreadID()  (( ((uint64_t)getpid()) << 32 ) | ( (uint64_t)(gettid()) ) )
+#    else
+#      define GetMyThreadID()  (( ((uint64_t)getpid()) << 32 ) | ( (uint64_t)(pthread_self()) ) )
+#    endif
+#  else
+#    define GetMyThreadID()  (( ((uint64_t)getppid()) << 32 ) | ( (uint64_t)(getpid()|0x40000000)) )
+#  endif
+#    define _GetMyThreadID GetMyThreadID
 #endif
-#ifdef GETPID_RETURNS_PPID
-#ifdef __ANDROID__
-#define GetMyThreadID()  (( ((uint64_t)getpid()) << 32 ) | ( (uint64_t)(gettid()) ) )
-#else
-#define GetMyThreadID()  (( ((uint64_t)getpid()) << 32 ) | ( (uint64_t)(pthread_self()) ) )
-#endif
-#else
-#define GetMyThreadID()  (( ((uint64_t)getppid()) << 32 ) | ( (uint64_t)(getpid()|0x40000000)) )
-#endif
-#define _GetMyThreadID GetMyThreadID
-#endif
-//#error blah
-// general macros for linking lists using
+//---------------------- Declare Link; 'single and a half'ly-linked lists -----------------------
+// Thse macros are for linking and unlininking things in a linked list.
+// The list is basically a singly-linked list, but also references the pointer that
+// is pointing at the current node.  This simplifies insert/remove operations, because
+// the specific list that the node is in, is not required.
+// List heads will always be updated correctly.
+//
+// A few 'tricks' are available, such as
+//     0) These are deemed dangerous; and uncomprehendable by anyone but the maintainer.
+//        use at your own time and expense required to explain WHY these work.
+//     1) when declaring a root node, include another node before it, and it's
+//        simple to make this a circularly linked list.
+//     2) defining DeclareLink at the start of the strcture, the 'me' pointer
+//        also happens to be 'prior', so you can step through the list in both
+//        directions.
+//
+//
+//
+// struct my_node {
+//    DeclareLink( struct my_node );
+//    // ...
+// };
+//
+// that declares
+//      struct my_node *next;  // the next node in list.
+//      struct my_node **me;   // address of the pointer pointing to 'me';
+//
+//
+//  struct my_node *root; // a root of a list of my_node.  It should be initialized to NULL.
+//
+//  struct my_node *newNode = (struct my_node*)malloc( sizeof( *newNode ) );
+//     // does not require next or me to be initiialized.
+//  LinkThing( root, newNode );
+//     // now newNode is in the list.
+//
+//  to remove from a list
+//
+//  struct my_node *someNode; // this should be a pointer to some valid node.
+//  UnlinkThing( someNode );
+//     The new node is now not in the list.
+//
+//  To move one node from one list to another
+//
+//   struct my_node *rootAvail;  // available nodes
+//   struct my_node *rootUsed;   // nodes in use
+//
+//   struct my_node *someNode; // some node in a list
+//   someNode = rootAvail; // get first available.
+//   if( !someNode ) ; // create a new one or abort
+//   RelinkThing( rootUsed, someNode );
+//      'someNode' is removed from its existing list, and added to the 'rootUsed' list.
+//
+// For Declaring the link structure members for lists
 #define DeclareLink( type )  type *next;type **me
-#define RelinkThing( root, node )	   ((( node->me && ( (*node->me)=node->next ) )?	  node->next->me = node->me:0),(node->next = NULL),(node->me = NULL),node),	 ((( node->next = root )?	        (root->me = &node->next):0),	  (node->me = &root),	             (root = node) )
 /* Link a new node into the list.
    Example
    struct mynode
    {
-   DeclareLink( struct mynode );
+       DeclareLink( struct mynode );
    } *node;
-   struct mynode *list;
-   LinkThing( list_root, node );  */
+	struct mynode *list;
+   // node allocation not shown.
+	LinkThing( list_root, node );
+*/
 #define LinkThing( root, node )		     ((( (node)->next = (root) )?	        (((root)->me) = &((node)->next)):0),	  (((node)->me) = &(root)),	             ((root) = (node)) )
-/* Link a node to the end of a list. Link thing inserts the new
-   node as the new head of the list.                            */
+/* Link a node to the end of a list. LinkThing() inserts the new
+ node as the new head of the list.
+ this has to scan the list to find the end, so it is a O(n) operation.
+ All other linked list operations are O(1)
+ */
 #define LinkLast( root, type, node ) if( node ) do { if( !root )	 { root = node; (node)->me=&root; }	 else { type tmp;	 for( tmp = root; tmp->next; tmp = tmp->next );	 tmp->next = (node);	 (node)->me = &tmp->next;	 } } while (0)
 // put 'Thing' after 'node'
+// inserts 'node' after Thing
 #define LinkThingAfter( node, thing )	 ( ( (thing)&&(node))	   ?(((((thing)->next = (node)->next))?((node)->next->me = &(thing)->next):0)	  ,((thing)->me = &(node)->next), ((node)->next = thing))	  :((node)=(thing)) )
 //
 // put 'Thing' before 'node'... so (*node->me) = thing
+// similar to LinkThingAfter but puts the new 'thing'
+// before the 'node' specified.
 #define LinkThingBefore( node, thing )	 {  thing->next = (*node->me);	(*node->me) = thing;    thing->me = node->me;       node->me = &thing->next;     }
+// move a list from one list to another.
+// unlinks node from where it was, inserts at the head of another.
+// this can also be use to reproiritize within the same list.
+#define RelinkThing( root, node )	   ((( node->me && ( (*node->me)=node->next ) )?	  node->next->me = node->me:0),(node->next = NULL),(node->me = NULL),node),	 ((( node->next = root )?	        (root->me = &node->next):0),	  (node->me = &root),	             (root = node) )
 /* Remove a node from a list. Requires only the node. */
 #define UnlinkThing( node )	                      ((( (node) && (node)->me && ( (*(node)->me)=(node)->next ) )?	  (node)->next->me = (node)->me:0),((node)->next = NULL),((node)->me = NULL),(node))
 // this has two expressions duplicated...
@@ -8364,18 +8520,18 @@ typedef uint64_t THREAD_ID;
 // the self-circular link needs to be duplicated.
 // GrabThing is used for nodes which are circularly bound
 #define GrabThing( node )	    ((node)?(((node)->me)?(((*(node)->me)=(node)->next)?	 ((node)->next->me=(node)->me),((node)->me=&(node)->next):NULL):((node)->me=&(node)->next)):NULL)
-/* Go to the next node with links declared by DeclareLink */
+/* Go to the next node with links declared by DeclareLink
+ safe iterator macro that tests if node is valid, which returns
+ the next item in the list, else returns NULL
+ */
 #define NextLink(node) ((node)?(node)->next:NULL)
 // everything else is called a thing... should probably migrate to using this...
 #define NextThing(node) ((node)?(node)->next:NULL)
-//#ifndef FALSE
-//#define FALSE 0
-//#endif
-//#ifndef TRUE
-//#define TRUE (!FALSE)
-//#endif
-/* the default type to use for flag sets - flag sets are arrays of bits which can be toggled on and off by an index. */
-#define FLAGSETTYPE uint32_t
+//----------- FLAG SETS (single bit fields) -----------------
+/* the default type to use for flag sets - flag sets are arrays of bits
+ which can be set/read with/as integer values an index.
+ All of the fields in a maskset are the same width */
+#define FLAGSETTYPE uintmax_t
 /* the number of bits a specific type is.
    Example
    int bit_size_int = FLAGTYPEBITS( int ); */
@@ -8389,17 +8545,33 @@ typedef uint64_t THREAD_ID;
 // declare a set of flags...
 #define FLAGSET(v,n)   FLAGSETTYPE (v)[((n)+FLAGROUND(FLAGSETTYPE))/FLAGTYPEBITS(FLAGSETTYPE)]
 // set a single flag index
-#define SETFLAG(v,n)   ( (v)[(n)/FLAGTYPEBITS((v)[0])] |= 1 << ( (n) & FLAGROUND((v)[0]) ))
+#define SETFLAG(v,n)   ( ( (v)[(n)/FLAGTYPEBITS((v)[0])] |= (FLAGSETTYPE)1 << ( (n) & FLAGROUND((v)[0]) )),1)
 // clear a single flag index
-#define RESETFLAG(v,n) ( (v)[(n)/FLAGTYPEBITS((v)[0])] &= ~( 1 << ( (n) & FLAGROUND((v)[0]) ) ) )
+#define RESETFLAG(v,n) ( ( (v)[(n)/FLAGTYPEBITS((v)[0])] &= ~( (FLAGSETTYPE)1 << ( (n) & FLAGROUND((v)[0]) ) ) ),0)
 // test if a flags is set
-#define TESTFLAG(v,n)  ( (v)[(n)/FLAGTYPEBITS((v)[0])] & ( 1 << ( (n) & FLAGROUND((v)[0]) ) ) )
+//  result is 0 or not; the value returned is the bit shifted within the word, and not always '1'
+#define TESTFLAG(v,n)  ( (v)[(n)/FLAGTYPEBITS((v)[0])] & ( (FLAGSETTYPE)1 << ( (n) & FLAGROUND((v)[0]) ) ) )
 // reverse a flag from 1 to 0 and vice versa
-#define TOGGLEFLAG(v,n)   ( (v)[(n)/FLAGTYPEBITS((v)[0])] ^= 1 << ( (n) & FLAGROUND((v)[0]) ))
+// return value is undefined... and is a whole bunch of flags from some offset...
+// if you want ot toggle and flag and test the result, use TESTGOGGLEFLAG() instead.
+#define TOGGLEFLAG(v,n)   ( (v)[(n)/FLAGTYPEBITS((v)[0])] ^= (FLAGSETTYPE)1 << ( (n) & FLAGROUND((v)[0]) ))
+// Toggle a bit, return the state of the bit after toggling.
+#define TESTTOGGLEFLAG(v,n)  ( TOGGLEFLAG(v,n), TESTFLAG(v,n) )
+//----------- MASK SETS -----------------
+//  MASK Sets are arrays of bit-fields of some bit-width (5, 3, ... )
+//  they are set/returned as integer values.
+//  They are stored-in/accessed via a uint8_t which gives byte-offset calculations.
+// they return their value as uintmax_t from the offset memory address directly;
+//   Some platforms(Arm) may SIGBUS because of wide offset accesses spanning word boundaries.
+//   This issue may be fixed by rounding, grabbing the word aligned values and shifting manually
+// Declarataion/Instantiation of a mask set is done with MASKSET macro below
 // 32 bits max for range on mask
-#define MASK_MAX_LENGTH 32
-// gives a 32 bit mask possible from flagset..
-#define MASKSET_READTYPE uint32_t
+#define MASK_MAX_LENGTH (sizeof(MASKSET_READTYPE)*CHAR_BIT)
+/* gives a 32 bit mask possible from flagset..
+ - updated; return max int possible; but only the low N bits will be set
+ - mask sets are meant for small values, but could be used for like 21 bit fields. (another form of unicode encoding I suppose)
+ */
+#define MASKSET_READTYPE uintmax_t
 // gives byte index...
 #define MASKSETTYPE uint8_t
 /* how many bits the type specified can hold
@@ -8430,38 +8602,27 @@ typedef uint64_t THREAD_ID;
 #define MASK_MASK(n,length)   (MASK_TOP_MASK(length) << (((n)*(length))&0x7) )
 // masks value with the mask size, then applies that mask back to the correct word indexing
 #define MASK_MASK_VAL(n,length,val)   (MASK_TOP_MASK_VAL(length,val) << (((n)*(length))&0x7) )
-/* declare a mask set. */
+/* declare a mask set.
+ MASKSET( maskVariableName
+        , 32 //number of items
+		  , 5 // number of bits per field
+		  );
+   declares
+	uint8_t maskVariableName[ (32*5 +(CHAR_BIT-1))/CHAR_BIT ];  //data array used for storage.
+   const int askVariableName_mask_size = 5;  // used aautomatically by macros
+*/
 #define MASKSET(v,n,r)  MASKSETTYPE  (v)[(((n)*(r))+MASK_MAX_ROUND())/MASKTYPEBITS(MASKSETTYPE)]; const int v##_mask_size = r;
-// set a field index to a value
+/* set a field index to a value
+    SETMASK( askVariableName, 3, 13 );  // set set member 3 to the value '13'
+ */
 #define SETMASK(v,n,val)    (((MASKSET_READTYPE*)((v)+((n)*(v##_mask_size))/MASKTYPEBITS((v)[0])))[0] =    ( ((MASKSET_READTYPE*)((v)+((n)*(v##_mask_size))/MASKTYPEBITS(uint8_t)))[0]                                  & (~(MASK_MASK(n,v##_mask_size))) )	                                                                           | MASK_MASK_VAL(n,v##_mask_size,val) )
-// get the value of a field
-#define GETMASK(v,n)  ( ( ((MASKSET_READTYPE*)((v)+((n)*(v##_mask_size))/MASKTYPEBITS((v)[0])))[0]                                  & MASK_MASK(n,v##_mask_size) )	                                                                           >> (((n)*(v##_mask_size))&0x7))
+/* get the value of a field
+     GETMASK( maskVariableName, 3 );   // returns '13' given the SETMASK() example code.
+ */
+#define GETMASK(v,n)  ( ( ((MASKSET_READTYPE*)((v)+((n)*(v##_mask_size))/MASKTYPEBITS((v)[0])))[0]         & MASK_MASK(n,v##_mask_size) )	                                                                           >> (((n)*(v##_mask_size))&0x7))
 /* This type stores data, it has a self-contained length in
    bytes of the data stored.  Length is in characters       */
 _CONTAINER_NAMESPACE
-#define DECLDATA(name,length) struct {size_t size; TEXTCHAR data[length];} name
-// Hmm - this can be done with MemLib alone...
-// although this library is not nessecarily part of that?
-// and it's not nessecarily allocated.
-typedef struct SimpleDataBlock {
-   size_t size;
-/* unsigned size; size is sometimes a pointer value... this
-                    means bad thing when we change platforms... Defined as
-                    uintptr_t now, so it's relative to the size of the platform
-                    anyhow.                                                    */
-#ifdef _MSC_VER
-#pragma warning (disable:4200)
-#endif
-   uint8_t  data[
-#ifndef __cplusplus
-   1
-#endif
- // beginning of var data - this is created size+sizeof(uint8_t)
-   ];
-#ifdef _MSC_VER
-#pragma warning (default:4200)
-#endif
-} DATA, *PDATA;
 /* This is a slab array of pointers, each pointer may be
    assigned to point to any user data.
    Remarks
@@ -9914,6 +10075,9 @@ enum TextFlags {
 // flag combinatoin which represents actual data is present even with 0 size
 // extended format operations (position, ops) are also considered data.
 #define IS_DATA_FLAGS (TF_QUOTE|TF_SQUOTE|TF_BRACKET|TF_BRACE|                              TF_PAREN|TF_TAG|TF_FORMATEX|TF_FORMATABS|TF_FORMATREL)
+// this THis defines/initializes the data part of a PTEXT/TEXT structure.
+// used with DECLTEXTSZTYPE
+#define DECLDATA(name,length) struct {size_t size; TEXTCHAR data[length];} name
 #define DECLTEXTSZTYPE( name, size ) struct {    uint32_t flags;    struct text_segment_tag *Next, *Prior;    FORMAT format;    DECLDATA(data, size); } name
 /* A macro to declare a structure which is the same physically
    as a PTEXT, (for declaring static buffers). Has to be cast to
@@ -11912,6 +12076,7 @@ using namespace sack;
 using namespace sack::containers;
 #endif
 #endif
+#endif
 // incldue this first so we avoid a conflict.
 // hopefully this comes from sack system?
 /*
@@ -12049,7 +12214,7 @@ SYSTEM_PROC( void, DeAttachThreadToLibraries )( LOGICAL attach );
 #define LoadFunction(l,f) LoadFunctionEx(l,f DBG_SRC )
 SYSTEM_PROC( generic_function, LoadPrivateFunctionEx )( CTEXTSTR libname, CTEXTSTR funcname DBG_PASS );
 #define LoadPrivateFunction(l,f) LoadPrivateFunctionEx(l,f DBG_SRC )
-#define OnLibraryLoad(name)	  __DefineRegistryMethod(WIDE("SACK"),_OnLibraryLoad,WIDE("system/library"),WIDE("load_event"),name WIDE("_LoadEvent"),void,(void), __LINE__)
+#define OnLibraryLoad(name)	  DefineRegistryMethod(WIDE("SACK"),_OnLibraryLoad,WIDE("system/library"),WIDE("load_event"),name WIDE("_LoadEvent"),void,(void), __LINE__)
 // the callback passed will be called during LoadLibrary to allow an external
 // handler to download or extract the library; the resulting library should also
 // be loaded by the callback using the standard 'LoadFunction' methods
@@ -12331,6 +12496,9 @@ struct critical_section_tag {
  // ID of thread waiting for this..
 	THREAD_ID dwThreadWaiting;
 #ifdef DEBUG_CRITICAL_SECTIONS
+	// these are not included without a special compile flag
+	// only required by low level deveopers who may be against
+   // undefined behavior.
 #define MAX_SECTION_LOG_QUEUE 16
 	uint32_t bCollisions ;
 	CTEXTSTR pFile[16];
@@ -14927,18 +15095,30 @@ PROCREG_PROC( int, ReleaseRegisteredFunctionEx )( PCLASSROOT root
 #else
 #define EXTRA_PRELOAD_SYMBOL
 #endif
-#define ___DefineRegistryMethod2(task,name,classtype,methodname,desc,returntype,argtypes,line)	   CPROC paste(name,line)argtypes;	       PRIORITY_PRELOAD( paste(paste(paste(paste(Register,name),Method),EXTRA_PRELOAD_SYMBOL),line), SQL_PRELOAD_PRIORITY ) {	  SimpleRegisterMethod( task WIDE("/") classtype, paste(name,line)	  , _WIDE(#returntype), methodname, _WIDE(#argtypes) );    RegisterValue( task WIDE("/") classtype WIDE("/") methodname, WIDE("Description"), desc ); }	                                                                          static returntype CPROC paste(name,line)
-#define __DefineRegistryMethod2(task,name,classtype,methodname,desc,returntype,argtypes,line)	   ___DefineRegistryMethod2(task,name,classtype,methodname,desc,returntype,argtypes,line)
-#define ___DefineRegistryMethod2P(priority,task,name,classtype,methodname,desc,returntype,argtypes,line)	   CPROC paste(name,line)argtypes;	       PRIORITY_PRELOAD( paste(paste(paste(paste(Register,name),Method),EXTRA_PRELOAD_SYMBOL),line), priority ) {	  SimpleRegisterMethod( task WIDE("/") classtype, paste(name,line)	  , _WIDE(#returntype), methodname, _WIDE(#argtypes) );    RegisterValue( task WIDE("/") classtype WIDE("/") methodname, WIDE("Description"), desc ); }	                                                                          static returntype CPROC paste(name,line)
-#define __DefineRegistryMethod2P(priority,task,name,classtype,methodname,desc,returntype,argtypes,line)	   ___DefineRegistryMethod2P(priority,task,name,classtype,methodname,desc,returntype,argtypes,line)
-#define ___DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes,line)	   CPROC paste(name,line)argtypes;	       PRELOAD( paste(Register##name##Button##EXTRA_PRELOAD_SYMBOL,line) ) {	  SimpleRegisterMethod( task WIDE("/") classtype WIDE("/") classbase, paste(name,line)	  , _WIDE(#returntype), methodname, _WIDE(#argtypes) ); }	                                                                          static returntype CPROC paste(name,line)
-#define __DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes,line)	   ___DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes,line)
-#define _DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes,line)	   static returntype __DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes,line)
-#define DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes)	  __DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes,__LINE__)
+#define DefineRegistryMethod2_i(task,name,classtype,methodname,desc,returntype,argtypes,line)	   CPROC paste(name,line)argtypes;	       PRIORITY_PRELOAD( paste(paste(paste(paste(Register,name),Method),EXTRA_PRELOAD_SYMBOL),line), SQL_PRELOAD_PRIORITY ) {	  SimpleRegisterMethod( task WIDE("/") classtype, paste(name,line)	  , _WIDE(#returntype), methodname, _WIDE(#argtypes) );    RegisterValue( task WIDE("/") classtype WIDE("/") methodname, WIDE("Description"), desc ); }	                                                                          static returntype CPROC paste(name,line)
+#define DefineRegistryMethod2(task,name,classtype,methodname,desc,returntype,argtypes,line)	   DefineRegistryMethod2_i(task,name,classtype,methodname,desc,returntype,argtypes,line)
+/* Dekware uses this macro.
+     passes preload priority override.
+	 so it can register new internal commands before initial macros are run.
+*/
+#define DefineRegistryMethod2P_i(priority,task,name,classtype,methodname,desc,returntype,argtypes,line)	   CPROC paste(name,line)argtypes;	       PRIORITY_PRELOAD( paste(paste(paste(paste(Register,name),Method),EXTRA_PRELOAD_SYMBOL),line), priority ) {	  SimpleRegisterMethod( task WIDE("/") classtype, paste(name,line)	  , _WIDE(#returntype), methodname, _WIDE(#argtypes) );    RegisterValue( task WIDE("/") classtype WIDE("/") methodname, WIDE("Description"), desc ); }	                                                                          static returntype CPROC paste(name,line)
+/* This macro indirection is to resolve inner macros like WIDE("") around text.  */
+#define DefineRegistryMethod2P(priority,task,name,classtype,methodname,desc,returntype,argtypes,line)	   DefineRegistryMethod2P_i(priority,task,name,classtype,methodname,desc,returntype,argtypes,line)
+/*
+    This method is used by PSI/Intershell.
+	no description
+*/
+#define DefineRegistryMethod_i(task,name,classtype,classbase,methodname,returntype,argtypes,line)	   CPROC paste(name,line)argtypes;	       PRELOAD( paste(Register##name##Button##EXTRA_PRELOAD_SYMBOL,line) ) {	  SimpleRegisterMethod( task WIDE("/") classtype WIDE("/") classbase, paste(name,line)	  , _WIDE(#returntype), methodname, _WIDE(#argtypes) ); }	                                                                          static returntype CPROC paste(name,line)
+#define DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes,line)	   DefineRegistryMethod_i(task,name,classtype,classbase,methodname,returntype,argtypes,line)
+/*
+#define _0_DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes,line)	   static returntype _1__DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes,line)
+#define DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes)	  _1__DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes,__LINE__)
+*/
 // this macro is used for ___DefineRegistryMethodP. Because this is used with complex names
 // an extra define wrapper of priority_preload must be used to fully resolve paramters.
-#define PRIOR_PRELOAD(a,p) PRIORITY_PRELOAD(a,p)
-#define ___DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,line)	   CPROC paste(name,line)argtypes;	       PRIOR_PRELOAD( paste(Register##name##Button##EXTRA_PRELOAD_SYMBOL,line), priority ) {	  SimpleRegisterMethod( task WIDE("/") classtype WIDE("/") classbase, paste(name,line)	  , _WIDE(#returntype), methodname, _WIDE(#argtypes) ); }	                                                                          static returntype CPROC paste(name,line)
+/*
+#define DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,line)	   CPROC paste(name,line)argtypes;	       PRIOR_PRELOAD( paste(Register##name##Button##EXTRA_PRELOAD_SYMBOL,line), priority ) {	  SimpleRegisterMethod( task WIDE("/") classtype WIDE("/") classbase, paste(name,line)	  , _WIDE(#returntype), methodname, _WIDE(#argtypes) ); }	                                                                          static returntype CPROC paste(name,line)
+*/
 /* <combine sack::app::registry::SimpleRegisterMethod>
    General form to build a registered procedure. Used by simple
    macros to create PRELOAD'ed registered functions. This flavor
@@ -14970,11 +15150,13 @@ PROCREG_PROC( int, ReleaseRegisteredFunctionEx )( PCLASSROOT root
    from the registered name.
    Example
    See <link sack::app::registry::GetFirstRegisteredNameEx@PCLASSROOT@CTEXTSTR@PCLASSROOT *, GetFirstRegisteredNameEx> */
-#define __DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,line)	   ___DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,line)
-#define _DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,line)	   __DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,line)
-#define DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes)	  _DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,__LINE__)
-#define _DefineRegistrySubMethod(task,name,classtype,classbase,methodname,subname,returntype,argtypes,line)	   CPROC paste(name,line)argtypes;	       PRELOAD( paste(Register##name##Button##EXTRA_PRELOAD_SYMBOL,line) ) {	  SimpleRegisterMethod( task WIDE("/") classtype WIDE("/") classbase WIDE("/") methodname, paste(name,line)	  , _WIDE(#returntype), subname, _WIDE(#argtypes) ); }	                                                                          static returntype CPROC paste(name,line)
-#define DefineRegistrySubMethod(task,name,classtype,classbase,methodname,subname,returntype,argtypes)	  _DefineRegistrySubMethod(task,name,classtype,classbase,methodname,subname,returntype,argtypes,__LINE__)
+/*
+#define _1__DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,line)	   _2___DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,line)
+#define _0_DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,line)	   _1__DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,line)
+#define DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes)	  _0_DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,__LINE__)
+*/
+#define DefineRegistrySubMethod_i(task,name,classtype,classbase,methodname,subname,returntype,argtypes,line)	   CPROC paste(name,line)argtypes;	       PRELOAD( paste(Register##name##Button##EXTRA_PRELOAD_SYMBOL,line) ) {	  SimpleRegisterMethod( task WIDE("/") classtype WIDE("/") classbase WIDE("/") methodname, paste(name,line)	  , _WIDE(#returntype), subname, _WIDE(#argtypes) ); }	                                                                          static returntype CPROC paste(name,line)
+#define DefineRegistrySubMethod(task,name,classtype,classbase,methodname,subname,returntype,argtypes)	  DefineRegistrySubMethod_i(task,name,classtype,classbase,methodname,subname,returntype,argtypes,__LINE__)
 /* attempts to use dynamic linking functions to resolve passed
    global name if that fails, then a type is registered for this
    global, and an instance created, so that that instance may be
@@ -16390,9 +16572,9 @@ PRIORITY_PRELOAD( InitLocals, NAMESPACE_PRELOAD_PRIORITY + 1 )
 #endif
 #ifdef __cplusplus
  //namespace sack {
-};
+}
  //	namespace containers {
-};
+}
 #endif
 //--------------------------------------------------------------
 // $Log: typecode.c,v $
@@ -19953,10 +20135,10 @@ PRELOAD( initTables ) {
 	int n, m;
 	for( n = 0; n < (sizeof( encodings )-1); n++ )
 		for( m = 0; m < (sizeof( encodings )-1); m++ ) {
-			b64xor_table[encodings[n]][encodings[m]] = encodings[n^m];
-			u8xor_table[n][encodings[m]] = n^m;
-			b64xor_table2[encodings2[n]][encodings2[m]] = encodings2[n^m];
-			u8xor_table2[n][encodings2[m]] = n^m;
+			b64xor_table[(uint8_t)encodings[n]][(uint8_t)encodings[m]] = encodings[n^m];
+			u8xor_table[n][(uint8_t)encodings[m]] = n^m;
+			b64xor_table2[(uint8_t)encodings2[n]][(uint8_t)encodings2[m]] = encodings2[n^m];
+			u8xor_table2[n][(uint8_t)encodings2[m]] = n^m;
 	}
 	//LogBinary( (uint8_t*)u8xor_table[0], sizeof( u8xor_table ) );
 	b64xor_table['=']['='] = '=';
@@ -19965,7 +20147,7 @@ char * b64xor( const char *a, const char *b ) {
 	int n;
 	char *out = NewArray( char, strlen(a) + 1);
 	for( n = 0; a[n]; n++ ) {
-		out[n] = b64xor_table[a[n]][b[n]];
+		out[n] = b64xor_table[(uint8_t)a[n]][(uint8_t)b[n]];
 	}
 	out[n] = 0;
 	return out;
@@ -20108,11 +20290,11 @@ uint8_t *DecodeBase64Ex( char* buf, size_t length, size_t *outsize, const char *
 }
 #ifdef __cplusplus
  //namespace text {
-};
+}
  //namespace containers {
-};
+}
  // namespace sack {
-};
+}
 #endif
 /*
  *
@@ -20748,6 +20930,18 @@ PSSQL_PROC( int, ReadFromNameTableExEx )( INDEX id, CTEXTSTR table, CTEXTSTR id_
 /* <combine sack::sql::ReadFromNameTableEx@INDEX@CTEXTSTR@CTEXTSTR@CTEXTSTR@CTEXTSTR *result>
    \ \                                                                                        */
 #define ReadFromNameTable(id,t,c,r) ReadFromNameTableEx(id,t,c,WIDE("name"),r DBG_SRC )
+/* This is a better name resolution function. It will also
+   create a table that contains the required columns, but the
+   column names may be more intelligent than 'ID' and 'name'.
+   Parameters
+   odbc :     database connection to read from
+   name :     the name to lookup the ID for
+   table :    table the name column is in
+   col :      name of the key column(s) to read.
+   namecol :  name of column containing the name to lookup.
+   bCreate :  if TRUE, will insert the name into the table, and
+              return the resulting columns.                     */
+PSSQL_PROC( TEXTSTR, SQLReadNameTableKeyExEx)( PODBC odbc, CTEXTSTR name, CTEXTSTR table, CTEXTSTR col, CTEXTSTR namecol, int bCreate DBG_PASS );
 /* This is a better name resolution function. It will also
    create a table that contains the required columns, but the
    column names may be more intelligent than 'ID' and 'name'.
@@ -22366,11 +22560,11 @@ uintptr_t ForEachSetMember( GENERICSET *pSet, int unitsize, int max, FESMCallbac
 }
 #ifdef __cplusplus
 //	namespace sets {
-	};
+	}
  //	namespace containers {
-	};
+	}
  //namespace sack {
-};
+}
 #endif
 // $Log: sets.c,v $
 // Revision 1.15  2005/05/20 21:47:10  jim
@@ -23328,11 +23522,11 @@ PTREEROOT ShadowBinaryTree( PTREEROOT Original )
 }
 #ifdef __cplusplus
  // namespace BinaryTree {
-};
+}
  //namespace containers {
-};
+}
  //namespace sack {
-};
+}
 #endif
 //---------------------------------------------------------------------------
 // $Log: binarylist.c,v $
@@ -26844,11 +27038,11 @@ PFAMILYNODE  FamilyTreeAddChild ( PFAMILYTREE *root, PFAMILYNODE parent, POINTER
 }
 #ifdef __cplusplus
  //namespace family {
-};
+}
  //namespace containers {
-};
+}
  //namespace sack {
-};
+}
 #endif
 /* Defines a simple FRACTION type. Fractions are useful for
    scaling one value to another. These operations are handles
@@ -28190,7 +28384,7 @@ struct global_memory_tag global_memory_data = { 0x10000 * 0x08, 1, 1
 #else
 #define BLOCK_TAG(pc)  (*(uint32_t*)((pc)->byData + (pc)->dwSize - (pc)->dwPad ))
 // so when we look at memory this stamp is 12345678
-#define TAG_FORMAT_MODIFIER ""
+#define TAG_FORMAT_MODIFIER "l"
 #define BLOCK_TAG_ID 0x78563412L
 #endif
 // file/line info are at the very end of the physical block...
@@ -28221,10 +28415,10 @@ PRIORITY_PRELOAD( InitGlobal, DEFAULT_PRELOAD_PRIORITY )
 	g.allowLogging = 1;
 }
 #if __GNUC__
+//#  pragma message( "GNUC COMPILER")
 #  ifndef __ATOMIC_RELAXED
 #    define __ATOMIC_RELAXED 0
 #  endif
-//#    define DoXchg  XCHG
 #  ifndef __GNUC_VERSION
 #    define __GNUC_VERSION ( __GNUC__ * 10000 ) + ( __GNUC_MINOR__ * 100 )
 #  endif
@@ -28264,8 +28458,8 @@ uint32_t  LockedExchange( volatile uint32_t* p, uint32_t val )
 	//   return __atomic_exchange_n(p,val,__ATOMIC_RELAXED);
 #  else
 	{
-			// swp is the instruction....
-			uint32_t prior = *p;
+		// swp is the instruction....
+		uint32_t prior = *p;
 		*p = val;
 		return prior;
 	}
@@ -30927,10 +31121,10 @@ void  DebugDumpHeapMemEx ( PMEM pHeap, LOGICAL bVerbose )
 						int minPad = MAGIC_SIZE;
 						if( pMem && !(pMem->dwFlags & HEAP_FLAG_NO_DEBUG) )
 							minPad += MAGIC_SIZE * 2;
-						if( pc->dwPad >= minPad && BLOCK_TAG(pc) != BLOCK_TAG_ID )
+						if( ( pc->dwPad >= minPad ) && ( BLOCK_TAG(pc) != BLOCK_TAG_ID ) )
 						{
 #ifndef NO_LOGGING
-							ll_lprintf( WIDE("memory block: %p %08") TAG_FORMAT_MODIFIER WIDE("x insted of %08")TAG_FORMAT_MODIFIER WIDE("x"), pc->byData, BLOCK_TAG(pc), BLOCK_TAG_ID );
+							ll_lprintf( WIDE("memory block: %p(%p) %08") TAG_FORMAT_MODIFIER WIDE("x instead of %08")TAG_FORMAT_MODIFIER WIDE("x"), pc, pc->byData, BLOCK_TAG(pc), BLOCK_TAG_ID );
 							if( !(pMemCheck->dwFlags & HEAP_FLAG_NO_DEBUG ) )
 							{
 								CTEXTSTR file = BLOCK_FILE(pc);
@@ -33294,6 +33488,8 @@ IMAGE_NAMESPACE_END
 #ifdef _VULKAN_DRIVER
 #  ifdef _WIN32
 #    define VK_USE_PLATFORM_WIN32_KHR
+#  else
+#    define VK_USE_PLATFORM_XCB_KHR
 #  endif
 #  include <vulkan/vulkan.h>
 #endif
@@ -37132,7 +37328,7 @@ enum {
 #define MINGW_SUX
 #endif
 // static void OnBeginShutdown( "Unique Name" )( void ) { /* run shutdown code */ }
-#define OnBeginShutdown(name)	 __DefineRegistryMethod(WIDE("SACK"),BeginShutdown,WIDE("System"),WIDE("Begin Shutdown"),name WIDE("_begin_shutdown"),void,(void),__LINE__)
+#define OnBeginShutdown(name)	 DefineRegistryMethod(WIDE("SACK"),BeginShutdown,WIDE("System"),WIDE("Begin Shutdown"),name WIDE("_begin_shutdown"),void,(void),__LINE__)
 /* function signature for the close callback  which can be specified to handle events to close the display.  see SetCloseHandler. */
 typedef void (CPROC*CloseCallback)( uintptr_t psvUser );
 /* function signature to define hide/restore callback, it just gets the user data of the callback... */
@@ -37887,7 +38083,7 @@ RENDER_PROC( int, UnbindKey )( PRENDERER pRenderer, uint32_t scancode, uint32_t 
    0.                                                          */
 RENDER_PROC( int, IsTouchDisplay )( void );
 // static void OnInputTouch( "Touch Handler" )(
-#define OnSurfaceInput(name)	 __DefineRegistryMethod(WIDE("sack/render"),SurfaceInput,WIDE("surface input"),WIDE("SurfaceInput"),name,void,( int nInputs, PINPUT_POINT pInputs ),__LINE__)
+#define OnSurfaceInput(name)	 DefineRegistryMethod(WIDE("sack/render"),SurfaceInput,WIDE("surface input"),WIDE("SurfaceInput"),name,void,( int nInputs, PINPUT_POINT pInputs ),__LINE__)
 #ifndef PSPRITE_METHOD
 /* Unused. Incomplete. */
 #define PSPRITE_METHOD PSPRITE_METHOD
@@ -38457,17 +38653,17 @@ typedef int check_this_variable;
 	// OnDisplayPause is called on systems that allow the application to suspend its display.
 	// Sleep mode may also trigger such an event, allows application to save state
    // a media player, for instance, may recover unplayed buffers to prepare for resume
-#define OnDisplaySizeChange(name)	 __DefineRegistryMethod(WIDE("sack/render"),OnDisplaySizeChange,WIDE("display"),name,WIDE("on_display_size_change"),void,( uintptr_t psv_redraw, int nDisplay, int32_t x, int32_t y, uint32_t width, uint32_t height ),__LINE__)
+#define OnDisplaySizeChange(name)	 DefineRegistryMethod(WIDE("sack/render"),OnDisplaySizeChange,WIDE("display"),name,WIDE("on_display_size_change"),void,( uintptr_t psv_redraw, int nDisplay, int32_t x, int32_t y, uint32_t width, uint32_t height ),__LINE__)
 // static void OnDisplayPause( WIDE("") )( void )
 	// OnDisplayPause is called on systems that allow the application to suspend its display.
 	// Sleep mode may also trigger such an event, allows application to save state
    // a media player, for instance, may recover unplayed buffers to prepare for resume
-#define OnDisplayPause(name)	 __DefineRegistryMethod(WIDE("sack/render/android"),OnDisplayPause,WIDE("display"),name,WIDE("on_display_pause"),void,(void),__LINE__)
+#define OnDisplayPause(name)	 DefineRegistryMethod(WIDE("sack/render/android"),OnDisplayPause,WIDE("display"),name,WIDE("on_display_pause"),void,(void),__LINE__)
 // static void OnDisplayResume( WIDE("") )( void )
 	// OnDisplayResume is called on systems that allow the application to suspend its display.
 	// Wake from sleep mode may also trigger such an event, allows application to restore saved state
    // a media player, for instance, may continue playing ( it might be good to wait just a little longer than 'now')
-#define OnDisplayResume(name)	 __DefineRegistryMethod(WIDE("sack/render/android"),OnDisplayResume,WIDE("display"),name,WIDE("on_display_resume"),void,(void),__LINE__)
+#define OnDisplayResume(name)	 DefineRegistryMethod(WIDE("sack/render/android"),OnDisplayResume,WIDE("display"),name,WIDE("on_display_resume"),void,(void),__LINE__)
 	struct display_app;
 	struct display_app_local;
 	// static void OnDisplayConnect( WIDE("") )( struct display_app*app, struct display_app_local ***pppLocal )
@@ -38482,9 +38678,9 @@ typedef int check_this_variable;
 	//       //... init local here
 	//  }
 	//
-#define OnDisplayConnect(name)	 __DefineRegistryMethod(WIDE("/sack/render/remote display"),OnDisplayConnect,WIDE("connect"),name,WIDE("new_display_connect"),void,(struct display_app*app, struct display_app_local ***),__LINE__)
+#define OnDisplayConnect(name)	 DefineRegistryMethod(WIDE("/sack/render/remote display"),OnDisplayConnect,WIDE("connect"),name,WIDE("new_display_connect"),void,(struct display_app*app, struct display_app_local ***),__LINE__)
 	// unimplemented.
-#define OnDisplayConnected(name)	 __DefineRegistryMethod(WIDE("/sack/render/remote display"),OnDisplayConnect,WIDE("connect"),name,WIDE("new_display_connected"),void,(struct display_app*app),__LINE__)
+#define OnDisplayConnected(name)	 DefineRegistryMethod(WIDE("/sack/render/remote display"),OnDisplayConnect,WIDE("connect"),name,WIDE("new_display_connected"),void,(struct display_app*app),__LINE__)
 RENDER_NAMESPACE_END
 #ifdef __cplusplus
 #ifdef _D3D_DRIVER
@@ -41266,9 +41462,9 @@ IDLE_PROC( int, IdleFor )( uint32_t dwMilliseconds )
 #undef procs
 #ifdef __cplusplus
  //namespace sack {
-};
+}
  //	namespace idle {
-};
+}
 #endif
 ///////////////////////////////////////////////////////////////////////////
 //
@@ -41285,6 +41481,11 @@ IDLE_PROC( int, IdleFor )( uint32_t dwMilliseconds )
 //
 //  DEBUG FLAGS IN netstruc.h
 //
+#ifndef _DEFAULT_SOURCE
+//#define __USE_MISC
+  // for features.h
+#define _DEFAULT_SOURCE
+#endif
 #define FIX_RELEASE_COM_COLLISION
 #define NO_UNICODE_C
 #define MAIN_PROGRAM
@@ -44305,6 +44506,10 @@ SOCKADDR *CreateRemote( CTEXTSTR lpName,uint16_t nHisPort)
 	{
 		if( lpName )
 		{
+#ifndef h_addr
+#define h_addr h_addr_list[0]
+#define H_ADDR_DEFINED
+#endif
 #ifdef WIN32
 			{
 				struct addrinfo *result;
@@ -44349,8 +44554,8 @@ SOCKADDR *CreateRemote( CTEXTSTR lpName,uint16_t nHisPort)
 						lpsaAddr->sin_family = AF_INET;
            // save IP address from host entry.
 						memcpy( &lpsaAddr->sin_addr.S_un.S_addr,
-							 phe->h_addr,
-							 phe->h_length);
+							    phe->h_addr,
+						       phe->h_length);
 					}
 				}
 				else
@@ -44384,6 +44589,10 @@ SOCKADDR *CreateRemote( CTEXTSTR lpName,uint16_t nHisPort)
 					 phe->h_addr,
 					 phe->h_length);
 			}
+#endif
+#ifdef H_ADDR_DEFINED
+#  undef H_ADDR_DEFINED
+#  undef h_addr
 #endif
 		}
 		else
@@ -45555,7 +45764,7 @@ void AcceptClient(PCLIENT pListen)
 					pNewClient->write.WriteComplete( pNewClient );
 				pNewClient->bWriteComplete = FALSE;
 			}
-			//lprintf( "Is it already closed HERE????");
+			//lprintf( "Is it already closed HERE?""?""?");
 			if( pNewClient->Socket ) {
 #ifdef USE_WSA_EVENTS
 				if( globalNetworkData.flags.bLogNotices )
@@ -47510,9 +47719,9 @@ SACK_NETWORK_NAMESPACE
 typedef struct tagIPHDR
 {
 			// Version and IHL
-	u_char  VIHL;
+	uint8_t  VIHL;
 			// Type Of Service
-	u_char	TOS;
+	uint8_t	TOS;
 			// Total Length
 	short	TotLen;
 				// Identification
@@ -47520,11 +47729,11 @@ typedef struct tagIPHDR
 		// Flags and Fragment Offset
 	short	FlagOff;
 			// Time To Live
-	u_char	TTL;
+	uint8_t	TTL;
 		// Protocol
-	u_char	Protocol;
+	uint8_t	Protocol;
 		// Checksum
-	u_short	Checksum;
+	uint16_t	Checksum;
 	// Internet Address - Source
 	struct	in_addr iaSrc;
 	// Internet Address - Destination
@@ -47534,15 +47743,15 @@ typedef struct tagIPHDR
 typedef struct tagICMPHDR
 {
 			// Type
-	u_char	Type;
+	uint8_t	Type;
 			// Code
-	u_char	Code;
+	uint8_t	Code;
 		// Checksum
-	u_short	Checksum;
+	uint16_t	Checksum;
 				// Identification
-	u_short	ID;
+	uint16_t	ID;
 			// Sequence
-	u_short	Seq;
+	uint16_t	Seq;
 			// Data
 	char	Data;
 }ICMPHDR, *PICMPHDR;
@@ -47573,10 +47782,10 @@ SACK_NETWORK_NAMESPACE
 void Ping(TEXTSTR pstrHost, int maxTTL);
 void ReportError(PVARTEXT pInto, CTEXTSTR pstrFrom);
 int  WaitForEchoReply(SOCKET s, uint32_t dwTime);
-u_short in_cksum(u_short *addr, int len);
+uint16_t in_cksum(uint16_t *addr, int len);
 // ICMP Echo Request/Reply functions
 int		SendEchoRequest(PVARTEXT, SOCKET, SOCKADDR_IN*);
-int	   RecvEchoReply( PVARTEXT, SOCKET, SOCKADDR_IN*, u_char *);
+int	   RecvEchoReply( PVARTEXT, SOCKET, SOCKADDR_IN*, uint8_t *);
 #define MAX_HOPS     128
 #define MAX_NAME_LEN 255
 typedef struct HopEntry_tag{
@@ -47631,7 +47840,7 @@ static LOGICAL DoPingExx( CTEXTSTR pstrHost
 	SOCKADDR_IN saDest;
 	SOCKADDR_IN saSrc;
 	uint64_t	     dwTimeSent;
-	u_char     cTTL;
+	uint8_t     cTTL;
 	int        nLoop;
 	int        nRet, nResult = 0;
 	int        i;
@@ -47697,8 +47906,16 @@ static LOGICAL DoPingExx( CTEXTSTR pstrHost
 		 lpHost = gethostbyname(pstrHost);
 #endif
        if (lpHost)
-       {
-           dwIP = *((u_long *) lpHost->h_addr);
+		 {
+#ifndef h_addr
+#define h_addr h_addr_list[0]
+#define H_ADDR_DEFINED
+#endif
+           dwIP = *((uint32_t *) lpHost->h_addr);
+#ifdef H_ADDR_DEFINED
+#  undef H_ADDR_DEFINED
+#  undef h_addr
+#endif
        }
        else
        {
@@ -48031,15 +48248,15 @@ int SendEchoRequest(PVARTEXT pvtResult, SOCKET s,SOCKADDR_IN *lpstToAddr)
 	echoReq.icmpHdr.Type		= ICMP_ECHOREQ;
 	echoReq.icmpHdr.Code		= 0;
 	echoReq.icmpHdr.Checksum	= 0;
-	echoReq.icmpHdr.ID			= (u_short)(nId++);
-	echoReq.icmpHdr.Seq			= (u_short)(nSeq++);
+	echoReq.icmpHdr.ID			= (uint16_t)(nId++);
+	echoReq.icmpHdr.Seq			= (uint16_t)(nSeq++);
 	// Fill in some data to send
 	for (nRet = 0; nRet < REQ_DATASIZE; nRet++)
 		echoReq.cData[nRet] = (char)(' '+nRet);
 	// Save tick count when sent
 	echoReq.dwTime				= GetCPUTick();
 	// Put data in packet and compute checksum
-	echoReq.icmpHdr.Checksum = in_cksum((u_short *)&echoReq, sizeof(ECHOREQUEST));
+	echoReq.icmpHdr.Checksum = in_cksum((uint16_t *)&echoReq, sizeof(ECHOREQUEST));
 	// Send the echo request
 	nRet = sendto(s,
 				 (char*)&echoReq,
@@ -48055,7 +48272,7 @@ int SendEchoRequest(PVARTEXT pvtResult, SOCKET s,SOCKADDR_IN *lpstToAddr)
 // RecvEchoReply()
 // Receive incoming data
 // and parse out fields
-int RecvEchoReply(PVARTEXT pvtResult, SOCKET s, SOCKADDR_IN *lpsaFrom, u_char *pTTL)
+int RecvEchoReply(PVARTEXT pvtResult, SOCKET s, SOCKADDR_IN *lpsaFrom, uint8_t *pTTL)
 {
 	ECHOREPLY echoReply;
 	int nRet;
@@ -48125,11 +48342,11 @@ int WaitForEchoReply(SOCKET s, uint32_t dwTime)
  * Checksum routine for Internet Protocol family headers (C Version)
  *
  */
-u_short in_cksum(u_short *addr, int len)
+uint16_t in_cksum(uint16_t *addr, int len)
 {
 	register int nleft = len;
-	register u_short *w = addr;
-	register u_short answer;
+	register uint16_t *w = addr;
+	register uint16_t answer;
 	register int sum = 0;
 	/*
 	 *  Our algorithm is simple, using a 32 bit accumulator (sum),
@@ -48143,8 +48360,8 @@ u_short in_cksum(u_short *addr, int len)
 	}
 	/* mop up an odd byte, if necessary */
 	if( nleft == 1 ) {
-		u_short	u = 0;
-		*(u_char *)(&u) = *(u_char *)w ;
+		uint16_t	u = 0;
+		*(uint8_t *)(&u) = *(uint8_t *)w ;
 		sum += u;
 	}
 	/*
@@ -48152,7 +48369,7 @@ u_short in_cksum(u_short *addr, int len)
 	 */
 	sum = (sum >> 16) + (sum & 0xffff);
 	sum += (sum >> 16);
-	answer = (u_short)(~sum);
+	answer = (uint16_t)(~sum);
 	return (answer);
 }
 SACK_NETWORK_NAMESPACE_END
@@ -48754,7 +48971,7 @@ static LOGICAL ssl_InitLibrary( void ){
 	{
 		SSL_library_init();
 		ssl_global.lock_cs = NewArray( uint32_t, CRYPTO_num_locks() );
-		memset( ssl_global.lock_cs, 0, sizeof( uint32_t ) * CRYPTO_num_locks() );
+		memset( ssl_global.lock_cs, 0, sizeof( CRYPTO_num_locks() ) );
 		CRYPTO_set_locking_callback(win32_locking_callback);
 		CRYPTO_set_id_callback(pthreads_thread_id);
 		//tls_init();
@@ -50218,8 +50435,8 @@ void SetWebSocketDataCompletion( PCLIENT pc, web_socket_completion callback ) {
  *      Please read the file sha1.c for more information.
  *
  */
-#ifndef _SHA1_H_
-#define _SHA1_H_
+#ifndef INCLUDED_SHA1_H_
+#define INCLUDED_SHA1_H_
 #ifdef SHA1_SOURCE
 #define SHA1_PROC(type,name) EXPORT_METHOD type CPROC name
 #else
@@ -51352,7 +51569,7 @@ static void CPROC WebSocketClientClosed( PCLIENT pc )
 		Release( websock );
 	}
 	else
-		lprintf( "websocket handle is gone from socket|" );
+		lprintf( "websocket handle is gone from socket?""?""!" );
 }
 static void CPROC WebSocketClientConnected( PCLIENT pc, int error )
 {
@@ -57098,6 +57315,7 @@ int jsox_parse_add_data( struct jsox_parse_state *state
 							}
 						}
 						pushValue( state, state->elements, &state->val );
+						JSOX_RESET_STATE_VAL();
 					}
 					state->val.value_type = JSOX_VALUE_ARRAY;
 					//state->val.string = NULL;
@@ -57181,6 +57399,7 @@ int jsox_parse_add_data( struct jsox_parse_state *state
 					lprintf( "comma after field value, push field to object: %s", state->val.name );
 #endif
 					state->parse_context = JSOX_CONTEXT_OBJECT_FIELD;
+					state->word = JSOX_WORD_POS_RESET;
 					if( state->val.value_type != JSOX_VALUE_UNSET )
 						pushValue( state, state->elements, &state->val );
 					JSOX_RESET_STATE_VAL();
@@ -57328,6 +57547,12 @@ int jsox_parse_add_data( struct jsox_parse_state *state
 					// but gatherString now just gathers all strings
 				case '"':
 				case '\'':
+					if( state->word == JSOX_WORD_POS_FIELD
+						|| ( state->val.value_type == JSOX_VALUE_STRING
+							 && !state->val.className ) ) {
+						(*output->pos++) = 0;
+						state->val.className = state->val.string;
+					}
 					state->val.string = output->pos;
 					state->gatheringString = TRUE;
 					state->gatheringStringFirstChar = c;
@@ -57908,6 +58133,7 @@ LOGICAL jsox_parse_message( const char * msg
 #endif
 #ifdef __LINUX__
 #include <time.h>
+//#include <linux/time.h> // struct tz
 #endif
 //-----------------------------------------------------------------------
 FILESYS_NAMESPACE
@@ -57989,9 +58215,10 @@ uint64_t GetTimeAsFileTime ( void )
 {
 #if defined( __LINUX__ )
 	struct timeval tmp;
-	struct timezone tz;
+	//struct timezone tz;
 	FILETIME result;
-	gettimeofday( &tmp, &tz );
+//&tz );
+	gettimeofday( &tmp, NULL );
 	result = ( tmp.tv_usec * 10LL ) + ( tmp.tv_sec * 1000LL * 1000LL * 10LL );
 	return result;
 #else
@@ -60530,7 +60757,7 @@ static	size_t CPROC sack_filesys_find_get_size( struct find_cursor *_cursor ) {
 			lprintf( "getsize stat error:%d", errno );
 			return -2;
 		}
-		if( s.st_mode & S_IFREG )
+		if( S_ISREG(s.st_mode) )
 			return s.st_size;
 		return -1;
 	}
@@ -61806,7 +62033,9 @@ uint64_t GetCPUTick(void )
 			uint64_t tick;
 			PREFIX_PACKED struct { uint32_t low, high; } PACKED parts;
 		}tick;
-		//asm( "rdtsc\n" : "=a"(tick.parts.low), "=d"(tick.parts.high) );
+#ifndef PEDANTIC_TEST
+		asm( "rdtsc\n" : "=a"(tick.parts.low), "=d"(tick.parts.high) );
+#endif
 		if( !(*syslog_local).lasttick )
 			(*syslog_local).lasttick = tick.tick;
 		else if( tick.tick < (*syslog_local).lasttick )
@@ -66982,7 +67211,7 @@ void loadMacLibraries(struct local_systemlib_data *init_l) {
     if((path_size = proc_pidpath(pid, path, sizeof(path))))
         path[path_size] = 0;
     else
-        strcpy(path, "????");
+        strcpy(path, "~/");
     //printf("%d: %s\n", pid, path);
     {
 				TEXTCHAR *ext, *ext1;
@@ -67392,7 +67621,7 @@ LOGICAL CPROC StopProgram( PTASK_INFO task )
 #else
 //lprintf( "need to send kill() to signal process to stop" );
 #ifndef PEDANTIC_TEST
-	kill task->pid, SIGINT );
+	kill( task->pid, SIGINT );
 #endif
 #endif
 	return FALSE;
@@ -69348,7 +69577,7 @@ SYSTEM_PROC( PTASK_INFO, LaunchPeerProgramExx )( CTEXTSTR program, CTEXTSTR path
 					}
 					newArgs[n + 1] = (char*)args[n];
 					newArgs[0] = (char*)program;
-					args = newArgs;
+					args = (PCTEXTSTR)newArgs;
 				}
 				char *_program = CStrDup( program );
 				// in case exec fails, we need to
@@ -69818,6 +70047,9 @@ struct procreg_local_tag {
 #ifdef l
 #   undef l
 #endif
+#ifdef __cplusplus
+#  define procreg_local_data  procreg_local_data_pp
+#endif
 #define l (*procreg_local_data)
 static struct procreg_local_tag *procreg_local_data;
 static CTEXTSTR SaveName( CTEXTSTR name );
@@ -70209,7 +70441,7 @@ static void Init( void )
 {
 	// don't call this function, preserves the process line cache, just check the flag and simple skip any call.
 	// use SAFE_INIT();
-#define SAFE_INIT() if( !procreg_local_data ) SimpleRegisterAndCreateGlobalWithInit( procreg_local_data, InitGlobalSpace );
+#define SAFE_INIT() if( !procreg_local_data ) RegisterAndCreateGlobalWithInit( (POINTER*)&procreg_local_data, sizeof( *procreg_local_data ), "procreg_local_data", InitGlobalSpace )
 	SAFE_INIT();
 }
 static void ReadConfiguration( void );
@@ -74811,7 +75043,7 @@ static LOGICAL ExpandVolume( struct volume *vol ) {
 	LOGICAL created;
 	LOGICAL path_checked = FALSE;
 	struct disk* new_disk;
-	size_t oldsize = vol->dwSize;
+	BLOCKINDEX oldsize = (BLOCKINDEX)vol->dwSize;
 	if( vol->read_only ) return TRUE;
 	if( !vol->dwSize ) {
 		{
@@ -76314,8 +76546,8 @@ static void MD5_memset (uint8_t* output, int value, unsigned int len)
  *      Please read the file sha1.c for more information.
  *
  */
-#ifndef _SHA1_H_
-#define _SHA1_H_
+#ifndef INCLUDED_SHA1_H_
+#define INCLUDED_SHA1_H_
 #ifdef SHA1_SOURCE
 #define SHA1_PROC(type,name) EXPORT_METHOD type CPROC name
 #else
@@ -79865,12 +80097,6 @@ using namespace sack::logging;
 using namespace sack::memory;
 using namespace sack::timers;
 using namespace sack::config;
-#endif
-// undef if USE=0
-#ifdef USE_ODBC
-#  if !USE_ODBC
-#    undef USE_ODBC
-#  endif
 #endif
 SQL_NAMESPACE
 #ifdef _cplusplus_cli
@@ -85484,6 +85710,46 @@ TEXTSTR RevertEscapeString( CTEXTSTR name )
 {
 	return SQLReadNameTableExEx( NULL, name, table,col,namecol,bCreate DBG_RELAY );
 }
+ TEXTSTR  SQLReadNameTableKeyExEx( PODBC odbc, CTEXTSTR name, CTEXTSTR table, CTEXTSTR col, CTEXTSTR namecol, int bCreate DBG_PASS )
+ {
+	 TEXTCHAR query[256];
+	 TEXTCHAR *tmp;
+	 CTEXTSTR result = NULL;
+	 TEXTSTR IDName = NULL;
+	 if( !table || !name )
+		 return IDName;
+	 // look in internal cache first...
+	 IDName = (TEXTSTR)GetKeyOfName( odbc, table, name );
+	 if( IDName != NULL )
+		 return IDName;
+	 PushSQLQueryEx( odbc );
+	 tmp = EscapeSQLStringEx( odbc, name DBG_RELAY );
+	 tnprintf( query, sizeof( query ), WIDE( "select %s from %s where %s like \'%s\'" ), col ? col : WIDE( "id" ), table, namecol, tmp );
+	 Release( tmp );
+	 if( SQLQueryEx( odbc, query, &result DBG_RELAY ) && result ) {
+		 IDName = StrDup( result );
+	 }
+	 else if( bCreate ) {
+		 TEXTSTR newval = EscapeSQLString( odbc, name );
+		 tnprintf( query, sizeof( query ), WIDE( "insert into %s (%s) values( \'%s\' )" ), table, namecol, newval );
+		 if( !SQLCommandEx( odbc, query DBG_RELAY ) ) {
+			 lprintf( WIDE( "insert failed, how can we define name %s?" ), name );
+			 // inser failed...
+		 }
+		 else {
+			 // all is well.
+			 IDName = (TEXTSTR)FetchLastInsertKeyEx( odbc, table, col ? col : WIDE( "id" ) DBG_RELAY );
+		 }
+		 Release( newval );
+	 }
+	 PopODBCEx( odbc );
+	 if( IDName ) {
+		 // instead of strdup, consider here using SaveName from procreg?
+		 AddBinaryNode( GetTableCache( odbc, table ), IDName
+			 , (uintptr_t)StrDup( name ) );
+	 }
+	 return IDName;
+ }
 //---------------------------------------------------------------------------
  INDEX  ReadNameTableEx( CTEXTSTR name, CTEXTSTR table, CTEXTSTR col DBG_PASS )
 {
@@ -90772,7 +91038,6 @@ void SaveTranslationDataToFile( FILE *output )
 	sack_fprintf( output, "{\n" );
 	{
 		INDEX idx;
-		LOGICAL firstTranslation = TRUE;
 		LOGICAL first = TRUE;
 		//TEXTCHAR *string;
 		struct translation *translation;

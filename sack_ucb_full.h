@@ -124,6 +124,12 @@
 #  if defined( WIN32 ) && defined( NEED_SHLOBJ )
 #    include <shlobj.h>
 #  endif
+#  if _MSC_VER > 1500
+#    define mkdir _mkdir
+#    define fileno _fileno
+#    define stricmp _stricmp
+#    define strdup _strdup
+#  endif
 //#  include <windowsx.h>
 // we like timeGetTime() instead of GetTickCount()
 //#  include <mmsystem.h>
@@ -220,7 +226,8 @@ extern __sighandler_t bsd_signal(int, __sighandler_t);
 #    define max(a,b) (((a)>(b))?(a):(b))
 #  endif
 #endif
-/* please Include sthdrs.h */
+#ifndef SACK_PRIMITIVE_TYPES_INCLUDED
+#define SACK_PRIMITIVE_TYPES_INCLUDED
 /* Define most of the sack core types on which everything else is
    based. Also defines some of the primitive container
    structures. We also handle a lot of platform/compiler
@@ -1055,7 +1062,8 @@ SACK_NAMESPACE
 // cannot declare _0 since that overloads the
 // vector library definition for origin (0,0,0,0,...)
 //typedef void             _0; // totally unusable to declare 0 size things.
-/* the only type other than when used in a function declaration that void is valid is as a pointer to void. no _0 type exists (it does, but it's in vectlib, and is an origin vector)*/
+/* the only type other than when used in a function declaration that void is valid is as a pointer to void. no _0 type exists
+	 (it does, but it's in vectlib, and is an origin vector)*/
 typedef void             *P_0;
 /*
  * several compilers are rather picky about the types of data
@@ -1070,9 +1078,11 @@ typedef unsigned int  BIT_FIELD;
  */
 typedef int  SBIT_FIELD;
 // have to do this on a per structure basis - otherwise
-// any included headers with structures to use will get FUCKED
+// any included headers with structures to use will get
+// padded as normal; this is appended to a strcture
+// and is ued on GCC comiplers for __attribute__((packed))
 #ifndef PACKED
-#define PACKED
+#  define PACKED
 #endif
 /* An pointer to a volatile unsigned integer type that is 64 bits long. */
 //typedef volatile uint64_t  *volatile int64_t*;
@@ -1360,46 +1370,108 @@ SACK_NAMESPACE
 typedef uint64_t THREAD_ID;
 #define GetMyThreadIDNL GetMyThreadID
 #if defined( _WIN32 ) || defined( __CYGWIN__ )
-#define _GetMyThreadID()  ( (( ((uint64_t)GetCurrentProcessId()) << 32 ) | ( (uint64_t)GetCurrentThreadId() ) ) )
-#define GetMyThreadID()  (GetThisThreadID())
+#  define _GetMyThreadID()  ( (( ((uint64_t)GetCurrentProcessId()) << 32 ) | ( (uint64_t)GetCurrentThreadId() ) ) )
+#  define GetMyThreadID()  (GetThisThreadID())
 #else
 // this is now always the case
 // it's a safer solution anyhow...
-#ifndef GETPID_RETURNS_PPID
-#define GETPID_RETURNS_PPID
+#  ifndef GETPID_RETURNS_PPID
+#    define GETPID_RETURNS_PPID
+#  endif
+#  ifdef GETPID_RETURNS_PPID
+#    ifdef __ANDROID__
+#      define GetMyThreadID()  (( ((uint64_t)getpid()) << 32 ) | ( (uint64_t)(gettid()) ) )
+#    else
+#      define GetMyThreadID()  (( ((uint64_t)getpid()) << 32 ) | ( (uint64_t)(pthread_self()) ) )
+#    endif
+#  else
+#    define GetMyThreadID()  (( ((uint64_t)getppid()) << 32 ) | ( (uint64_t)(getpid()|0x40000000)) )
+#  endif
+#    define _GetMyThreadID GetMyThreadID
 #endif
-#ifdef GETPID_RETURNS_PPID
-#ifdef __ANDROID__
-#define GetMyThreadID()  (( ((uint64_t)getpid()) << 32 ) | ( (uint64_t)(gettid()) ) )
-#else
-#define GetMyThreadID()  (( ((uint64_t)getpid()) << 32 ) | ( (uint64_t)(pthread_self()) ) )
-#endif
-#else
-#define GetMyThreadID()  (( ((uint64_t)getppid()) << 32 ) | ( (uint64_t)(getpid()|0x40000000)) )
-#endif
-#define _GetMyThreadID GetMyThreadID
-#endif
-//#error blah
-// general macros for linking lists using
+//---------------------- Declare Link; 'single and a half'ly-linked lists -----------------------
+// Thse macros are for linking and unlininking things in a linked list.
+// The list is basically a singly-linked list, but also references the pointer that
+// is pointing at the current node.  This simplifies insert/remove operations, because
+// the specific list that the node is in, is not required.
+// List heads will always be updated correctly.
+//
+// A few 'tricks' are available, such as
+//     0) These are deemed dangerous; and uncomprehendable by anyone but the maintainer.
+//        use at your own time and expense required to explain WHY these work.
+//     1) when declaring a root node, include another node before it, and it's
+//        simple to make this a circularly linked list.
+//     2) defining DeclareLink at the start of the strcture, the 'me' pointer
+//        also happens to be 'prior', so you can step through the list in both
+//        directions.
+//
+//
+//
+// struct my_node {
+//    DeclareLink( struct my_node );
+//    // ...
+// };
+//
+// that declares
+//      struct my_node *next;  // the next node in list.
+//      struct my_node **me;   // address of the pointer pointing to 'me';
+//
+//
+//  struct my_node *root; // a root of a list of my_node.  It should be initialized to NULL.
+//
+//  struct my_node *newNode = (struct my_node*)malloc( sizeof( *newNode ) );
+//     // does not require next or me to be initiialized.
+//  LinkThing( root, newNode );
+//     // now newNode is in the list.
+//
+//  to remove from a list
+//
+//  struct my_node *someNode; // this should be a pointer to some valid node.
+//  UnlinkThing( someNode );
+//     The new node is now not in the list.
+//
+//  To move one node from one list to another
+//
+//   struct my_node *rootAvail;  // available nodes
+//   struct my_node *rootUsed;   // nodes in use
+//
+//   struct my_node *someNode; // some node in a list
+//   someNode = rootAvail; // get first available.
+//   if( !someNode ) ; // create a new one or abort
+//   RelinkThing( rootUsed, someNode );
+//      'someNode' is removed from its existing list, and added to the 'rootUsed' list.
+//
+// For Declaring the link structure members for lists
 #define DeclareLink( type )  type *next;type **me
-#define RelinkThing( root, node )	   ((( node->me && ( (*node->me)=node->next ) )?	  node->next->me = node->me:0),(node->next = NULL),(node->me = NULL),node),	 ((( node->next = root )?	        (root->me = &node->next):0),	  (node->me = &root),	             (root = node) )
 /* Link a new node into the list.
    Example
    struct mynode
    {
-   DeclareLink( struct mynode );
+       DeclareLink( struct mynode );
    } *node;
-   struct mynode *list;
-   LinkThing( list_root, node );  */
+	struct mynode *list;
+   // node allocation not shown.
+	LinkThing( list_root, node );
+*/
 #define LinkThing( root, node )		     ((( (node)->next = (root) )?	        (((root)->me) = &((node)->next)):0),	  (((node)->me) = &(root)),	             ((root) = (node)) )
-/* Link a node to the end of a list. Link thing inserts the new
-   node as the new head of the list.                            */
+/* Link a node to the end of a list. LinkThing() inserts the new
+ node as the new head of the list.
+ this has to scan the list to find the end, so it is a O(n) operation.
+ All other linked list operations are O(1)
+ */
 #define LinkLast( root, type, node ) if( node ) do { if( !root )	 { root = node; (node)->me=&root; }	 else { type tmp;	 for( tmp = root; tmp->next; tmp = tmp->next );	 tmp->next = (node);	 (node)->me = &tmp->next;	 } } while (0)
 // put 'Thing' after 'node'
+// inserts 'node' after Thing
 #define LinkThingAfter( node, thing )	 ( ( (thing)&&(node))	   ?(((((thing)->next = (node)->next))?((node)->next->me = &(thing)->next):0)	  ,((thing)->me = &(node)->next), ((node)->next = thing))	  :((node)=(thing)) )
 //
 // put 'Thing' before 'node'... so (*node->me) = thing
+// similar to LinkThingAfter but puts the new 'thing'
+// before the 'node' specified.
 #define LinkThingBefore( node, thing )	 {  thing->next = (*node->me);	(*node->me) = thing;    thing->me = node->me;       node->me = &thing->next;     }
+// move a list from one list to another.
+// unlinks node from where it was, inserts at the head of another.
+// this can also be use to reproiritize within the same list.
+#define RelinkThing( root, node )	   ((( node->me && ( (*node->me)=node->next ) )?	  node->next->me = node->me:0),(node->next = NULL),(node->me = NULL),node),	 ((( node->next = root )?	        (root->me = &node->next):0),	  (node->me = &root),	             (root = node) )
 /* Remove a node from a list. Requires only the node. */
 #define UnlinkThing( node )	                      ((( (node) && (node)->me && ( (*(node)->me)=(node)->next ) )?	  (node)->next->me = (node)->me:0),((node)->next = NULL),((node)->me = NULL),(node))
 // this has two expressions duplicated...
@@ -1407,18 +1479,18 @@ typedef uint64_t THREAD_ID;
 // the self-circular link needs to be duplicated.
 // GrabThing is used for nodes which are circularly bound
 #define GrabThing( node )	    ((node)?(((node)->me)?(((*(node)->me)=(node)->next)?	 ((node)->next->me=(node)->me),((node)->me=&(node)->next):NULL):((node)->me=&(node)->next)):NULL)
-/* Go to the next node with links declared by DeclareLink */
+/* Go to the next node with links declared by DeclareLink
+ safe iterator macro that tests if node is valid, which returns
+ the next item in the list, else returns NULL
+ */
 #define NextLink(node) ((node)?(node)->next:NULL)
 // everything else is called a thing... should probably migrate to using this...
 #define NextThing(node) ((node)?(node)->next:NULL)
-//#ifndef FALSE
-//#define FALSE 0
-//#endif
-//#ifndef TRUE
-//#define TRUE (!FALSE)
-//#endif
-/* the default type to use for flag sets - flag sets are arrays of bits which can be toggled on and off by an index. */
-#define FLAGSETTYPE uint32_t
+//----------- FLAG SETS (single bit fields) -----------------
+/* the default type to use for flag sets - flag sets are arrays of bits
+ which can be set/read with/as integer values an index.
+ All of the fields in a maskset are the same width */
+#define FLAGSETTYPE uintmax_t
 /* the number of bits a specific type is.
    Example
    int bit_size_int = FLAGTYPEBITS( int ); */
@@ -1432,17 +1504,33 @@ typedef uint64_t THREAD_ID;
 // declare a set of flags...
 #define FLAGSET(v,n)   FLAGSETTYPE (v)[((n)+FLAGROUND(FLAGSETTYPE))/FLAGTYPEBITS(FLAGSETTYPE)]
 // set a single flag index
-#define SETFLAG(v,n)   ( (v)[(n)/FLAGTYPEBITS((v)[0])] |= 1 << ( (n) & FLAGROUND((v)[0]) ))
+#define SETFLAG(v,n)   ( ( (v)[(n)/FLAGTYPEBITS((v)[0])] |= (FLAGSETTYPE)1 << ( (n) & FLAGROUND((v)[0]) )),1)
 // clear a single flag index
-#define RESETFLAG(v,n) ( (v)[(n)/FLAGTYPEBITS((v)[0])] &= ~( 1 << ( (n) & FLAGROUND((v)[0]) ) ) )
+#define RESETFLAG(v,n) ( ( (v)[(n)/FLAGTYPEBITS((v)[0])] &= ~( (FLAGSETTYPE)1 << ( (n) & FLAGROUND((v)[0]) ) ) ),0)
 // test if a flags is set
-#define TESTFLAG(v,n)  ( (v)[(n)/FLAGTYPEBITS((v)[0])] & ( 1 << ( (n) & FLAGROUND((v)[0]) ) ) )
+//  result is 0 or not; the value returned is the bit shifted within the word, and not always '1'
+#define TESTFLAG(v,n)  ( (v)[(n)/FLAGTYPEBITS((v)[0])] & ( (FLAGSETTYPE)1 << ( (n) & FLAGROUND((v)[0]) ) ) )
 // reverse a flag from 1 to 0 and vice versa
-#define TOGGLEFLAG(v,n)   ( (v)[(n)/FLAGTYPEBITS((v)[0])] ^= 1 << ( (n) & FLAGROUND((v)[0]) ))
+// return value is undefined... and is a whole bunch of flags from some offset...
+// if you want ot toggle and flag and test the result, use TESTGOGGLEFLAG() instead.
+#define TOGGLEFLAG(v,n)   ( (v)[(n)/FLAGTYPEBITS((v)[0])] ^= (FLAGSETTYPE)1 << ( (n) & FLAGROUND((v)[0]) ))
+// Toggle a bit, return the state of the bit after toggling.
+#define TESTTOGGLEFLAG(v,n)  ( TOGGLEFLAG(v,n), TESTFLAG(v,n) )
+//----------- MASK SETS -----------------
+//  MASK Sets are arrays of bit-fields of some bit-width (5, 3, ... )
+//  they are set/returned as integer values.
+//  They are stored-in/accessed via a uint8_t which gives byte-offset calculations.
+// they return their value as uintmax_t from the offset memory address directly;
+//   Some platforms(Arm) may SIGBUS because of wide offset accesses spanning word boundaries.
+//   This issue may be fixed by rounding, grabbing the word aligned values and shifting manually
+// Declarataion/Instantiation of a mask set is done with MASKSET macro below
 // 32 bits max for range on mask
-#define MASK_MAX_LENGTH 32
-// gives a 32 bit mask possible from flagset..
-#define MASKSET_READTYPE uint32_t
+#define MASK_MAX_LENGTH (sizeof(MASKSET_READTYPE)*CHAR_BIT)
+/* gives a 32 bit mask possible from flagset..
+ - updated; return max int possible; but only the low N bits will be set
+ - mask sets are meant for small values, but could be used for like 21 bit fields. (another form of unicode encoding I suppose)
+ */
+#define MASKSET_READTYPE uintmax_t
 // gives byte index...
 #define MASKSETTYPE uint8_t
 /* how many bits the type specified can hold
@@ -1473,38 +1561,27 @@ typedef uint64_t THREAD_ID;
 #define MASK_MASK(n,length)   (MASK_TOP_MASK(length) << (((n)*(length))&0x7) )
 // masks value with the mask size, then applies that mask back to the correct word indexing
 #define MASK_MASK_VAL(n,length,val)   (MASK_TOP_MASK_VAL(length,val) << (((n)*(length))&0x7) )
-/* declare a mask set. */
+/* declare a mask set.
+ MASKSET( maskVariableName
+        , 32 //number of items
+		  , 5 // number of bits per field
+		  );
+   declares
+	uint8_t maskVariableName[ (32*5 +(CHAR_BIT-1))/CHAR_BIT ];  //data array used for storage.
+   const int askVariableName_mask_size = 5;  // used aautomatically by macros
+*/
 #define MASKSET(v,n,r)  MASKSETTYPE  (v)[(((n)*(r))+MASK_MAX_ROUND())/MASKTYPEBITS(MASKSETTYPE)]; const int v##_mask_size = r;
-// set a field index to a value
+/* set a field index to a value
+    SETMASK( askVariableName, 3, 13 );  // set set member 3 to the value '13'
+ */
 #define SETMASK(v,n,val)    (((MASKSET_READTYPE*)((v)+((n)*(v##_mask_size))/MASKTYPEBITS((v)[0])))[0] =    ( ((MASKSET_READTYPE*)((v)+((n)*(v##_mask_size))/MASKTYPEBITS(uint8_t)))[0]                                  & (~(MASK_MASK(n,v##_mask_size))) )	                                                                           | MASK_MASK_VAL(n,v##_mask_size,val) )
-// get the value of a field
-#define GETMASK(v,n)  ( ( ((MASKSET_READTYPE*)((v)+((n)*(v##_mask_size))/MASKTYPEBITS((v)[0])))[0]                                  & MASK_MASK(n,v##_mask_size) )	                                                                           >> (((n)*(v##_mask_size))&0x7))
+/* get the value of a field
+     GETMASK( maskVariableName, 3 );   // returns '13' given the SETMASK() example code.
+ */
+#define GETMASK(v,n)  ( ( ((MASKSET_READTYPE*)((v)+((n)*(v##_mask_size))/MASKTYPEBITS((v)[0])))[0]         & MASK_MASK(n,v##_mask_size) )	                                                                           >> (((n)*(v##_mask_size))&0x7))
 /* This type stores data, it has a self-contained length in
    bytes of the data stored.  Length is in characters       */
 _CONTAINER_NAMESPACE
-#define DECLDATA(name,length) struct {size_t size; TEXTCHAR data[length];} name
-// Hmm - this can be done with MemLib alone...
-// although this library is not nessecarily part of that?
-// and it's not nessecarily allocated.
-typedef struct SimpleDataBlock {
-   size_t size;
-/* unsigned size; size is sometimes a pointer value... this
-                    means bad thing when we change platforms... Defined as
-                    uintptr_t now, so it's relative to the size of the platform
-                    anyhow.                                                    */
-#ifdef _MSC_VER
-#pragma warning (disable:4200)
-#endif
-   uint8_t  data[
-#ifndef __cplusplus
-   1
-#endif
- // beginning of var data - this is created size+sizeof(uint8_t)
-   ];
-#ifdef _MSC_VER
-#pragma warning (default:4200)
-#endif
-} DATA, *PDATA;
 /* This is a slab array of pointers, each pointer may be
    assigned to point to any user data.
    Remarks
@@ -2957,6 +3034,9 @@ enum TextFlags {
 // flag combinatoin which represents actual data is present even with 0 size
 // extended format operations (position, ops) are also considered data.
 #define IS_DATA_FLAGS (TF_QUOTE|TF_SQUOTE|TF_BRACKET|TF_BRACE|                              TF_PAREN|TF_TAG|TF_FORMATEX|TF_FORMATABS|TF_FORMATREL)
+// this THis defines/initializes the data part of a PTEXT/TEXT structure.
+// used with DECLTEXTSZTYPE
+#define DECLDATA(name,length) struct {size_t size; TEXTCHAR data[length];} name
 #define DECLTEXTSZTYPE( name, size ) struct {    uint32_t flags;    struct text_segment_tag *Next, *Prior;    FORMAT format;    DECLDATA(data, size); } name
 /* A macro to declare a structure which is the same physically
    as a PTEXT, (for declaring static buffers). Has to be cast to
@@ -4955,6 +5035,7 @@ using namespace sack;
 using namespace sack::containers;
 #endif
 #endif
+#endif
 // incldue this first so we avoid a conflict.
 // hopefully this comes from sack system?
 /*
@@ -5092,7 +5173,7 @@ SYSTEM_PROC( void, DeAttachThreadToLibraries )( LOGICAL attach );
 #define LoadFunction(l,f) LoadFunctionEx(l,f DBG_SRC )
 SYSTEM_PROC( generic_function, LoadPrivateFunctionEx )( CTEXTSTR libname, CTEXTSTR funcname DBG_PASS );
 #define LoadPrivateFunction(l,f) LoadPrivateFunctionEx(l,f DBG_SRC )
-#define OnLibraryLoad(name)	  __DefineRegistryMethod(WIDE("SACK"),_OnLibraryLoad,WIDE("system/library"),WIDE("load_event"),name WIDE("_LoadEvent"),void,(void), __LINE__)
+#define OnLibraryLoad(name)	  DefineRegistryMethod(WIDE("SACK"),_OnLibraryLoad,WIDE("system/library"),WIDE("load_event"),name WIDE("_LoadEvent"),void,(void), __LINE__)
 // the callback passed will be called during LoadLibrary to allow an external
 // handler to download or extract the library; the resulting library should also
 // be loaded by the callback using the standard 'LoadFunction' methods
@@ -5374,6 +5455,9 @@ struct critical_section_tag {
  // ID of thread waiting for this..
 	THREAD_ID dwThreadWaiting;
 #ifdef DEBUG_CRITICAL_SECTIONS
+	// these are not included without a special compile flag
+	// only required by low level deveopers who may be against
+   // undefined behavior.
 #define MAX_SECTION_LOG_QUEUE 16
 	uint32_t bCollisions ;
 	CTEXTSTR pFile[16];
@@ -9165,18 +9249,30 @@ PROCREG_PROC( int, ReleaseRegisteredFunctionEx )( PCLASSROOT root
 #else
 #define EXTRA_PRELOAD_SYMBOL
 #endif
-#define ___DefineRegistryMethod2(task,name,classtype,methodname,desc,returntype,argtypes,line)	   CPROC paste(name,line)argtypes;	       PRIORITY_PRELOAD( paste(paste(paste(paste(Register,name),Method),EXTRA_PRELOAD_SYMBOL),line), SQL_PRELOAD_PRIORITY ) {	  SimpleRegisterMethod( task WIDE("/") classtype, paste(name,line)	  , _WIDE(#returntype), methodname, _WIDE(#argtypes) );    RegisterValue( task WIDE("/") classtype WIDE("/") methodname, WIDE("Description"), desc ); }	                                                                          static returntype CPROC paste(name,line)
-#define __DefineRegistryMethod2(task,name,classtype,methodname,desc,returntype,argtypes,line)	   ___DefineRegistryMethod2(task,name,classtype,methodname,desc,returntype,argtypes,line)
-#define ___DefineRegistryMethod2P(priority,task,name,classtype,methodname,desc,returntype,argtypes,line)	   CPROC paste(name,line)argtypes;	       PRIORITY_PRELOAD( paste(paste(paste(paste(Register,name),Method),EXTRA_PRELOAD_SYMBOL),line), priority ) {	  SimpleRegisterMethod( task WIDE("/") classtype, paste(name,line)	  , _WIDE(#returntype), methodname, _WIDE(#argtypes) );    RegisterValue( task WIDE("/") classtype WIDE("/") methodname, WIDE("Description"), desc ); }	                                                                          static returntype CPROC paste(name,line)
-#define __DefineRegistryMethod2P(priority,task,name,classtype,methodname,desc,returntype,argtypes,line)	   ___DefineRegistryMethod2P(priority,task,name,classtype,methodname,desc,returntype,argtypes,line)
-#define ___DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes,line)	   CPROC paste(name,line)argtypes;	       PRELOAD( paste(Register##name##Button##EXTRA_PRELOAD_SYMBOL,line) ) {	  SimpleRegisterMethod( task WIDE("/") classtype WIDE("/") classbase, paste(name,line)	  , _WIDE(#returntype), methodname, _WIDE(#argtypes) ); }	                                                                          static returntype CPROC paste(name,line)
-#define __DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes,line)	   ___DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes,line)
-#define _DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes,line)	   static returntype __DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes,line)
-#define DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes)	  __DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes,__LINE__)
+#define DefineRegistryMethod2_i(task,name,classtype,methodname,desc,returntype,argtypes,line)	   CPROC paste(name,line)argtypes;	       PRIORITY_PRELOAD( paste(paste(paste(paste(Register,name),Method),EXTRA_PRELOAD_SYMBOL),line), SQL_PRELOAD_PRIORITY ) {	  SimpleRegisterMethod( task WIDE("/") classtype, paste(name,line)	  , _WIDE(#returntype), methodname, _WIDE(#argtypes) );    RegisterValue( task WIDE("/") classtype WIDE("/") methodname, WIDE("Description"), desc ); }	                                                                          static returntype CPROC paste(name,line)
+#define DefineRegistryMethod2(task,name,classtype,methodname,desc,returntype,argtypes,line)	   DefineRegistryMethod2_i(task,name,classtype,methodname,desc,returntype,argtypes,line)
+/* Dekware uses this macro.
+     passes preload priority override.
+	 so it can register new internal commands before initial macros are run.
+*/
+#define DefineRegistryMethod2P_i(priority,task,name,classtype,methodname,desc,returntype,argtypes,line)	   CPROC paste(name,line)argtypes;	       PRIORITY_PRELOAD( paste(paste(paste(paste(Register,name),Method),EXTRA_PRELOAD_SYMBOL),line), priority ) {	  SimpleRegisterMethod( task WIDE("/") classtype, paste(name,line)	  , _WIDE(#returntype), methodname, _WIDE(#argtypes) );    RegisterValue( task WIDE("/") classtype WIDE("/") methodname, WIDE("Description"), desc ); }	                                                                          static returntype CPROC paste(name,line)
+/* This macro indirection is to resolve inner macros like WIDE("") around text.  */
+#define DefineRegistryMethod2P(priority,task,name,classtype,methodname,desc,returntype,argtypes,line)	   DefineRegistryMethod2P_i(priority,task,name,classtype,methodname,desc,returntype,argtypes,line)
+/*
+    This method is used by PSI/Intershell.
+	no description
+*/
+#define DefineRegistryMethod_i(task,name,classtype,classbase,methodname,returntype,argtypes,line)	   CPROC paste(name,line)argtypes;	       PRELOAD( paste(Register##name##Button##EXTRA_PRELOAD_SYMBOL,line) ) {	  SimpleRegisterMethod( task WIDE("/") classtype WIDE("/") classbase, paste(name,line)	  , _WIDE(#returntype), methodname, _WIDE(#argtypes) ); }	                                                                          static returntype CPROC paste(name,line)
+#define DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes,line)	   DefineRegistryMethod_i(task,name,classtype,classbase,methodname,returntype,argtypes,line)
+/*
+#define _0_DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes,line)	   static returntype _1__DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes,line)
+#define DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes)	  _1__DefineRegistryMethod(task,name,classtype,classbase,methodname,returntype,argtypes,__LINE__)
+*/
 // this macro is used for ___DefineRegistryMethodP. Because this is used with complex names
 // an extra define wrapper of priority_preload must be used to fully resolve paramters.
-#define PRIOR_PRELOAD(a,p) PRIORITY_PRELOAD(a,p)
-#define ___DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,line)	   CPROC paste(name,line)argtypes;	       PRIOR_PRELOAD( paste(Register##name##Button##EXTRA_PRELOAD_SYMBOL,line), priority ) {	  SimpleRegisterMethod( task WIDE("/") classtype WIDE("/") classbase, paste(name,line)	  , _WIDE(#returntype), methodname, _WIDE(#argtypes) ); }	                                                                          static returntype CPROC paste(name,line)
+/*
+#define DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,line)	   CPROC paste(name,line)argtypes;	       PRIOR_PRELOAD( paste(Register##name##Button##EXTRA_PRELOAD_SYMBOL,line), priority ) {	  SimpleRegisterMethod( task WIDE("/") classtype WIDE("/") classbase, paste(name,line)	  , _WIDE(#returntype), methodname, _WIDE(#argtypes) ); }	                                                                          static returntype CPROC paste(name,line)
+*/
 /* <combine sack::app::registry::SimpleRegisterMethod>
    General form to build a registered procedure. Used by simple
    macros to create PRELOAD'ed registered functions. This flavor
@@ -9208,11 +9304,13 @@ PROCREG_PROC( int, ReleaseRegisteredFunctionEx )( PCLASSROOT root
    from the registered name.
    Example
    See <link sack::app::registry::GetFirstRegisteredNameEx@PCLASSROOT@CTEXTSTR@PCLASSROOT *, GetFirstRegisteredNameEx> */
-#define __DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,line)	   ___DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,line)
-#define _DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,line)	   __DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,line)
-#define DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes)	  _DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,__LINE__)
-#define _DefineRegistrySubMethod(task,name,classtype,classbase,methodname,subname,returntype,argtypes,line)	   CPROC paste(name,line)argtypes;	       PRELOAD( paste(Register##name##Button##EXTRA_PRELOAD_SYMBOL,line) ) {	  SimpleRegisterMethod( task WIDE("/") classtype WIDE("/") classbase WIDE("/") methodname, paste(name,line)	  , _WIDE(#returntype), subname, _WIDE(#argtypes) ); }	                                                                          static returntype CPROC paste(name,line)
-#define DefineRegistrySubMethod(task,name,classtype,classbase,methodname,subname,returntype,argtypes)	  _DefineRegistrySubMethod(task,name,classtype,classbase,methodname,subname,returntype,argtypes,__LINE__)
+/*
+#define _1__DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,line)	   _2___DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,line)
+#define _0_DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,line)	   _1__DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,line)
+#define DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes)	  _0_DefineRegistryMethodP(priority,task,name,classtype,classbase,methodname,returntype,argtypes,__LINE__)
+*/
+#define DefineRegistrySubMethod_i(task,name,classtype,classbase,methodname,subname,returntype,argtypes,line)	   CPROC paste(name,line)argtypes;	       PRELOAD( paste(Register##name##Button##EXTRA_PRELOAD_SYMBOL,line) ) {	  SimpleRegisterMethod( task WIDE("/") classtype WIDE("/") classbase WIDE("/") methodname, paste(name,line)	  , _WIDE(#returntype), subname, _WIDE(#argtypes) ); }	                                                                          static returntype CPROC paste(name,line)
+#define DefineRegistrySubMethod(task,name,classtype,classbase,methodname,subname,returntype,argtypes)	  DefineRegistrySubMethod_i(task,name,classtype,classbase,methodname,subname,returntype,argtypes,__LINE__)
 /* attempts to use dynamic linking functions to resolve passed
    global name if that fails, then a type is registered for this
    global, and an instance created, so that that instance may be
@@ -11703,6 +11801,18 @@ PSSQL_PROC( int, ReadFromNameTableExEx )( INDEX id, CTEXTSTR table, CTEXTSTR id_
    namecol :  name of column containing the name to lookup.
    bCreate :  if TRUE, will insert the name into the table, and
               return the resulting columns.                     */
+PSSQL_PROC( TEXTSTR, SQLReadNameTableKeyExEx)( PODBC odbc, CTEXTSTR name, CTEXTSTR table, CTEXTSTR col, CTEXTSTR namecol, int bCreate DBG_PASS );
+/* This is a better name resolution function. It will also
+   create a table that contains the required columns, but the
+   column names may be more intelligent than 'ID' and 'name'.
+   Parameters
+   odbc :     database connection to read from
+   name :     the name to lookup the ID for
+   table :    table the name column is in
+   col :      name of the key column(s) to read.
+   namecol :  name of column containing the name to lookup.
+   bCreate :  if TRUE, will insert the name into the table, and
+              return the resulting columns.                     */
 PSSQL_PROC( INDEX, SQLReadNameTableExEx)( PODBC odbc, CTEXTSTR name, CTEXTSTR table, CTEXTSTR col, CTEXTSTR namecol, int bCreate DBG_PASS );
 /* <combine sack::sql::SQLReadNameTableExEx@PODBC@CTEXTSTR@CTEXTSTR@CTEXTSTR@CTEXTSTR@int bCreate>
    \ \                                                                                             */
@@ -12842,8 +12952,8 @@ MD5_PROC( void, MD5Final )(unsigned char [16], MD5_CTX *);
  *      Please read the file sha1.c for more information.
  *
  */
-#ifndef _SHA1_H_
-#define _SHA1_H_
+#ifndef INCLUDED_SHA1_H_
+#define INCLUDED_SHA1_H_
 #ifdef SHA1_SOURCE
 #define SHA1_PROC(type,name) EXPORT_METHOD type CPROC name
 #else
