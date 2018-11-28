@@ -12,6 +12,10 @@
 /* A macro to build a wide character string of __FILE__ */
 #define _WIDE__FILE__(n) WIDE(n)
 #define WIDE__FILE__ _WIDE__FILE__(__FILE__)
+#if _XOPEN_SOURCE < 500
+#  undef _XOPEN_SOURCE
+#  define _XOPEN_SOURCE 500
+#endif
 #ifndef STANDARD_HEADERS_INCLUDED
 /* multiple inclusion protection symbol */
 #define STANDARD_HEADERS_INCLUDED
@@ -187,7 +191,7 @@ __declspec(dllimport) DWORD WINAPI timeGetTime(void);
 #      ifdef __EMSCRIPTEN__
 #        define DebugBreak()
 #      else
-#        define DebugBreak()  asm("int $3\n" )
+#        define DebugBreak()  __asm__("int $3\n" )
 #      endif
 #    endif
 #  endif
@@ -3257,6 +3261,7 @@ TYPELIB_PROC  int TYPELIB_CALLTYPE  TextSimilar  ( PTEXT pText, CTEXTSTR text );
 //#define SameText( l1, l2 )  ( strcmp( GetText(l1), GetText(l2) ) )
 #define textmin(a,b) ( (((a)>0)&&((b)>0))?(((a)<(b))?(a):(b)):(((a)>0)?(a):((b)>0)?(b):0) )
 #ifdef __LINUX__
+#  include <strings.h>
 /* windows went with stricmp() and strnicmp(), whereas linux
  went with strcasecmp() and strncasecmp()                  */
 #  ifdef UNICODE
@@ -4414,9 +4419,9 @@ TYPELIB_PROC  CPOINTER TYPELIB_CALLTYPE  GetPriorNode( PTREEROOT root );
 /* \Returns the total number of nodes in the tree.
    Example
    <code lang="c++">
-   uint32_t total_nodes = GetNodeCount(tree);
+   int total_nodes = GetNodeCount(tree);
    </code>                                         */
-TYPELIB_PROC  uint32_t TYPELIB_CALLTYPE  GetNodeCount ( PTREEROOT root );
+TYPELIB_PROC  int TYPELIB_CALLTYPE  GetNodeCount ( PTREEROOT root );
  // returns a shadow of the original.
 TYPELIB_PROC  PTREEROOT TYPELIB_CALLTYPE  ShadowBinaryTree( PTREEROOT root );
 #ifdef __cplusplus
@@ -6333,6 +6338,8 @@ inline void operator delete (void * p)
 #endif
 #endif
 #endif
+#endif
+#ifdef __LINUX__
 #endif
 #ifndef _TIMER_NAMESPACE
 #ifdef __cplusplus
@@ -9230,7 +9237,7 @@ PROCREG_PROC( POINTER, GetInterfaceDbg )( CTEXTSTR pServiceName DBG_PASS );
 #define GetInterface(n) GetInterfaceDbg( n DBG_SRC )
 #define GetRegisteredInterface(name) GetInterface(name)
 PROCREG_PROC( LOGICAL, RegisterInterfaceEx )( CTEXTSTR name, POINTER(CPROC*load)(void), void(CPROC*unload)(POINTER) DBG_PASS );
-PROCREG_PROC( LOGICAL, RegisterInterface )(CTEXTSTR name, POINTER( CPROC*load )(void), void(CPROC*unload)(POINTER));
+//PROCREG_PROC( LOGICAL, RegisterInterface )(CTEXTSTR name, POINTER( CPROC*load )(void), void(CPROC*unload)(POINTER));
 #define RegisterInterface(n,l,u) RegisterInterfaceEx( n,l,u DBG_SRC )
 // unregister a function, should be smart and do full return type
 // and parameters..... but for now this only references name, this indicates
@@ -9584,12 +9591,12 @@ HTTP_EXPORT int HTTPAPI GetHttpResponseCode( HTTPState pHttpState );
 #define CreateHttpServer2(interface_address,site,default_handler,psv) CreateHttpServerEx( interface_address,NULL,site,default_handler,psv )
 // receives events for either GET if aspecific OnHttpRequest has not been defined for the specific resource
 // Return TRUE if processed, otherwise will attempt to match other Get Handlers
-#define OnHttpGet( site, resource )	 __DefineRegistryMethod(WIDE( "SACK/Http/Methods" ),OnHttpGet,site,resource,WIDE( "Get" ),LOGICAL,(uintptr_t,PCLIENT,struct HttpState *,PTEXT),__LINE__)
+#define OnHttpGet( site, resource )	 DefineRegistryMethod(WIDE( "SACK/Http/Methods" ),OnHttpGet,site,resource,WIDE( "Get" ),LOGICAL,(uintptr_t,PCLIENT,struct HttpState *,PTEXT),__LINE__)
 // receives events for either GET if aspecific OnHttpRequest has not been defined for the specific resource
 // Return TRUE if processed, otherwise will attempt to match other Get Handlers
-#define OnHttpPost( site, resource )	 __DefineRegistryMethod(WIDE( "SACK/Http/Methods" ),OnHttpPost,site,resource,WIDE( "Post" ),LOGICAL,(uintptr_t,PCLIENT,struct HttpState *,PTEXT),__LINE__)
+#define OnHttpPost( site, resource )	 DefineRegistryMethod(WIDE( "SACK/Http/Methods" ),OnHttpPost,site,resource,WIDE( "Post" ),LOGICAL,(uintptr_t,PCLIENT,struct HttpState *,PTEXT),__LINE__)
 // define a specific handler for a specific resource name on a host
-#define OnHttpRequest( site, resource )	 __DefineRegistryMethod(WIDE( "SACK/Http/Methods" ),OnHttpRequest,WIDE( "something" ),site WIDE( "/" ) resource,WIDE( "Get" ),void,(uintptr_t,PCLIENT,struct HttpState *,PTEXT),__LINE__)
+#define OnHttpRequest( site, resource )	 DefineRegistryMethod(WIDE( "SACK/Http/Methods" ),OnHttpRequest,WIDE( "something" ),site WIDE( "/" ) resource,WIDE( "Get" ),void,(uintptr_t,PCLIENT,struct HttpState *,PTEXT),__LINE__)
 //--------------------------------------------------------------
 //  URL.c  (url parsing utility)
 struct url_cgi_data
