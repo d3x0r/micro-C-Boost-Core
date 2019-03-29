@@ -32,6 +32,11 @@
 #ifndef WINVER
 #  define WINVER 0x0601
 #endif
+#ifndef _WIN32
+#  ifndef __LINUX__
+#    define __LINUX__
+#  endif
+#endif
 #if !defined(__LINUX__)
 #  ifndef STRICT
 #    define STRICT
@@ -1829,6 +1834,7 @@ TYPELIB_PROC  void TYPELIB_CALLTYPE         EmptyList      ( PLIST *pList );
    gave up doing this sort of thing afterwards after realizing
    the methods of a library and these static methods for a class
    aren't much different.                                        */
+#  if defined( INCLUDE_SAMPLE_CPLUSPLUS_WRAPPERS )
 typedef class iList
 {
 public:
@@ -1843,6 +1849,7 @@ public:
 	inline POINTER next( void ) { POINTER p; for( idx++;list && (( p = GetLink( &list, idx ) )==0) && idx < list->Cnt; )idx++; return p; }
 	inline POINTER get(INDEX index) { return GetLink( &list, index ); }
 } *piList;
+#  endif
 #endif
 // address of the thing...
 typedef uintptr_t (CPROC *ForProc)( uintptr_t user, INDEX idx, POINTER *item );
@@ -3563,8 +3570,23 @@ TYPELIB_PROC  PTEXT TYPELIB_CALLTYPE  FlattenLine ( PTEXT pLine );
 /* Create a highest precision signed integer from a PTEXT. */
 TYPELIB_PROC  int64_t TYPELIB_CALLTYPE  IntCreateFromSeg( PTEXT pText );
 /* Converts a text to the longest precision signed integer
-   value.                                                  */
+   value.
+     allows +/- leadin ([-*]|[+*])*
+     supports 0x### (hex), 0b#### (binary), 0o#### (octal), 0### (octal)
+	 decimal 1-9[0-9]*
+	 buggy implementation supports +/- inline continue number and are either ignored(+)
+	 or changes the overall sign of the number(-).  A Decimal definatly ends the number.
+	 And octal/binary digits aren't checked for range, so 8/9 will over-flow in octal,
+	 and 2-9 overflow to upper bits in octal...
+	    0b901090 // would be like   0b 10100110    0b1001 +  010 + 1001<<3 + 0
+   */
 TYPELIB_PROC  int64_t TYPELIB_CALLTYPE  IntCreateFromText( CTEXTSTR p );
+/* Converts a text to the longest precision signed integer
+   value.  Does the work of IntCreateFromText.
+   IntCreateFromTextRef updates the pointer passed by reference so
+   the pointer ends at the first character after the returned number.
+   */
+TYPELIB_PROC  int64_t TYPELIB_CALLTYPE  IntCreateFromTextRef( CTEXTSTR *p_ );
 /* Create a high precision floating point value from PTEXT
    segment.                                                */
 TYPELIB_PROC  double TYPELIB_CALLTYPE  FloatCreateFromSeg( PTEXT pText );
@@ -3965,12 +3987,12 @@ TYPELIB_PROC  INDEX TYPELIB_CALLTYPE  vvtprintf( PVARTEXT pvt, CTEXTSTR format, 
 /* encode binary buffer into base64 encoding.
    outsize is updated with the length of the buffer.
  */
-TYPELIB_PROC  TEXTCHAR * TYPELIB_CALLTYPE  EncodeBase64Ex( uint8_t* buf, size_t length, size_t *outsize, const char *encoding );
+TYPELIB_PROC  TEXTCHAR * TYPELIB_CALLTYPE  EncodeBase64Ex( const uint8_t* buf, size_t length, size_t *outsize, const char *encoding );
 /* decode base64 buffer into binary buffer
    outsize is updated with the length of the buffer.
    result should be Release()'d
  */
-TYPELIB_PROC  uint8_t * TYPELIB_CALLTYPE  DecodeBase64Ex( char* buf, size_t length, size_t *outsize, const char *encoding );
+TYPELIB_PROC  uint8_t * TYPELIB_CALLTYPE  DecodeBase64Ex( const char* buf, size_t length, size_t *outsize, const char *encoding );
 /* xor a base64 encoded string over a utf8 string, keeping the utf8 characters in the same length...
    although technically this can result in invalid character encoding where upper bits get zeroed
    result should be Release()'d
@@ -3984,8 +4006,8 @@ TYPELIB_PROC  char * TYPELIB_CALLTYPE  b64xor( const char *a, const char *b );
 // extended command entry stuff... handles editing buffers with insert/overwrite/copy/paste/etc...
 typedef struct user_input_buffer_tag {
 	// -------------------- custom cmd buffer extension
-  // position counter for pulling history
-	INDEX nHistory;
+  // position counter for pulling history; negative indexes are recalled commands.
+	int nHistory;
   // a link queue which contains the prior lines of text entered for commands.
 	PLINKQUEUE InputHistory;
  // set to TRUE when nHistory has wrapped...
@@ -4734,6 +4756,40 @@ SYSLOG_SOCKET_SYSLOGD
 SYSLOG_PROC  LOGICAL SYSLOG_API  IsBadReadPtr ( CPOINTER pointer, uintptr_t len );
 #endif
 SYSLOG_PROC  CTEXTSTR SYSLOG_API  GetPackedTime ( void );
+//  returns the millisecond of the day (since UNIX Epoch) * 256 ( << 8 )
+// the lowest 8 bits are the timezone / 15.
+// The effect of the low [7/]8 bits being the time zone is that within the same millisecond
+// UTC +0 sorts first, followed by +1, +2, ... etc until -14, -13, -12,... -1
+// the low [7/]8 bits are the signed timezone
+// (timezone could have been either be hr*60 + min (ISO TZ format)
+// or in minutes (hr*60+mn) this would only take 7 bits
+// one would think 8 bit shifts would be slightly more efficient than 7 bits.
+// and sign extension for 8 bits already exists.
+// - REVISION - timezone with hr*100 does not divide by 15 cleanly.
+//     The timezone is ( hour*60 + min ) / 15 which is a range from -56 to 48
+//     minimal representation is 7 bits (0 - 127 or -64 - 63)
+//     still keeping 8 bits for shifting, so the effective range is only -56 to 48 of -128 to 127
+// struct time_of_day {
+//    uint64_t epoch_milliseconds : 56;
+//    int64_t timezone : 8; divided by 15... hours * 60 / 15
+// }
+SYSLOG_PROC  int64_t SYSLOG_API GetTimeOfDay( void );
+// binary little endian order; somewhat
+typedef struct sack_expanded_time_tag
+{
+	uint16_t ms;
+	uint8_t sc,mn,hr,dy,mo;
+	uint16_t yr;
+	int8_t zhr, zmn;
+} SACK_TIME;
+typedef struct sack_expanded_time_tag *PSACK_TIME;
+// convert a integer time value to an expanded structure.
+SYSLOG_PROC void     SYSLOG_API ConvertTickToTime( int64_t, PSACK_TIME st );
+// convert a expanded time structure to a integer value.
+SYSLOG_PROC int64_t SYSLOG_API ConvertTimeToTick( PSACK_TIME st );
+// returns timezone as hours*100 + minutes.
+// result is often negated?
+SYSLOG_PROC  int SYSLOG_API GetTimeZone(void);
 //
 typedef void (CPROC*UserLoggingCallback)( CTEXTSTR log_string );
 SYSLOG_PROC  void SYSLOG_API  SetSystemLog ( enum syslog_types type, const void *data );
@@ -5389,6 +5445,12 @@ typedef struct win_sockaddr_in SOCKADDR_IN;
 #undef StrRChr
 #undef StrStr
 #endif
+#if defined( __MAC__ )
+#  define strdup(s) StrDup(s)
+#  define strdup_free(s) Release(s)
+#else
+#  define strdup_free(s) free(s)
+#endif
 #ifdef __cplusplus
 #define SACK_MEMORY_NAMESPACE SACK_NAMESPACE namespace memory {
 #define SACK_MEMORY_NAMESPACE_END } SACK_NAMESPACE_END
@@ -5965,11 +6027,11 @@ MEM_PROC  uint64_t MEM_API  LockedExchange64 ( volatile uint64_t* p, uint64_t va
 /* A multi-processor safe increment of a variable.
    Parameters
    p :  pointer to a 32 bit value to increment.    */
-MEM_PROC  uint32_t MEM_API  LockedIncrement ( uint32_t* p );
+MEM_PROC  uint32_t MEM_API  LockedIncrement ( volatile uint32_t* p );
 /* Does a multi-processor safe decrement on a variable.
    Parameters
    p :  pointer to a 32 bit value to decrement.         */
-MEM_PROC  uint32_t MEM_API  LockedDecrement ( uint32_t* p );
+MEM_PROC  uint32_t MEM_API  LockedDecrement ( volatile uint32_t* p );
 #ifdef __cplusplus
 // like also __if_assembly__
 //extern "C" {
@@ -6356,10 +6418,17 @@ inline void operator delete (void * p)
 #endif
 // this is a method replacement to use PIPEs instead of SEMAPHORES
 // replacement code only affects linux.
-#if defined( __QNX__ ) || defined( __MAC__) || defined( __LINUX__ ) || defined( __ANDROID__ )
-#  define USE_PIPE_SEMS
+#if defined( __QNX__ ) || defined( __MAC__) || defined( __LINUX__ )
+#  if defined( __ANDROID__ ) || defined( EMSCRIPTEN ) || defined( __MAC__ )
+// android > 21 can use pthread_mutex_timedop
+#    define USE_PIPE_SEMS
+#  else
+//   Default behavior is to use pthread_mutex_timedlock for wakeable sleeps.
 // no semtimedop; no semctl, etc
-//#include <sys/sem.h>
+//#    include <sys/sem.h>
+//originally used semctl; but that consumes system resources that are not
+//cleaned up when the process exits.
+#endif
 #endif
 #ifdef USE_PIPE_SEMS
 #  define _NO_SEMTIMEDOP_
@@ -7891,6 +7960,7 @@ NETWORK_PROC( LOGICAL, DoPingEx )( CTEXTSTR pstrHost,
 //----- WHOIS.C -----
 NETWORK_PROC( LOGICAL, DoWhois )( CTEXTSTR pHost, CTEXTSTR pServer, PVARTEXT pvtResult );
 #ifdef __cplusplus
+#  if defined( INCLUDE_SAMPLE_CPLUSPLUS_WRAPPERS )
 typedef class network *PNETWORK;
 /* <combine sack::network::network>
    \ \                              */
@@ -8022,6 +8092,7 @@ public:
 	      return 0;
 	}
 }NETWORK;
+#  endif
 #endif
 SACK_NETWORK_NAMESPACE_END
 #ifdef __cplusplus
@@ -9229,6 +9300,8 @@ PROCREG_PROC( int, LoadTree )( void );
    DropInterface( p );
    </code>                                                     */
 PROCREG_PROC( void, DropInterface )( CTEXTSTR pServiceName, POINTER interface_x );
+PROCREG_PROC( POINTER, GetInterface_v4 )( CTEXTSTR pServiceName, LOGICAL ReadConfig, int quietFail DBG_PASS );
+#define GetInterfaceV4( a, b )  GetInterface_v4( a, FALSE, b DBG_SRC )
 /* \Returns the pointer to a registered interface. This is
    typically a structure that contains pointer to functions. Takes
    a text string to an interface. Interfaces are registered at a
@@ -9903,6 +9976,8 @@ JSON_EMITTER_PROC( int, json_parse_add_data )( struct json_parse_state *context
                                              );
 // these are common functions that work for json or json6 stream parsers
 JSON_EMITTER_PROC( PDATALIST, json_parse_get_data )( struct json_parse_state *context );
+// get actual allocated root for a value... allows holding that.
+JSON_EMITTER_PROC( const char *, json_get_parse_buffer )(struct json_parse_state *pState, const char *buf);
 JSON_EMITTER_PROC( void, json_parse_dispose_state )( struct json_parse_state **context );
 JSON_EMITTER_PROC( void, json_parse_clear_state )(struct json_parse_state *context);
 JSON_EMITTER_PROC( PTEXT, json_parse_get_error )(struct json_parse_state *context);
@@ -9927,6 +10002,8 @@ JSON_EMITTER_PROC( LOGICAL, _json6_parse_message )( char * msg
                                                   , size_t msglen
                                                   , PDATALIST *msg_data_out
                                                   );
+JSON_EMITTER_PROC( struct json_parse_state *, json6_get_message_parser )( void );
+JSON_EMITTER_PROC( struct json_parse_state *, json_get_message_parser )( void );
 // Add some data to parse for json stream (which may consist of multiple values)
 // return 1 when a completed value/object is available.
 // after returning 1, call json_parse_get_data.  It is possible that there is
@@ -10045,9 +10122,9 @@ parse_message
 		  int index;
         struct jsox_value_container *value;
 		  DATALIST_FORALL( pdlMessage, index, struct jsox_value_container *. value ) {
-           /* for each value in the result.... the first layer will
-           always be just one element, either a simple type, or a VALUE_ARRAY or VALUE_OBJECT, which
-           then for each value->contains (as a datalist like above), process each of those values.
+           // for each value in the result.... the first layer will
+           // always be just one element, either a simple type, or a VALUE_ARRAY or VALUE_OBJECT, which
+           // then for each value->contains (as a datalist like above), process each of those values.
 		  }
         jsox_dispose_mesage( &pdlMessage );
     }
@@ -10070,9 +10147,9 @@ parse_message
         int index;
         struct jsox_value_container *value;
         DATALIST_FORALL( pdlMessage, index, struct jsox_value_container *. value ) {
-           /* for each value in the result.... the first layer will
-           always be just one element, either a simple type, or a VALUE_ARRAY or VALUE_OBJECT, which
-           then for each value->contains (as a datalist like above), process each of those values.
+           // for each value in the result.... the first layer will
+           // always be just one element, either a simple type, or a VALUE_ARRAY or VALUE_OBJECT, which
+           // then for each value->contains (as a datalist like above), process each of those values.
         }
         jsox_dispose_mesage( &pdlMessage );
 		  jsox_parse_add_data( parser, NULL, 0 ); // trigger parsing next message.
@@ -10157,6 +10234,8 @@ struct jsox_value_container {
 JSOX_PARSER_PROC( struct jsox_parse_state *, jsox_begin_parse )(void);
 // clear state; after an error state, this can allow reusing a state.
 JSOX_PARSER_PROC( void, jsox_parse_clear_state )( struct jsox_parse_state *state );
+// get actual allocated root for a value... allows holding that.
+JSOX_PARSER_PROC( const char *, jsox_get_parse_buffer )(struct jsox_parse_state *pState, const char *buf);
 // destroy current parse state.
 JSOX_PARSER_PROC( void, jsox_parse_dispose_state )(struct jsox_parse_state **ppState);
 // return >0 when a completed value/object is available.
@@ -10178,8 +10257,42 @@ JSOX_PARSER_PROC( LOGICAL, jsox_parse_message )(const char * msg
 	);
 // release all resources of a message from jsox_parse_message or jsox_parse_get_data
 JSOX_PARSER_PROC( void, jsox_dispose_message )(PDATALIST *msg_data);
+JSOX_PARSER_PROC( struct jsox_parse_state *, jsox_get_messge_parser )(void);
 JSOX_PARSER_PROC( char *, jsox_escape_string_length )(const char *string, size_t len, size_t *outlen);
 JSOX_PARSER_PROC( char *, jsox_escape_string )(const char *string);
+/*
+	jsox_get_pared_value()
+	takes a parsed message data list as a parameer, and a path.
+	A message may have been parsed into multiple parts.  This
+	early version will return just the first value in the datalist.
+	If there is an optional `path` specified, then that is used to
+	step through the JSOX parsed structure to get deeper values.
+	Path is specified as a list of fieldnames and array index numbers.
+	optional separator characters may be used between members '.', ' ', '/' and '\'.
+	Separator characters may be repeated or mixed with other seaprators and are all
+	considered a single separation.
+	optional bracket characters around an array index may be used     [0]    is often as good as 0.
+	Some example paths
+		messages[0]from
+		messages.0.from
+		messages [0] from
+		messages [0] lines[0]
+	{ messages : [ // array of messages
+	    { from : "someone", lines: [ "lines","of","message"] }
+	  ]
+	}
+	jsox_get_parsed_value() returns a value from a PDATALIST
+	jsox_get_parsed_object_value() and jsox_get_parsed_array_value() :  returns a value from a value member.
+*/
+JSOX_PARSER_PROC( struct jsox_value_container *, jsox_get_parsed_value )(PDATALIST pdlMessage, const char *path
+	, void( *callback )(uintptr_t psv, struct jsox_value_container *val), uintptr_t psv
+	);
+JSOX_PARSER_PROC( struct jsox_value_container *, jsox_get_parsed_object_value )(struct jsox_value_container *pdlMessage, const char *path
+	, void( *callback )(uintptr_t psv, struct jsox_value_container *val), uintptr_t psv
+	);
+JSOX_PARSER_PROC( struct jsox_value_container *, jsox_get_parsed_array_value )(struct jsox_value_container * pdlMessage, const char *path
+	, void( *callback )(uintptr_t psv, struct jsox_value_container *val), uintptr_t psv
+	);
 #ifdef __cplusplus
 } } SACK_NAMESPACE_END
 using namespace sack::network::jsox;
@@ -10899,6 +11012,10 @@ struct file_system_interface {
 	LOGICAL (CPROC *find_is_directory)( struct find_cursor *cursor );
 	LOGICAL (CPROC *is_directory)( uintptr_t psvInstance, const char *cursor );
 	LOGICAL (CPROC *rename )( uintptr_t psvInstance, const char *original_name, const char *new_name );
+	uintptr_t (CPROC *ioctl)( uintptr_t psvInstance, uintptr_t opCode, va_list args );
+	uintptr_t (CPROC *fs_ioctl)(uintptr_t psvInstance, uintptr_t opCode, va_list args);
+	uint64_t( CPROC *find_get_ctime )(struct find_cursor *cursor);
+	uint64_t( CPROC *find_get_wtime )(struct find_cursor *cursor);
 };
 /* \ \
    Parameters
@@ -10932,20 +11049,22 @@ FILESYS_PROC  int FILESYS_API  CompareMask ( CTEXTSTR mask, CTEXTSTR name, int k
 FILESYS_PROC  int FILESYS_API  ScanFilesEx ( CTEXTSTR base
            , CTEXTSTR mask
            , void **pInfo
-           , void CPROC Process( uintptr_t psvUser, CTEXTSTR name, int flags )
-           , int flags
+           , void CPROC Process( uintptr_t psvUser, CTEXTSTR name, enum ScanFileProcessFlags flags )
+           , enum ScanFileFlags flags
 		   , uintptr_t psvUser, LOGICAL begin_sub_path, struct file_system_mounted_interface *mount );
 FILESYS_PROC  int FILESYS_API  ScanFiles ( CTEXTSTR base
            , CTEXTSTR mask
            , void **pInfo
-           , void CPROC Process( uintptr_t psvUser, CTEXTSTR name, int flags )
-           , int flags
+           , void CPROC Process( uintptr_t psvUser, CTEXTSTR name, enum ScanFileProcessFlags flags )
+           , enum ScanFileFlags flags
            , uintptr_t psvUser );
 FILESYS_PROC  void FILESYS_API  ScanDrives ( void (CPROC *Process)(uintptr_t user, CTEXTSTR letter, int flags)
 										  , uintptr_t user );
+// pass the pointer (pInfo) from aobve; get find_cursor.
+FILESYS_PROC struct find_cursor * FILESYS_API GetScanFileCursor( void *pInfo );
 // result is length of name filled into pResult if pResult == NULL && nResult = 0
 // the result will the be length of the name matching the file.
-FILESYS_PROC  int FILESYS_API  GetMatchingFileName ( CTEXTSTR filemask, int flags, TEXTSTR pResult, int nResult );
+FILESYS_PROC  int FILESYS_API  GetMatchingFileName ( CTEXTSTR filemask, enum ScanFileFlags flags, TEXTSTR pResult, int nResult );
 // searches a path for the last '/' or '\'
 FILESYS_PROC  CTEXTSTR FILESYS_API  pathrchr ( CTEXTSTR path );
 #ifdef __cplusplus
@@ -11138,6 +11257,8 @@ FILESYS_PROC  int FILESYS_API  sack_renameEx ( CTEXTSTR file_source, CTEXTSTR ne
 FILESYS_PROC  int FILESYS_API  sack_rename ( CTEXTSTR file_source, CTEXTSTR new_name );
 FILESYS_PROC  void FILESYS_API sack_set_common_data_application( CTEXTSTR name );
 FILESYS_PROC  void FILESYS_API sack_set_common_data_producer( CTEXTSTR name );
+FILESYS_PROC  uintptr_t FILESYS_API  sack_ioctl( FILE *file, uintptr_t opCode, ... );
+FILESYS_PROC  uintptr_t FILESYS_API  sack_fs_ioctl( struct file_system_mounted_interface *mount, uintptr_t opCode, ... );
 #ifndef NO_FILEOP_ALIAS
 #  ifndef NO_OPEN_MACRO
 # define open(a,...) sack_iopen(0,a,##__VA_ARGS__)
@@ -12142,6 +12263,28 @@ PSSQL_PROC( int, SQLRecordQueryEx )( PODBC odbc
    odbc :     connection to do the query on.
    query :    query to execute.
    queryLength : actual length of the query (allows embedded NUL characters)
+   PDATALIST* :  pointer to datalist pointer which will contain struct jsox_value_container.
+			 for each result in this list until VALUE_UNDEFINED is used.
+		.name is the field name (constant)
+		.string is the text, value_type is the value type (so numbers can stay numbers)
+	pdlParams : parameters to bind to the query.  (struct json_value_container types)
+   Example
+   See SQLRecordQueryf, but omit the database parameter.         */
+PSSQL_PROC( int, SQLRecordQuery_js )( PODBC odbc
+	, CTEXTSTR query
+	, size_t queryLen
+	, PDATALIST *pdlResults
+	, PDATALIST pdlParams
+	DBG_PASS );
+/* Do a SQL query on the default odbc connection. The first
+   record results immediately if there are any records. Returns
+   the results as an array of strings. If you know the select
+   you are using .... "select a,b,c from xyz" then you know that
+   this will have 3 columns resulting.
+   Parameters
+   odbc :     connection to do the query on.
+   query :    query to execute.
+   queryLength : actual length of the query (allows embedded NUL characters)
    columns :  pointer to an int to receive the number of columns
               in the result. (the user will know this based on
               the query issued usually, so it can be NULL to
@@ -12153,20 +12296,27 @@ PSSQL_PROC( int, SQLRecordQueryEx )( PODBC odbc
               field names
    Example
    See SQLRecordQueryf, but omit the database parameter.         */
-PSSQL_PROC( int, SQLRecordQueryExx )( PODBC odbc
+PSSQL_PROC( int, SQLRecordQuery_v4 )( PODBC odbc
                                    , CTEXTSTR query
                                    , size_t queryLength
                                    , int *pnResult
                                    , CTEXTSTR **result
                                    , size_t **resultLengths
                                    , CTEXTSTR **fields
+                                   , PDATALIST pdlParameters
                                    DBG_PASS);
 /* <combine sack::sql::SQLRecordQueryEx@PODBC@CTEXTSTR@int *@CTEXTSTR **@CTEXTSTR **fields>
    \ \                                                                                      */
 #define SQLRecordQuery(o,q,prn,r,f) SQLRecordQueryEx( o,q,prn,r,f DBG_SRC )
 /* <combine sack::sql::SQLRecordQueryExx@PODBC@CTEXTSTR@size_t@int *@CTEXTSTR **@size_t *@CTEXTSTR **fields>
    \ \                                                                                      */
-#define SQLRecordQueryLen(o,q,ql,prn,r,rl,f) SQLRecordQueryExx( o,q,ql,prn,r,rl,f DBG_SRC )
+#if defined _DEBUG || defined _DEBUG_INFO
+#  define SQLRecordQueryLen(o,q,ql,prn,r,rl,f) SQLRecordQueryExx( o,q,ql,prn,r,rl,f, __FILE__,__LINE__ )
+#  define SQLRecordQueryExx(o,q,ql,ppr,res,reslen,fields ,file,line )  SQLRecordQuery_v4(o,q,ql,ppr,res,reslen,fields,NULL ,file,line )
+#else
+#  define SQLRecordQueryLen(o,q,ql,prn,r,rl,f) SQLRecordQueryExx( o,q,ql,prn,r,rl,f  )
+#  define SQLRecordQueryExx(o,q,ql,ppr,res,reslen,fields )  SQLRecordQuery_v4(o,q,ql,ppr,res,reslen,fields,NULL )
+#endif
    /* Gets the next result from a query.
    Parameters
    odbc :     database connection that the query was executed on
@@ -12184,6 +12334,15 @@ PSSQL_PROC( int, FetchSQLResult )( PODBC, CTEXTSTR *result );
    Values received are invalid after the next FetchSQLRecord or
    possibly other query.                                        */
 PSSQL_PROC( int, FetchSQLRecord )( PODBC, CTEXTSTR **result );
+/* Gets the next record result from the connection.
+   Parameters
+   odbc :     connection to get the result from; if NULL, uses
+			  \internal static connection.
+   result\ :  (unchanged; is same list as original)
+   Remarks
+   Values received are invalid after the next FetchSQLRecord or
+   possibly other query.                                        */
+PSSQL_PROC( int, FetchSQLRecordJS )(PODBC odbc, PDATALIST *ppdlRecord);
 /* Gets the last result on the specified ODBC connection.
    Parameters
    odbc :     connection to get the last error of
@@ -13248,9 +13407,11 @@ SACK_VFS_PROC int CPROC sack_vfs_find_close( struct find_info *info );
 // move to the next entry returns 0 if no entry.
 SACK_VFS_PROC int CPROC sack_vfs_find_next( struct find_info *info );
 // get file information for the file at the current cursor position...
-SACK_VFS_PROC char * CPROC sack_vfs_find_get_name( struct find_info *info );
+SACK_VFS_PROC char * CPROC sack_vfs_find_get_name( struct find_cursor *info );
 // get file information for the file at the current cursor position...
-SACK_VFS_PROC size_t CPROC sack_vfs_find_get_size( struct find_info *info );
+SACK_VFS_PROC size_t CPROC sack_vfs_find_get_size( struct find_cursor *info );
+SACK_VFS_PROC uint64_t CPROC sack_vfs_find_get_ctime( struct find_cursor *info );
+SACK_VFS_PROC uint64_t CPROC sack_vfs_find_get_wtime( struct find_cursor *info );
 #ifdef __cplusplus
 namespace fs {
 #endif
@@ -13333,6 +13494,129 @@ namespace fs {
 #ifdef __cplusplus
 namespace objStore {
 #endif
+	/* thse should probably be moved to sack_vfs_os.h being file system specific extensions. */
+	enum sack_object_store_file_system_file_ioctl_ops {
+  // psvInstance should be a file handle pass (char*, size_t length )
+		SOSFSFIO_PROVIDE_SEALANT,
+ // test if file has been tampered, is is still sealed. pass (address of int)
+		SOSFSFIO_TAMPERED,
+ // get the resulting storage ID.  (Move ID creation into low level driver)
+		SOSFSFIO_STORE_OBJECT,
+ // set key required to read this record.
+		SOSFSFIO_PROVIDE_READKEY,
+		//SFSIO_GET_OBJECT_ID, // get the resulting storage ID.  (Move ID creation into low level driver)
+	};
+	enum sack_object_store_file_system_system_ioctl_ops {
+ // get the resulting storage ID.  (Move ID creation into low level driver)
+		SOSFSSIO_STORE_OBJECT,
+		SOSFSSIO_PATCH_OBJECT,
+		SOSFSSIO_LOAD_OBJECT,
+		//SFSIO_GET_OBJECT_ID, // get the resulting storage ID.  (Move ID creation into low level driver)
+	};
+// returns a pointer to and array of buffers.
+// the last pointer in the list is NULL.
+// each pointer in the list points to a structure containing a pointer to the data and the length of the data
+#define sack_vfs_os_ioctl_load_decrypt_object( vol, objId,objIdLen, seal,seallen )                            ((struct {uint8_t*, size_t}*)sack_fs_ioctl( vol, SOSFSSIO_LOAD_OBJECT, objId, objIdLen, seal, seallen ))
+// returns a pointer to and array of buffers.
+// the last pointer in the list is NULL.
+// each pointer in the list points to a structure containing a pointer to the data and the length of the data
+#define sack_vfs_os_ioctl_load_object( vol, objId,objIdLen )                                                  ((struct {uint8_t*, size_t}*)sack_fs_ioctl( vol, SOSFSSIO_LOAD_OBJECT, objId, objIdLen ))
+// unsealed store/update(patch)
+// returns TRUE/FALSE. true if the object already exists, or was successfully written.
+// store object data, get a unique ID for the data.
+// {
+//     char data[] = "some data";
+//     char result[44];
+//     sack_vfs_os_ioctl_store_rw_object( vol, data, sizeof( data ), result, 44 );
+// }
+#define sack_vfs_os_ioctl_store_rw_object( vol, obj,objlen, result, resultlen )                                 sack_fs_ioctl( vol, SOSFSSIO_STORE_OBJECT, FALSE, obj, objlen, NULL, 0, NULL, 0, NULL, 0, result, resultlen )
+// re-write an object with new content using old ID.
+// returns TRUE/FALSE. true if the patch already exists, or was successfully written.
+// {
+//     char data[] = "some data";
+//     char oldResult[] = "AAAAAAAAAAAAAAAAAAAAAAAA"; // ID from previous store result
+//     char result[44];
+//     sack_vfs_os_ioctl_patch_rw_object( vol, oldResult, sizeof( oldReult-1 ), data, sizeof( data ), result, 44 );
+// }
+#define sack_vfs_os_ioctl_patch_rw_object( vol, objId,objIdLen, obj,objlen )                                     sack_fs_ioctl( vol, SOSFSSIO_PATCH_OBJECT, FALSE, objId, objIdLen, NULL, 0, obj, objlen, NULL, 0, NULL, 0 )
+// sealed store and patch
+// store a unencrypted, sealed object using specified sealant
+// store data to a new sealed block.  Also encrypt the data
+// returns TRUE/FALSE. true if the object already exists, or was successfully written.
+// {
+//     char data[] = "some data";
+//     char seal[] = "BBBBBBBBBBBBBBBBBBBBBBBB"; // Some sealant bsea64
+//     char result[44];
+//     sack_vfs_os_ioctl_store_crypt_object( vol, data, sizeof( data ), seal, sizeof( seal ), result, 44 );
+// }
+#define sack_vfs_os_ioctl_store_crypt_owned_object( vol, obj,objlen, seal,seallen, readkey,readkeylen, result, resultlen )                 sack_fs_ioctl( vol, SOSFSSIO_STORE_OBJECT, TRUE,TRUE,  obj, objlen, NULL, 0, seal, seallen, readkey,readkeylen, result, resultlen )
+// store data to a new sealed block.  Also encrypt the data
+// returns TRUE/FALSE. true if the object already exists, or was successfully written.
+// {
+//     char data[] = "some data";
+//     char seal[] = "BBBBBBBBBBBBBBBBBBBBBBBB"; // Some sealant bsea64
+//     char result[44];
+//     sack_vfs_os_ioctl_store_crypt_object( vol, data, sizeof( data ), seal, sizeof( seal ), result, 44 );
+// }
+#define sack_vfs_os_ioctl_store_crypt_sealed_object( vol, obj,objlen, seal,seallen, readkey,readkeylen, result, resultlen )                 sack_fs_ioctl( vol, SOSFSSIO_STORE_OBJECT, TRUE,FALSE,  obj, objlen, NULL, 0, seal, seallen, readkey,readkeylen, result, resultlen )
+// store patch to an existing sealed block.  (Writes never change existing data), also encrypt the data
+// returns TRUE/FALSE. true if the patch already exists, or was successfully written.
+// {
+//     char data[] = "some data";
+//     char seal[] = "BBBBBBBBBBBBBBBBBBBBBBBB"; // Some sealant bsea64
+//     char oldResult[] = "AAAAAAAAAAAAAAAAAAAAAAAA"; // ID from previous store result
+//     char result[44];
+//     sack_vfs_os_ioctl_patch_crypt_object( vol, oldResult, sizeof( oldResult )-1, data, sizeof( data ), seal, sizeof( seal ), result, 44 );
+// }
+#define sack_vfs_os_ioctl_patch_crypt_owned_object( vol, objId,objIdLen, obj,objlen, seal,seallen, readkey,readkeylen, result, resultlen ) sack_fs_ioctl( vol, SOSFSSIO_PATCH_OBJECT, TRUE, TRUE, objId, objIdLen, authId, authIdLen, obj, objlen, seal, seallen, readkey,readkeylen, result, resultlen )
+// store patch to an existing sealed block.  (Writes never change existing data), also encrypt the data
+// returns TRUE/FALSE. true if the patch already exists, or was successfully written.
+// {
+//     char data[] = "some data";
+//     char seal[] = "BBBBBBBBBBBBBBBBBBBBBBBB"; // Some sealant bsea64
+//     char oldResult[] = "AAAAAAAAAAAAAAAAAAAAAAAA"; // ID from previous store result
+//     char result[44];
+//     sack_vfs_os_ioctl_patch_crypt_object( vol, oldResult, sizeof( oldResult )-1, data, sizeof( data ), seal, sizeof( seal ), result, 44 );
+// }
+#define sack_vfs_os_ioctl_patch_crypt_sealed_object( vol, objId,objIdLen, obj,objlen, seal,seallen, result, resultlen ) sack_fs_ioctl( vol, SOSFSSIO_PATCH_OBJECT, TRUE, FALSE, objId, objIdLen, authId, authIdLen, obj, objlen, seal, seallen, result, resultlen )
+// store data to a new sealed block.  Data is publically readable.
+// returns TRUE/FALSE. true if the object already exists, or was successfully written.
+// {
+//     char data[] = "some data";
+//     char seal[] = "BBBBBBBBBBBBBBBBBBBBBBBB"; // Some sealant bsea64
+//     char result[44];
+//     sack_vfs_os_ioctl_store_owned_object( vol, data, sizeof( data ), seal, sizeof( seal ), result, 44 );
+// }
+#define sack_vfs_os_ioctl_store_owned_object( vol, obj,objlen, seal,seallen, result, resultlen )                 sack_fs_ioctl( vol, SOSFSSIO_STORE_OBJECT, FALSE, TRUE, obj, objlen, NULL, 0, seal, seallen, NULL, 0, result, resultlen )
+// store data to a new sealed block.  Data is publically readable.
+// returns TRUE/FALSE. true if the object already exists, or was successfully written.
+// {
+//     char data[] = "some data";
+//     char seal[] = "BBBBBBBBBBBBBBBBBBBBBBBB"; // Some sealant bsea64
+//     char result[44];
+//     sack_vfs_os_ioctl_store_sealed_object( vol, data, sizeof( data ), seal, sizeof( seal ), result, 44 );
+// }
+#define sack_vfs_os_ioctl_store_sealed_object( vol, obj,objlen, seal,seallen, result, resultlen )                 sack_fs_ioctl( vol, SOSFSSIO_STORE_OBJECT, FALSE, FALSE, obj, objlen, NULL, 0, seal, seallen, NULL, 0, result, resultlen )
+// store patch to an existing sealed block.  (Writes never change existing data).  Data is publically readable.
+// returns TRUE/FALSE. true if the patch already exists, or was successfully written.
+// {
+//     char data[] = "some data";
+//     char seal[] = "BBBBBBBBBBBBBBBBBBBBBBBB"; // Some sealant bsea64
+//     char oldResult[] = "AAAAAAAAAAAAAAAAAAAAAAAA"; // ID from previous store result
+//     char result[44];
+//     sack_vfs_os_ioctl_patch_object( vol, oldResult, sizeof( oldResult )-1, data, sizeof( data ), seal, sizeof( seal ), result, 44 );
+// }
+#define sack_vfs_os_ioctl_patch_owned_object( vol, objId,objIdLen, obj,objlen, seal,seallen, result, resultlen ) sack_fs_ioctl( vol, SOSFSSIO_PATCH_OBJECT, FALSE, TRUE, objId, objIdLen, authId, authIdLen, obj, objlen, seal, seallen, result, resultlen )
+// store patch to an existing sealed block.  (Writes never change existing data).  Data is publically readable.
+// returns TRUE/FALSE. true if the patch already exists, or was successfully written.
+// {
+//     char data[] = "some data";
+//     char seal[] = "BBBBBBBBBBBBBBBBBBBBBBBB"; // Some sealant bsea64
+//     char oldResult[] = "AAAAAAAAAAAAAAAAAAAAAAAA"; // ID from previous store result
+//     char result[44];
+//     sack_vfs_os_ioctl_patch_object( vol, oldResult, sizeof( oldResult )-1, data, sizeof( data ), seal, sizeof( seal ), result, 44 );
+// }
+#define sack_vfs_os_ioctl_patch_sealed_object( vol, objId,objIdLen, obj,objlen, seal,seallen, result, resultlen ) sack_fs_ioctl( vol, SOSFSSIO_PATCH_OBJECT, FALSE, FALSE, objId, objIdLen, authId, authIdLen, obj, objlen, seal, seallen, result, resultlen )
 	struct volume;
 	struct sack_vfs_file;
 	struct find_info;
@@ -13436,6 +13720,8 @@ SACK_VFS_PROC size_t CPROC sack_vfs_os_find_get_size( struct find_info *info );
 #define sack_vfs_find_next  sack_vfs_fs_find_next
 #define sack_vfs_find_get_name  sack_vfs_fs_find_get_name
 #define sack_vfs_find_get_size  sack_vfs_fs_find_get_size
+#define sack_vfs_find_get_cdate  sack_vfs_fs_find_get_cdate
+#define sack_vfs_find_get_wdate  sack_vfs_fs_find_get_wdate
 #endif
 #if defined USE_VFS_OS_INTERFACE
 #define sack_vfs_load_volume  sack_vfs_os_load_volume
@@ -13464,6 +13750,8 @@ SACK_VFS_PROC size_t CPROC sack_vfs_os_find_get_size( struct find_info *info );
 #define sack_vfs_find_next  sack_vfs_os_find_next
 #define sack_vfs_find_get_name  sack_vfs_os_find_get_name
 #define sack_vfs_find_get_size  sack_vfs_os_find_get_size
+#define sack_vfs_find_get_cdate  sack_vfs_os_find_get_cdate
+#define sack_vfs_find_get_wdate  sack_vfs_os_find_get_wdate
 #endif
 SACK_VFS_NAMESPACE_END
 #if defined( __cplusplus ) && !defined( SACK_VFS_SOURCE )
@@ -13646,9 +13934,13 @@ SRG_EXPORT struct random_context *SRG_CreateEntropy2( void (*getsalt)( uintptr_t
 //  uses a sha2-256
 SRG_EXPORT struct random_context *SRG_CreateEntropy2_256( void (*getsalt)( uintptr_t, POINTER *salt, size_t *salt_size ), uintptr_t psv_user );
 //
-// struct random_context *entropy = CreateEntropy2( void (*getsalt)( uintptr_t, POINTER *salt, size_t *salt_size ), uintptr_t psv_user );
-//  uses a sha3-512
+// struct random_context *entropy = CreateEntropy3( void (*getsalt)( uintptr_t, POINTER *salt, size_t *salt_size ), uintptr_t psv_user );
+//  uses a sha3-512 (keccak)
 SRG_EXPORT struct random_context *SRG_CreateEntropy3( void (*getsalt)( uintptr_t, POINTER *salt, size_t *salt_size ), uintptr_t psv_user );
+//
+// struct random_context *entropy = CreateEntropy4( void (*getsalt)( uintptr_t, POINTER *salt, size_t *salt_size ), uintptr_t psv_user );
+//  uses a K12-32768
+SRG_EXPORT struct random_context *SRG_CreateEntropy4( void( *getsalt )(uintptr_t, POINTER *salt, size_t *salt_size), uintptr_t psv_user );
 // Destroya  context.  Pass the address of your 'struct random_context *entropy;   ... SRG_DestroyEntropy( &entropy );
 SRG_EXPORT void SRG_DestroyEntropy( struct random_context **ppEntropy );
 // get a large number of bits of entropy from the random_context
@@ -13658,16 +13950,29 @@ SRG_EXPORT void SRG_GetEntropyBuffer( struct random_context *ctx, uint32_t *buff
 // if get_signed is not 0, the result will be sign extended if the last bit is set
 //  (coded on little endian; tests for if ( result & ( 1 << bits - 1 ) ) then sign extend
 SRG_EXPORT int32_t SRG_GetEntropy( struct random_context *ctx, int bits, int get_signed );
+// get a single bit.
+SRG_EXPORT uint32_t SRG_GetBit( struct random_context *ctx );
 // opportunity to reset an entropy generator back to initial condition
 // next call to getentropy will be the same as the first call after create.
 SRG_EXPORT void SRG_ResetEntropy( struct random_context *ctx );
+// After SRG_ResetEntropy(), this takes the existing entropy
+// already in the random_context and seeds the entropy generator
+// with this existing digest;  GetEntropy/GetEntropyBuffer do this
+// internally; but for user control, this is separated from just
+// ResetEntropy().
+//   SRG_ResetEntropy(ctx);   // reset entropy generator to empty.
+//   SRG_StreamEntropy(ctx);  // continue from last ending
+//   SRG_FeedEntropy(ctx, /*buffer*/ ); // mix in some more entropy
+//
+SRG_EXPORT void SRG_StreamEntropy( struct random_context *ctx );
 // Manually load some salt into the next enropy buffer to e retreived.
 // sets up to add the next salt into the buffer.
 SRG_EXPORT void SRG_FeedEntropy( struct random_context *ctx, const uint8_t *salt, size_t salt_size );
 // restore the random contxt from the external holder specified
 // {
 //    POINTER save_context;
-//    SRG_RestoreState( ctx, save_context );
+//    SRG_SaveState( ctx, &save_context );  // will allocate space for the context
+//    SRG_RestoreState( ctx, save_context ); // context should previously be saved
 // }
 SRG_EXPORT void SRG_RestoreState( struct random_context *ctx, POINTER external_buffer_holder );
 // save the random context in an external buffer holder.
@@ -13676,7 +13981,23 @@ SRG_EXPORT void SRG_RestoreState( struct random_context *ctx, POINTER external_b
 //    POINTER save_context = NULL;
 //    SRG_SaveState( ctx, &save_context );
 // }
-SRG_EXPORT void SRG_SaveState( struct random_context *ctx, POINTER *external_buffer_holder );
+SRG_EXPORT void SRG_SaveState( struct random_context *ctx, POINTER *external_buffer_holder, size_t *dataSize );
+//
+// Randeom Hash generators.  Returns a 256 bit hash in a base 64 string.
+// internally seeded by clocks
+// Are thread safe; current thread pool is 32 before having to wait
+//
+// return a unique ID using SHA2_512
+SRG_EXPORT char * SRG_ID_Generator( void );
+// return a unique ID using SHA2_256
+SRG_EXPORT char *SRG_ID_Generator_256( void );
+// return a unique ID using SHA3-keccak-512
+SRG_EXPORT char *SRG_ID_Generator3( void );
+// return a unique ID using SHA3-K12-512
+SRG_EXPORT char *SRG_ID_Generator4( void );
+//------------------------------------------------------------------------
+//   crypt_util.c extra simple routines - kinda like 'passwd'
+//
 // usage
 /// { uint8_t* buf; size_t buflen; SRG_DecryptData( <resultfrom encrypt>, &buf, &buflen ); }
 //  buffer result must be released by user
@@ -13691,12 +14012,107 @@ SRG_EXPORT TEXTCHAR * SRG_EncryptData( CPOINTER buffer, size_t buflen );
 // text result must release by user
 // calls EncrytpData with buffer and string length + 1 to include the null for decryption.
 SRG_EXPORT TEXTCHAR * SRG_EncryptString( CTEXTSTR buffer );
-// return a unique ID using SRG2
-SRG_EXPORT char * SRG_ID_Generator( void );
-// return a unique ID using SRG2_256
-SRG_EXPORT char *SRG_ID_Generator_256( void );
-// return a unique ID using SRG3
-SRG_EXPORT char *SRG_ID_Generator3( void );
+// Simplified encyprtion wrapper around OpenSSL/LibreSSL EVP AES-256-CBC, uses key as IV also.
+// result is length; address of pointer to cyphertext is filled in with an Allocated buffer.
+// Limitation of 4G-byte encryption.
+// automaically adds padding as required.
+SRG_EXPORT int SRG_AES_decrypt( uint8_t *ciphertext, int ciphertext_len, uint8_t *key, uint8_t **plaintext );
+// Simplified encyprtion wrapper around OpenSSL/LibreSSL EVP AES-256-CBC, uses key as IV also.
+// result is length; address of pointer to cyphertext is filled in with an Allocated buffer.
+// Limitation of 4G-byte encryption.
+// automaically adds padding as required.
+SRG_EXPORT size_t SRG_AES_encrypt( uint8_t *plaintext, size_t plaintext_len, uint8_t *key, uint8_t **ciphertext );
+// xor-sub-wipe-sub encryption.
+// encrypts objBuf of objBufLen using (keyBuf+tick)
+// pointers refrenced passed to outBuf and outBufLen are filled in with the result
+// Will automatically add 4 bytes and pad up to 8
+SRG_EXPORT void SRG_XSWS_encryptData( uint8_t *objBuf, size_t objBufLen
+	, uint64_t tick, const uint8_t *keyBuf, size_t keyBufLen
+	, uint8_t **outBuf, size_t *outBufLen
+);
+// xor-sub-wipe-sub decryption.
+// decrypts objBuf of objBufLen using (keyBuf+tick)
+// pointers refrenced passed to outBuf and outBufLen are filled in with the result
+//
+SRG_EXPORT void SRG_XSWS_decryptData( uint8_t *objBuf, size_t objBufLen
+	, uint64_t tick, const uint8_t *keyBuf, size_t keyBufLen
+	, uint8_t **outBuf, size_t *outBufLen
+);
+//--------------------------------------------------------------
+// block_shuffle.c
+//
+// Utilities to shuffle 2D data.
+//
+//  This can use a small swap block to tile over a larger 2D area
+//
+//  shuffles a matrix of bytes
+//  1D operation is available by setting either height to 1
+//  (arrays are 'wide' before they are 'high')
+/*
+{
+	struct block_shuffle_key *key = BlockShuffle_CreateKey( SRG_CreateEntropy( NULL, 0 ), 8, 8 );
+	uint8_t input_bytes[8][18];
+	uint8_t encoded_bytes[8][8];
+	uint8_t output_bytes[8][36];
+	BlockShuffle_SetDataBlock( key, input, 2, 2, 15, 3, sizeof( input_bytes[0] )
+		encoded, 0, 0, sizeof( encoded_bytes[0] ) );
+	BlockShuffle_GetDataBlock( key, encoded, 2, 2, 15, 3, sizeof( encoded_bytes[0] )
+		output_bytes, 0, 0, sizeof( input_bytes[0] ) );
+}
+{
+	struct block_shuffle_key *BlockShuffle_CreateKey( SRG_CreateEntropy( NULL, 0 ), 8, 8 );
+	uint8_t input_bytes[8][18];
+	uint8_t encoded_bytes[8][8];
+	uint8_t output_bytes[8][36];
+}
+*/
+// API subjet to CHANGE!
+// creates a swap-matrix of width by height matrix.  Could be a linear
+// swap width (or height) is 1
+SRG_EXPORT struct block_shuffle_key *BlockShuffle_CreateKey( struct random_context *ctx, size_t width, size_t height );
+// do substitution within a range of data
+SRG_EXPORT void BlockShuffle_SetDataBlock( struct block_shuffle_key *key
+	, uint8_t* encrypted, int x, int y, size_t w, size_t h, size_t output_stride
+	, uint8_t* input, int ofs_x, int ofs_y, size_t input_stride );
+// do linear substitution over a range
+SRG_EXPORT void BlockShuffle_SetData( struct block_shuffle_key *key
+	, uint8_t* encrypted, int x, size_t w
+	, uint8_t* input, int ofs_x );
+// reverse subsittuion within a range of data
+SRG_EXPORT void BlockShuffle_GetDataBlock( struct block_shuffle_key *key
+	, uint8_t* encrypted, int x, int y, size_t w, size_t h, size_t encrypted_stride
+	, uint8_t* output, int ofs_x, int ofs_y, size_t stride );
+// reverse linear substituion over a range.
+SRG_EXPORT void BlockShuffle_GetData( struct block_shuffle_key *key
+	, uint8_t* encrypted, size_t x, size_t w
+	, uint8_t* output, size_t ofs_x );
+// Allocate a byte shuffler.
+// This transformation creates a unique mapping of byteA to byteB.
+// The SubByte and BusByte operations may be performed in either order
+// but the complimentary function is required to decode the buffer.
+//  (A->B) mapping with SubByte is different from (A->B) mapping with BusByte
+// Bus(A) != Sub(A)  but  Bus(Sub(A)) == Sub(Bus(A)) == A
+SRG_EXPORT struct byte_shuffle_key *BlockShuffle_ByteShuffler( struct random_context *ctx );
+// Releases any resource sassociated with_byte shuffler_key.
+void BlockShuffle_DropByteShuffler( struct byte_shuffle_key *key );
+// BlockSHuffle_SubBytes and BLockShuffle_BusBytes are reflective routines.
+//  They read bytes from 'bytes' and otuput to 'out_bytes'
+//  in-place operation (bytes == out_bytes) is posssible.
+// SubBytes swaps A->B
+SRG_EXPORT void BlockShuffle_SubBytes( struct byte_shuffle_key *key
+	, uint8_t *bytes, uint8_t *out_bytes, size_t byteCount );
+// swap a single byte; can be in-place.
+SRG_EXPORT void BlockShuffle_SubByte( struct byte_shuffle_key *key
+	, uint8_t *bytes, uint8_t *out_bytes );
+// BlockSHuffle_SubBytes and BlockShuffle_BusBytes are reflective routines.
+//  They read bytes from 'bytes' and otuput to 'out_bytes'
+//  in-place operation (bytes == out_bytes) is posssible.
+// BusBytes swaps B->A
+SRG_EXPORT void BlockShuffle_BusBytes( struct byte_shuffle_key *key, uint8_t *bytes
+	, uint8_t *out_bytes, size_t byteCount );
+// swap a single byte; can be in-place.
+SRG_EXPORT void BlockShuffle_BusByte( struct byte_shuffle_key *key
+	, uint8_t *bytes, uint8_t *out_bytes );
 #ifndef SACKCOMM_PROTECT_ME_AGAINST_DOBULE_INCLUSION
 #define SACKCOMM_PROTECT_ME_AGAINST_DOBULE_INCLUSION
 #ifdef SACKCOMM_SOURCE
