@@ -6,7 +6,7 @@ Tried to host this as a gist; but that didn't work out so well.
 Other Amalgamations
  - [Minimal; just types](https://github.com/d3x0r/micro-C-Boost-Types)
  - [System(Tasks) and File System](https://github.com/d3x0r/micro-C-Boost-FileSystem)
- - [Netowrking](https://github.com/d3x0r/micro-C-Boost-Network)
+ - [Networking](https://github.com/d3x0r/micro-C-Boost-Network)
  - [Full Core](https://github.com/d3x0r/micro-C-Boost-Core)
 
 # Full Core
@@ -127,7 +127,7 @@ on Linux
 An old build of the documentation (there haven't been a LOT of updates)
 http://sack.sf.net
 
-- [Netowrking](http://sack.sourceforge.net/sack__network.html)
+- [Networking](http://sack.sourceforge.net/sack__network.html)
   - [TCP](http://sack.sourceforge.net/sack__network__tcp.html)
   - [UDP](http://sack.sourceforge.net/sack__network__udp.html)
   - Websockets need documentation [Example Server](https://github.com/d3x0r/sack.vfs/blob/master/src/websocket_module.cc#L1367) [Example Client](https://github.com/d3x0r/sack.vfs/blob/master/src/websocket_module.cc#L1890).
