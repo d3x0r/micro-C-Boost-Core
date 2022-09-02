@@ -5054,11 +5054,24 @@ typedef void (CPROC*TaskOutput)(uintptr_t, PTASK_INFO task, CTEXTSTR buffer, siz
 #define LPP_OPTION_NEW_CONSOLE          16
 #define LPP_OPTION_SUSPEND              32
 #define LPP_OPTION_ELEVATE              64
+struct environmentValue {
+	char* field;
+	char* value;
+};
 SYSTEM_PROC( PTASK_INFO, LaunchPeerProgramExx )( CTEXTSTR program, CTEXTSTR path, PCTEXTSTR args
                                                , int flags
                                                , TaskOutput OutputHandler
                                                , TaskEnd EndNotice
                                                , uintptr_t psv
+                                                DBG_PASS
+                                               );
+SYSTEM_PROC( PTASK_INFO, LaunchPeerProgram_v2 )( CTEXTSTR program, CTEXTSTR path, PCTEXTSTR args
+                                               , int flags
+                                               , TaskOutput OutputHandler
+                                               , TaskOutput OutputHandler2
+                                               , TaskEnd EndNotice
+                                               , uintptr_t psv
+                                               , PLIST envStrings
                                                 DBG_PASS
                                                );
 SYSTEM_PROC( PTASK_INFO, LaunchProgramEx )( CTEXTSTR program, CTEXTSTR path, PCTEXTSTR args, TaskEnd EndNotice, uintptr_t psv );
@@ -5499,10 +5512,20 @@ namespace sack {
 /* Memory namespace contains functions for allocating and
    releasing memory. Also contains methods for accessing shared
    memory (if available on the target platform).
-   Allocate
-   Release
-   Hold
-   OpenSpace                                                    */
+   Allocate / New - get new memory
+   Release / Deallocate - allow others to use this memory
+   Hold - keep the memory; requires an additional Release.
+   Reallocate - given an existing block, allocate a new block, and copy the minimum of what's already in the block, and the new block size.  It is possible this is the same address, which is just extended into a free block.
+   OpenSpace - Low level system memory; requested by filename and region name and provides sharing;  NULL, NULL is just new memory.
+   GetHeapMemStats - Run diagnostics on the heap blocks.
+   SetAllocateLogging - enable allocate/deallocate loggging for debugging; returns the previous logging state.
+   SetAllocateDebug -  disables additional runtime checks compiled in for debug builds/
+   SetManualAllocateCheck - GetHeapMemStats is run every Allocate/Deallocate in debug mode; this disables that behavior, and expects the libary's user to check as required.
+   SetCriticalLogging - Enable/disable critical section logging; does of course influence timing when enabled.
+   SetMinAllocate - defines a minimum size that will be tracked internally; if every block is at least 100 bytes (for example), there is less chance at fragmentation when allocating 32-96 byte blocks.
+   SetHeapUnit - How much to expand the heap when more space is required.   Very large allocations will end up with their own memory mapped; but the sum of all small allocations will fill up a block of memory, and this controls the expansion rate.
+   AlignOfMemBlock - Get the alignment of a memory block; allows reallocate
+                                                */
 namespace memory {
 #endif
 typedef struct memory_block_tag* PMEM;
@@ -7119,13 +7142,13 @@ NETWORK_PROC( void, NetworkUnlockEx )( PCLIENT pc, int readWrite DBG_PASS );
 typedef void (CPROC*cReadComplete)(PCLIENT, POINTER, size_t );
 typedef void (CPROC*cReadCompleteEx)(PCLIENT, POINTER, size_t, SOCKADDR * );
 typedef void (CPROC*cCloseCallback)(PCLIENT);
-typedef void (CPROC*cWriteComplete)(PCLIENT );
+typedef void (CPROC*cWriteComplete)(PCLIENT, CPOINTER buffer, size_t len );
 typedef void (CPROC*cNotifyCallback)(PCLIENT server, PCLIENT newClient);
 typedef void (CPROC*cConnectCallback)(PCLIENT, int);
 typedef void (CPROC*cppReadComplete)(uintptr_t, POINTER, size_t );
 typedef void (CPROC*cppReadCompleteEx)(uintptr_t,POINTER, size_t, SOCKADDR * );
 typedef void (CPROC*cppCloseCallback)(uintptr_t);
-typedef void (CPROC*cppWriteComplete)(uintptr_t );
+typedef void (CPROC*cppWriteComplete)(uintptr_t, CPOINTER buffer, size_t len );
 typedef void (CPROC*cppNotifyCallback)(uintptr_t, PCLIENT newClient);
 typedef void (CPROC*cppConnectCallback)(uintptr_t, int);
 enum SackNetworkErrorIdentifier {
@@ -7668,6 +7691,13 @@ NETWORK_PROC( int, GetMacAddress)(PCLIENT pc, uint8_t* buf, size_t *buflen );
 //int get_mac_addr (char *device, unsigned char *buffer)
 NETWORK_PROC( PLIST, GetMacAddresses)( void );
 NETWORK_PROC( LOGICAL, sack_network_is_active )( PCLIENT pc );
+// mark that a socket has outstanding work.  If a close is handled while in network read
+// prevent the automatic close until work is cleared.
+NETWORK_PROC( void, AddNetWork )( PCLIENT lpClient, uintptr_t psv );
+// clear outstanding work on a socket.  Once all work is cleared, and the socket is flagged
+// to close, then a oustanding close operation will be performed when the last work is cleared.
+//
+NETWORK_PROC( void, ClearNetWork )( PCLIENT lpClient, uintptr_t psv );
 NETWORK_PROC( void, RemoveClientExx )(PCLIENT lpClient, LOGICAL bBlockNofity, LOGICAL bLinger DBG_PASS );
 /* <combine sack::network::RemoveClientExx@PCLIENT@LOGICAL@LOGICAL bLinger>
    \ \                                                                      */
@@ -9470,6 +9500,33 @@ struct HttpField {
 	PTEXT name;
 	PTEXT value;
 };
+struct HTTPRequestHeader {
+	char* field;
+	char* value;
+};
+struct HTTPRequestOptions {
+  // deafult GET
+	const char* method;
+     // path part of the request
+	PTEXT url;
+ // address part of request (ip:port)
+	PTEXT address;
+ // list of TEXTCAHR*
+	PLIST headers;
+  // content to send with request, if any
+	CPOINTER content;
+// lengt of content to send with request
+	size_t contentLen;
+ // set to true to request over SSL;
+	LOGICAL ssl;
+ //optionally this can be used to specify the certain, if not set, uses parameter, which will otherwise be NULL.
+	const char* certChain;
+	// specify the agent field, default to SACK(System)
+	const char* agent;
+	// if set, will be called when content buffer has been sent.
+	void ( *writeComplete )( uintptr_t userData );
+	uintptr_t userData;
+};
 typedef struct HttpState *HTTPState;
 enum ProcessHttpResult{
 	HTTP_STATE_RESULT_NOTHING = 0,
@@ -9515,7 +9572,7 @@ HTTP_EXPORT int HTTPAPI ProcessHttp( PCLIENT pc, HTTPState pHttpState );
 HTTP_EXPORT
  /* Gets the specific result code at the header of the packet -
    http 2.0 OK sort of thing.                                  */
-PTEXT HTTPAPI GetHttpResponce( HTTPState pHttpState );
+PTEXT HTTPAPI GetHttpResponse( HTTPState pHttpState );
 /* Get the method of the request in ht e http state.
 */
 HTTP_EXPORT PTEXT HTTPAPI GetHttpMethod( struct HttpState *pHttpState );
@@ -9597,6 +9654,8 @@ HTTP_EXPORT PTEXT HTTPAPI GetHttp( PTEXT site, PTEXT resource, LOGICAL secure );
 /* results with just the content of the message; no access to other information avaialble */
 HTTP_EXPORT PTEXT HTTPAPI GetHttps( PTEXT address, PTEXT url, const char *certChain );
 /* results with the http state of the message response; Allows getting other detailed information about the result */
+HTTP_EXPORT HTTPState HTTPAPI GetHttpsQueryEx( PTEXT address, PTEXT url, const char* certChain, struct HTTPRequestOptions* options );
+/* results with the http state of the message response; Allows getting other detailed information about the result */
 HTTP_EXPORT HTTPState  HTTPAPI PostHttpQuery( PTEXT site, PTEXT resource, PTEXT content );
 /* results with the http state of the message response; Allows getting other detailed information about the result */
 HTTP_EXPORT HTTPState  HTTPAPI GetHttpQuery( PTEXT site, PTEXT resource );
@@ -9604,6 +9663,8 @@ HTTP_EXPORT HTTPState  HTTPAPI GetHttpQuery( PTEXT site, PTEXT resource );
 HTTP_EXPORT HTTPState HTTPAPI GetHttpsQuery( PTEXT site, PTEXT resource, const char *certChain );
 /* return the numeric response code of a http reply. */
 HTTP_EXPORT int HTTPAPI GetHttpResponseCode( HTTPState pHttpState );
+/* return the text response code of an http reply */
+HTTP_EXPORT const char* HTTPAPI GetHttpResponseStatus( HTTPState pHttpState );
 #define CreateHttpServer(interface_address,site,psv) CreateHttpServerEx( interface_address,NULL,site,NULL,psv )
 #define CreateHttpServer2(interface_address,site,default_handler,psv) CreateHttpServerEx( interface_address,NULL,site,default_handler,psv )
 // receives events for either GET if aspecific OnHttpRequest has not been defined for the specific resource
@@ -9691,7 +9752,7 @@ WEBSOCKET_EXPORT PCLIENT WebSocketOpen( CTEXTSTR address
                                       , const char *protocols );
 // if WS_DELAY_OPEN is used, WebSocketOpen does not do immediate connect.
 // calling this begins the connection sequence.
-WEBSOCKET_EXPORT void WebSocketConnect( PCLIENT );
+WEBSOCKET_EXPORT int WebSocketConnect( PCLIENT );
 // end a websocket connection nicely.
 // code must be 1000, or 3000-4999, and reason must be less than 123 characters (125 bytes with code)
 WEBSOCKET_EXPORT void WebSocketClose( PCLIENT, int code, const char *reason );
@@ -13584,6 +13645,7 @@ namespace objStore {
 	struct sack_vfs_os_volume;
 	struct sack_vfs_os_file;
 	struct sack_vfs_os_find_info;
+	struct sack_vfs_os_time_cursor;
 	/* thse should probably be moved to sack_vfs_os.h being file system specific extensions. */
 	enum sack_object_store_file_system_file_ioctl_ops {
   // psvInstance should be a file handle pass (char*, size_t length )
@@ -13607,12 +13669,22 @@ namespace objStore {
 		SOSFSFIO_REMOVE_REFERENCE_BY,
  // set file preferred block size intead of automatic
 		SOSFSFIO_SET_BLOCKSIZE,
+ // set the last updated time of a file
+		SOSFSFIO_SET_TIME,
+ // get the list of all times associated with a file
+		SOSFSFIO_GET_TIMES,
+ // get the last(current) time of the file
+		SOSFSFIO_GET_TIME,
 	};
 	enum sack_object_store_file_system_system_ioctl_ops {
  // get the resulting storage ID.  (Move ID creation into low level driver)
 		SOSFSSIO_STORE_OBJECT,
 		SOSFSSIO_PATCH_OBJECT,
 		SOSFSSIO_LOAD_OBJECT,
+		SOSFSSIO_OPEN_VERSION,
+		SOSFSSIO_NEW_VERSION,
+		SOSFSSIO_OPEN_TIMELINE,
+		SOSFSSIO_READ_TIMELINE,
 		//SFSIO_GET_OBJECT_ID, // get the resulting storage ID.  (Move ID creation into low level driver)
 	};
 // returns a pointer to and array of buffers.
@@ -13719,7 +13791,12 @@ namespace objStore {
 //     sack_vfs_os_ioctl_patch_object( vol, oldResult, sizeof( oldResult )-1, data, sizeof( data ), seal, sizeof( seal ), result, 44 );
 // }
 #define sack_vfs_os_ioctl_patch_sealed_object( vol, objId,objIdLen, obj,objlen, seal,seallen, result, resultlen ) sack_fs_ioctl( vol, SOSFSSIO_PATCH_OBJECT, FALSE, FALSE, objId, objIdLen, authId, authIdLen, obj, objlen, seal, seallen, result, resultlen )
-#define sack_vfs_os_ioctl_create_index( file, indexName ) sack_vfs_os_fs_ioctl( file, SOSFSFIO_CREATE_INDEX, indexName )
+#define sack_vfs_os_ioctl_create_index( file, indexName ) sack_vfs_os_file_ioctl( file, SOSFSFIO_CREATE_INDEX, indexName )
+#define sack_vfs_os_ioctl_get_times( file, timeArray,tzArray,timeCount ) sack_vfs_os_file_ioctl( file, SOSFSFIO_GET_TIMES, timeArray,tzArray,timeCount )
+// get the last write timeline index of a file
+//     sack_vfs_os_ioctl_get_time( file )
+#define sack_vfs_os_ioctl_get_time( file ) sack_vfs_os_file_ioctl( file, SOSFSFIO_GET_TIME )
+#define sack_vfs_os_ioctl_set_time( file, timestamp,tz )            sack_vfs_os_file_ioctl( file, SOSFSFIO_SETTIME, timestamp,tz )
 // open a volume at the specified pathname.
 // if the volume does not exist, will create it.
 // if the volume does exist, a quick validity check is made on it, and then the result is opened
@@ -13738,6 +13815,10 @@ SACK_VFS_PROC void sack_vfs_os_flush_volume( struct sack_vfs_os_volume* vol, LOG
 // returns NULL if failure.  (permission denied to the file, or invalid filename passed, could be out of space... )
 // if the keys are NULL same as load_volume.
 SACK_VFS_PROC struct sack_vfs_os_volume * sack_vfs_os_load_crypt_volume( CTEXTSTR filepath, uintptr_t version, CTEXTSTR userkey, CTEXTSTR devkey, struct file_system_mounted_interface* mount );
+// diagnostics can use this open; flags may control whether the journal is processed automatically on open.
+// this flag can be used to disable journal replay.
+#define SACK_VFS_LOAD_FLAG_NO_REPLAY 1
+SACK_VFS_PROC struct sack_vfs_os_volume* sack_vfs_os_load_volume_v2( int flags, CTEXTSTR filepath, uintptr_t version, CTEXTSTR userkey, CTEXTSTR devkey, struct file_system_mounted_interface* mount );
 // pass some memory and a memory length of the memory to use as a volume.
 // if userkey and/or devkey are not NULL the memory is assume to be encrypted with those keys.
 // the space is opened as readonly; write accesses/expanding operations will fail.
@@ -13801,7 +13882,16 @@ SACK_VFS_PROC char * sack_vfs_os_find_get_name( struct sack_vfs_os_find_info *in
 // get file information for the file at the current cursor position...
 SACK_VFS_PROC size_t sack_vfs_os_find_get_size( struct sack_vfs_os_find_info *info );
 // get times for the object in storage.
-SACK_VFS_PROC LOGICAL sack_vfs_os_get_times( struct sack_vfs_os_file* file, uint64_t** timeArray, size_t* timeCount );
+SACK_VFS_PROC LOGICAL sack_vfs_os_get_times( struct sack_vfs_os_file* file, uint64_t** timeArray, int8_t**tzArray, size_t* timeCount );
+// set last time for object in storage. (overwrites current tick used to update on write)
+SACK_VFS_PROC LOGICAL sack_vfs_os_set_time( struct sack_vfs_os_file* file, uint64_t time, int8_t tz );
+SACK_VFS_PROC struct sack_vfs_os_time_cursor* sack_vfs_os_get_time_cursor( struct sack_vfs_os_volume* vol );
+SACK_VFS_PROC LOGICAL sack_vfs_os_read_time_cursor( struct sack_vfs_os_time_cursor* cursor, int step, uint64_t time_, uint64_t* entry, const char** filename, uint64_t* result_timestamp, int8_t* result_tz, const char** buffer, size_t* size );
+// force disabling any further writes to the volue; for unit-testing journal recovery.
+SACK_VFS_PROC LOGICAL sack_vfs_os_halt( struct sack_vfs_os_volume* volume );
+// generate a report about the internal structure of the volue...
+// journal parameters, timeline length?  File Entries?
+SACK_VFS_PROC LOGICAL sack_vfs_os_analyze( struct sack_vfs_os_volume* volume );
 #ifdef __cplusplus
 }
 #endif
