@@ -7772,6 +7772,15 @@ NETWORK_PROC( PCLIENT, CPPOpenTCPListenerAddr_v2d )(SOCKADDR *pAddr
 	, LOGICAL waitForReady
 	DBG_PASS);
 #define CPPOpenTCPListenerAddr_v2(a,b,c,d)  CPPOpenTCPListenerAddr_v2d(a,b,c,d DBG_SRC )
+// This is an extended version of v2 - that is used internally to open a second socket that can listen on 0.0.0.0 and ::0
+// FALSE is passed to the first isAuto; and TRUE to the second, which prevents infinite recursion.
+NETWORK_PROC( PCLIENT, CPPOpenTCPListenerAddr_v3d )( SOCKADDR *pAddr
+	, cppNotifyCallback NotifyCallback
+	, uintptr_t psvConnect
+	, LOGICAL waitForReady
+	, LOGICAL isAuto
+	DBG_PASS );
+#define CPPOpenTCPListenerAddr_v3(a,b,c,d,e)  CPPOpenTCPListenerAddr_v3d(a,b,c,d,e DBG_SRC )
 /* <combine sack::network::tcp::OpenTCPListenerAddrEx@SOCKADDR *@cNotifyCallback>
    \ \                                                                            */
 NETWORK_PROC( PCLIENT, OpenTCPListenerExx )( uint16_t wPort, cNotifyCallback NotifyCallback DBG_PASS );
@@ -9504,7 +9513,36 @@ PROCREG_PROC( PCLASSROOT, GetClassRootEx )( PCLASSROOT root, PCLASSROOT name_cla
 #endif
 /* Fills a string with the path name to the specified node */
 PROCREG_PROC( int, GetClassPath )( TEXTSTR out, size_t len, PCLASSROOT root );
+/* Sets the interface configuration file to be used by the
+	registry. This is the file that will be used to save the
+	configuration of the interface, and will be loaded at startup.
+	If this is not set, then the default interface configuration
+	file will be used.
+	Parameters
+	filename :  The name of the file to use for the interface
+	         configuration.  the file is duplicated, so the value
+			 may be deallocated after this.
+	Example
+	<code lang="c++">
+	char *filename = strdup( "my_interface.cfg" );
+	SetInterfaceConfigFile( filename );
+	free( filename );
+	</code>                                                                 */
 PROCREG_PROC( void, SetInterfaceConfigFile )( TEXTCHAR *filename );
+/* Sets the interface configuration file to be used by the
+	registry. This is the file that will be used to save the
+	configuration of the interface, and will be loaded at startup.
+	If this is not set, then the default interface configuration
+	file will be used.
+	Parameters
+	filename :  The name of the file to use for the interface
+	         configuration.  The pointer passed is retained,
+			 and is not duplicated.
+	Example
+	<code lang="c++">
+	  SetStaticInterfaceConfigFile( "my_interface.cfg" );
+	</code>                                                                 */
+PROCREG_PROC( void, SetStaticInterfaceConfigFile )( CTEXTSTR filename );
 /* Get[First/Next]RegisteredName( "classname", &amp;data );
    these operations are not threadsafe and multiple thread
    accesses will cause mis-stepping
@@ -10093,6 +10131,8 @@ enum ProcessHttpResult{
 HTTP_EXPORT HTTPState  HTTPAPI CreateHttpState( PCLIENT *pc );
 /*Get the http state associated with a network client */
 HTTP_EXPORT HTTPState HTTPAPI GetHttpState( PCLIENT pc );
+HTTP_EXPORT void HTTPAPI LockHttp( struct HttpState *state );
+HTTP_EXPORT void HTTPAPI UnlockHttp( struct HttpState *state );
 /* Destroys a http state, releasing all resources associated
    with it.                                                  */
 HTTP_EXPORT void HTTPAPI DestroyHttpState( HTTPState pHttpState );
@@ -10150,7 +10190,16 @@ HTTP_EXPORT PTEXT HTTPAPI GetHttpResource( HTTPState pHttpState );
    see also: ProcessHttpFields and ProcessCGIFields
 */
 HTTP_EXPORT PLIST HTTPAPI GetHttpHeaderFields( HTTPState pHttpState );
-HTTP_EXPORT int HTTPAPI GetHttpVersion( HTTPState pHttpState );
+//HTTP_EXPORT int HTTPAPI GetHttpVersion( HTTPState pHttpState );
+/* get the version of the current reply which has been parsed into the state.
+    will be 0 if it is a reply and not a reply.
+*/
+HTTP_EXPORT int HTTPAPI GetHttpReplyVersion( HTTPState pHttpState );
+/* get the version of the current request which has been parsed into the state.
+    will be 0 if it is a reply and not a request.
+*/
+HTTP_EXPORT int HTTPAPI GetHttpRequestVersion( HTTPState pHttpState );
+// #define GetHttpVersion(state) GetHttpRequestVersion( state )
 HTTP_EXPORT
  /* Enumerates the various http header fields by passing them
    each sequentially to the specified callback.
