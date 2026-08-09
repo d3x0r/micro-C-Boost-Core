@@ -20,6 +20,14 @@
 #  ifndef _GNU_SOURCE
 #    define _GNU_SOURCE
 #  endif
+/* On macOS the BSD/Darwin extensions (e.g. the termios baud constants
+   B57600/B115200/B230400 used by the commlib serial code) are hidden when
+   _POSIX_C_SOURCE is defined - which we force below.  Enabling
+   _DARWIN_C_SOURCE keeps those extensions visible while still requesting
+   the POSIX feature set.  Must be set before any system header. */
+#  if defined( __APPLE__ ) && !defined( _DARWIN_C_SOURCE )
+#    define _DARWIN_C_SOURCE
+#  endif
 #ifndef STANDARD_HEADERS_INCLUDED
 /* multiple inclusion protection symbol */
 #define STANDARD_HEADERS_INCLUDED
@@ -175,7 +183,17 @@ __declspec(dllimport) DWORD WINAPI timeGetTime(void);
 #    define getenv(name)       OSALOT_GetEnvironmentVariable(name)
 #    define setenv(name,val)   SetEnvironmentVariable(name,val)
 #  endif
-#  define Relinquish()       Sleep(0)
+// Spin-wait hint issued before yielding.  Relinquish() is only ever reached
+// after an acquire has already failed, so this costs nothing on the fast path.
+// It buys three things: PAUSE prevents the memory-order-violation pipeline
+// flush that a naive spin takes when the watched line finally changes (i.e.
+// exactly at hand-off, when you want to be fastest); it frees issue slots for
+// an SMT sibling, which matters when a spinner and a real worker share a
+// physical core; and it lets Intel Thread Director recognise a spin-wait, so
+// hybrid parts stop scheduling spinners onto P-cores against threads doing
+// real work.  YieldProcessor() resolves to _mm_pause on x86 and __yield on ARM64.
+#  define SpinHint()         YieldProcessor()
+#  define Relinquish()       do { SpinHint(); Sleep(0); } while( 0 )
 //#pragma pragnoteonly("GetFunctionAddress is lazy and has no library cleanup - needs to be a lib func")
 //#define GetFunctionAddress( lib, proc ) GetProcAddress( LoadLibrary( lib ), (proc) )
 #  ifdef __cplusplus_cli
@@ -222,7 +240,17 @@ extern __sighandler_t bsd_signal(int, __sighandler_t);
 #  endif
 // moved into timers - please linnk vs timers to get Sleep...
 //#define Sleep(n) (usleep((n)*1000))
-#  define Relinquish() sched_yield()
+// See the SpinHint note in the _WIN32 branch above.  No portable intrinsic
+// here, so pick per architecture; the fallback is a no-op, which just restores
+// the previous behaviour rather than breaking an unlisted target.
+#  if defined( __i386__ ) || defined( __x86_64__ )
+#    define SpinHint() __builtin_ia32_pause()
+#  elif defined( __aarch64__ ) || defined( __arm__ )
+#    define SpinHint() __asm__ __volatile__( "yield" ::: "memory" )
+#  else
+#    define SpinHint() ((void)0)
+#  endif
+#  define Relinquish() do { SpinHint(); sched_yield(); } while( 0 )
 #  define GetLastError() (int32_t)errno
 /* return with a THREAD_ID that is a unique, universally
    identifier for the thread for inter process communication. */
@@ -1617,6 +1645,7 @@ _CONTAINER_NAMESPACE
 	POINTER pNode[1];
 } LIST;
 typedef struct LinkBlock volatile* volatile PLIST;
+typedef struct LinkBlock volatile* PNVLIST;
 _LINKLIST_NAMESPACE_END
 #ifdef __cplusplus
 using namespace sack::containers::list;
@@ -1626,6 +1655,7 @@ _DATALIST_NAMESPACE
 typedef struct DataBlock  DATALIST;
 /* A typedef of a pointer to a DATALIST struct DataList. */
 typedef struct DataBlock volatile * volatile PDATALIST;
+typedef struct DataBlock volatile * PNVDATALIST;
 /* Data Blocks are like LinkBlocks, and store blocks of data in
    slab format. If the count of elements exceeds available, the
    structure is grown, to always contain a continuous array of
@@ -1670,6 +1700,7 @@ _DATALIST_NAMESPACE_END
 	POINTER pNode[1];
 } LINKSTACK;
 typedef struct LinkStack volatile* volatile PLINKSTACK;
+typedef struct LinkStack volatile* PNVLINKSTACK;
 /* A Stack that stores information in an array of structures of
    known size.
    Remarks
@@ -1693,6 +1724,7 @@ typedef struct DataListStack
 	uint8_t      data[1];
 } DATASTACK;
 typedef struct DataListStack volatile* volatile PDATASTACK;
+typedef struct DataListStack volatile* PNVDATASTACK;
 /* A queue which contains pointers to user objects. If the queue
    is filled to capacity and new queue is allocated, and all
    existing pointers are transferred.                            */
@@ -1716,6 +1748,7 @@ typedef struct LinkQueue
 	POINTER pNode[2];
 } LINKQUEUE;
 typedef struct LinkQueue volatile* volatile PLINKQUEUE;
+typedef struct LinkQueue volatile* PNVLINKQUEUE;
 /* A queue of structure elements.
    Remarks
    The size of each element must be known at stack creation
@@ -1747,6 +1780,7 @@ typedef struct DataQueue
 	uint8_t      data[1];
 } DATAQUEUE;
 typedef struct DataQueue volatile* volatile PDATAQUEUE;
+typedef struct DataQueue volatile* PNVDATAQUEUE;
 /* A mostly obsolete function, but can return the status of
    whether all initially scheduled startups are completed. (Or
    maybe whether we are not complete, and are processing
@@ -1785,7 +1819,8 @@ _CONTAINER_NAMESPACE_END
 namespace list {
 #  endif
 //--------------------------------------------------------
-TYPELIB_PROC  PLIST TYPELIB_CALLTYPE        CreateListEx   ( DBG_VOIDPASS );
+TYPELIB_PROC  PNVLIST TYPELIB_CALLTYPE        CreateListEx   ( DBG_VOIDPASS );
+TYPELIB_PROC  PNVLIST TYPELIB_CALLTYPE        CreateList2Ex(PLIST *ppList DBG_PASS);
 TYPELIB_PROC  void TYPELIB_CALLTYPE        MakeListEx   ( PLIST *pList DBG_PASS );
 /* Destroy a PLIST. */
 TYPELIB_PROC  void TYPELIB_CALLTYPE        DeleteListEx   ( PLIST *plist DBG_PASS );
@@ -1834,9 +1869,14 @@ TYPELIB_PROC  INDEX TYPELIB_CALLTYPE        FindLink       ( PLIST *pList, POINT
 	Return Value
 	   number of things in the list.
 */
-TYPELIB_PROC  INDEX TYPELIB_CALLTYPE        GetLinkCount   ( PLIST pList );
+TYPELIB_PROC  INDEX TYPELIB_CALLTYPE        GetLinkCount   ( PNVLIST pList );
 #define GetLinkCount(l) GetLinksUsed(&(l))
 TYPELIB_PROC  INDEX TYPELIB_CALLTYPE        GetLinksUsed( PLIST *pList );
+/* pack items in the list, moving items from the end into any empty spots
+ that are found.
+   return the count of items in the list.
+*/
+TYPELIB_PROC  INDEX TYPELIB_CALLTYPE        PackLinks( PNVLIST pList );
 /* Uses FindLink on the list for the value to delete, and then
    sets the index of the found link to NULL.
    Parameters
@@ -2008,7 +2048,8 @@ namespace data_list {
 /* Creates a data list which hold data elements of the specified
    size.
                                                                  */
-TYPELIB_PROC  PDATALIST TYPELIB_CALLTYPE  CreateDataListEx ( uintptr_t nSize DBG_PASS );
+TYPELIB_PROC  PNVDATALIST TYPELIB_CALLTYPE  CreateDataListEx ( uintptr_t nSize DBG_PASS );
+TYPELIB_PROC  PNVDATALIST TYPELIB_CALLTYPE  CreateDataList2Ex( PDATALIST *ppdl, uintptr_t nSize DBG_PASS);
 /* <combine sack::containers::data_list::DeleteDataList>
    \ \                                                   */
 TYPELIB_PROC  void TYPELIB_CALLTYPE       DeleteDataListEx ( PDATALIST *ppdl DBG_PASS );
@@ -2118,7 +2159,15 @@ TYPELIB_PROC  void TYPELIB_CALLTYPE       EmptyDataList ( PDATALIST *ppdl );
                allocation of the stack.
    Returns
    Pointer to a new link stack.                               */
-TYPELIB_PROC  PLINKSTACK TYPELIB_CALLTYPE   CreateLinkStackEx( DBG_VOIDPASS );
+TYPELIB_PROC  PNVLINKSTACK TYPELIB_CALLTYPE   CreateLinkStackEx( DBG_VOIDPASS );
+/* Creates a new stack for links (POINTERS).
+   Parameters
+   ppls :       address of a link stack pointer
+   DBG_PASS :  Debug file and line information to use for the
+			   allocation of the stack.
+   Returns
+   Pointer to a new link stack.                               */
+TYPELIB_PROC  PNVLINKSTACK TYPELIB_CALLTYPE   CreateLinkStack2Ex(PLINKSTACK *ppls DBG_PASS);
 /* Creates a new stack for links (POINTERS).  Link stack has a limited number of entries.
     When the stack fills, the oldest item on the stack is removed automatically.
 	 Parameters
@@ -2128,7 +2177,8 @@ TYPELIB_PROC  PLINKSTACK TYPELIB_CALLTYPE   CreateLinkStackEx( DBG_VOIDPASS );
    Returns
    Pointer to a new link stack.                               */
          // creates a link stack with maximum entries - any extra entries are pushed off the bottom into NULL
-TYPELIB_PROC  PLINKSTACK TYPELIB_CALLTYPE      CreateLinkStackLimitedEx        ( int max_entries  DBG_PASS );
+TYPELIB_PROC  PNVLINKSTACK TYPELIB_CALLTYPE      CreateLinkStackLimitedEx        ( int max_entries  DBG_PASS );
+TYPELIB_PROC  PNVLINKSTACK TYPELIB_CALLTYPE      CreateLinkStackLimited2Ex( PLINKSTACK *ppls, int max_entries  DBG_PASS);
 /* <combine sack::containers::link_stack::CreateLinkStackLimitedEx@int max_entries>
    Macro to pass default debug file and line information.                           */
 #define CreateLinkStackLimited(n) CreateLinkStackLimitedEx(n DBG_SRC)
@@ -2201,7 +2251,7 @@ TYPELIB_PROC  void TYPELIB_CALLTYPE   MakeDataStackEx( PDATASTACK *pds, size_t s
    Parameters
    size :       size of elements in the stack
    DBG_PASS :  debug file and line information.                 */
-TYPELIB_PROC  PDATASTACK TYPELIB_CALLTYPE   CreateDataStackEx( size_t size DBG_PASS );
+TYPELIB_PROC  PNVDATASTACK TYPELIB_CALLTYPE   CreateDataStackEx( size_t size DBG_PASS );
 /* Creates a data stack for data element of the specified size.
    Parameters
    size :       size of items in the stack
@@ -2213,7 +2263,14 @@ TYPELIB_PROC  void TYPELIB_CALLTYPE   MakeDataStackLimitedEx( PDATASTACK *pds, s
    size :       size of items in the stack
    count :      max items in stack (oldest gets deleted)
    DBG_PASS :  debug file and line information.                 */
-TYPELIB_PROC PDATASTACK TYPELIB_CALLTYPE CreateDataStackLimitedEx( size_t size, INDEX count DBG_PASS );
+TYPELIB_PROC PNVDATASTACK TYPELIB_CALLTYPE CreateDataStackLimitedEx( size_t size, INDEX count DBG_PASS );
+/* Creates a data stack for data element of the specified size.
+   Parameters
+   ppds :       address of a data stack pointer
+   size :       size of items in the stack
+   count :      max items in stack (oldest gets deleted)
+   DBG_PASS :  debug file and line information.                 */
+TYPELIB_PROC PNVDATASTACK TYPELIB_CALLTYPE CreateDataStackLimited2Ex(PDATASTACK *ppds, size_t size, INDEX count DBG_PASS);
 /* Destroys a data stack.
    Parameters
    pds :       address of a data stack pointer. The pointer will
@@ -2277,7 +2334,7 @@ TYPELIB_PROC  void TYPELIB_CALLTYPE   MakeLinkQueueEx( PLINKQUEUE *into DBG_PASS
 /* Creates a <link sack::containers::PLINKQUEUE, LinkQueue>. In
    debug mode, gets passed the current source and file so it can
    blame the user for the allocation.                            */
-TYPELIB_PROC  PLINKQUEUE TYPELIB_CALLTYPE   CreateLinkQueueEx( DBG_VOIDPASS );
+TYPELIB_PROC  PNVLINKQUEUE TYPELIB_CALLTYPE   CreateLinkQueueEx( DBG_VOIDPASS );
 /* Delete a link queue. Pass the address of the pointer to the
    queue to delete, this function sets the pointer to NULL if
    the queue is actually deleted.                              */
@@ -2297,15 +2354,15 @@ TYPELIB_PROC POINTER  TYPELIB_CALLTYPE      DequeLinkNL      ( PLINKQUEUE *pplq 
 /* Return TRUE/FALSE if the queue is empty or not. */
 TYPELIB_PROC  LOGICAL TYPELIB_CALLTYPE      IsQueueEmpty     ( PLINKQUEUE *pplq );
 /* Gets the number of elements current in the queue. */
-TYPELIB_PROC  INDEX TYPELIB_CALLTYPE        GetQueueLength   ( PLINKQUEUE plq );
+TYPELIB_PROC  INDEX TYPELIB_CALLTYPE        GetQueueLength   ( PNVLINKQUEUE plq );
 // get a PLINKQUEUE element at index
 //  If idx < 0 then count from the end of the queue, otherwise count from the start of the queue
 // start of the queue is the next element to be dequeue, end of the queue is the last element added to the queue.
-TYPELIB_PROC  POINTER TYPELIB_CALLTYPE      PeekQueueEx    ( PLINKQUEUE plq, int idx );
+TYPELIB_PROC  POINTER TYPELIB_CALLTYPE      PeekQueueEx    ( PNVLINKQUEUE plq, int idx );
 /* Can be used to look at the next element in the queue without
    removing it from the queue. PeekQueueEx allows you to specify
    an index of an item in the queue to get.                      */
-TYPELIB_PROC  POINTER TYPELIB_CALLTYPE      PeekQueue    ( PLINKQUEUE plq );
+TYPELIB_PROC  POINTER TYPELIB_CALLTYPE      PeekQueue    ( PNVLINKQUEUE plq );
 /* <combinewith sack::containers::queue::CreateLinkQueueEx@DBG_VOIDPASS>
    \ \                                                                   */
 #define     CreateLinkQueue()     CreateLinkQueueEx( DBG_VOIDSRC )
@@ -2340,7 +2397,7 @@ TYPELIB_PROC  POINTER TYPELIB_CALLTYPE      PeekQueue    ( PLINKQUEUE plq );
 TYPELIB_PROC  void TYPELIB_CALLTYPE   MakeDataQueueEx( PDATAQUEUE *into, INDEX size DBG_PASS );
 /* Creates a PDATAQUEUE. Can pass DBG_FILELINE information to
    blame other code for the allocation.                       */
-TYPELIB_PROC  PDATAQUEUE TYPELIB_CALLTYPE   CreateDataQueueEx( INDEX size DBG_PASS );
+TYPELIB_PROC  PNVDATAQUEUE TYPELIB_CALLTYPE   CreateDataQueueEx( INDEX size DBG_PASS );
 /* Creates a PDATAQUEUE that has an overridden expand-by amount
    and initial amount of entries in the queue. (expecting
    something like 1000 to start and expand by 500, instead of
@@ -2350,7 +2407,7 @@ TYPELIB_PROC void TYPELIB_CALLTYPE MakeLargeDataQueueEx( PDATAQUEUE *pdq, INDEX 
    and initial amount of entries in the queue. (expecting
    something like 1000 to start and expand by 500, instead of
    the default 0, and expand by 1.                              */
-TYPELIB_PROC  PDATAQUEUE TYPELIB_CALLTYPE   CreateLargeDataQueueEx( INDEX size, INDEX entries, INDEX expand DBG_PASS );
+TYPELIB_PROC  PNVDATAQUEUE TYPELIB_CALLTYPE   CreateLargeDataQueueEx( INDEX size, INDEX entries, INDEX expand DBG_PASS );
 /* Destroys a data queue. */
 TYPELIB_PROC  void TYPELIB_CALLTYPE         DeleteDataQueueEx( PDATAQUEUE *pplq DBG_PASS );
 /* Add a data element into the queue. */
@@ -2370,7 +2427,7 @@ TYPELIB_PROC  LOGICAL TYPELIB_CALLTYPE      IsDataQueueEmpty ( PDATAQUEUE *pplq 
 /* Empty a dataqueue of all data. (Sets head=tail). */
 TYPELIB_PROC  void TYPELIB_CALLTYPE         EmptyDataQueue ( PDATAQUEUE *pplq );
 /* returns how many entries are in the queue. */
-TYPELIB_PROC  INDEX   TYPELIB_CALLTYPE      GetDataQueueLength( PDATAQUEUE pdq );
+TYPELIB_PROC  INDEX   TYPELIB_CALLTYPE      GetDataQueueLength( PNVDATAQUEUE pdq );
 /*
  * get a PDATAQUEUE element at index
  * result buffer is a pointer to the type of structure expected to be
@@ -2853,6 +2910,12 @@ TYPELIB_PROC  uintptr_t TYPELIB_CALLTYPE  _ForAllInSet( GENERICSET *pSet, int un
    ForEachSetMember'                                       */
 typedef uintptr_t (CPROC *FESMCallback)(INDEX,uintptr_t);
 TYPELIB_PROC  uintptr_t TYPELIB_CALLTYPE  ForEachSetMember ( GENERICSET *pSet, int unitsize, int max, FESMCallback f, uintptr_t psv );
+/*
+ StoreSetIntoEx() - stores a set into a packed linear array passed in.
+ to get the size to create the array, can use CountUsedInSet()...
+ doing it this way is less calls then a for-each-set-member self-copy.
+    */
+TYPELIB_PROC  void * TYPELIB_CALLTYPE  StoreSetIntoEx( GENERICSET *pSet, void*unit, int unitsize, int max );
  //def __cplusplus
 #if 0
 #define DeclareSet(name)	                                struct name##set_tag {	               uint32_t set_size;	                             uint32_t element_size;	                         uint32_t element_cnt;	                          PGENERICSET pool;	                        name##set_tag() {	                        element_size = sizeof( name );	             element_cnt = MAX##name##SPERSET;	          set_size = (element_size * element_cnt )+ ((((element_cnt + 31 )/ 32 )- 1 ) * 4) + sizeof( GENERICSET );	 pool = NULL;	                               }	    ~name##set_tag() { DeleteSet( &pool ); }	 name* grab() { return (name*)GetFromSetEx( &pool, set_size, element_size, element_cnt DBG_SRC ); }	 name* grab(INDEX member) { return (name*)GetSetMemberEx( &pool, member, set_size, element_size, element_cnt DBG_SRC ); }	 name* get(INDEX member) { return (this)?(name*)GetUsedSetMemberEx( &pool, member, set_size, element_size, element_cnt DBG_SRC ):(NULL); }	 void drop( name* member ) { DeleteFromSetEx( pool, (POINTER)member, element_size, element_cnt ); }	 int valid( name* member ) { return MemberValidInSetEx( pool, (POINTER)member, element_size, element_cnt ); }	 uintptr_t forall( FAISCallback f, uintptr_t psv ) { if( this ) return _ForAllInSet( pool, element_size, element_cnt, f, psv ); else return 0; }	 };	       typedef struct name##set_tag *P##name##SET, name##SET;
@@ -2968,7 +3031,8 @@ typedef struct format_info_tag
 		BIT_FIELD background : 4;
       /* a bit indicating the text should blink if supported */
 		BIT_FIELD blink : 1;
-      /* a bit indicating the foreground and background color should be reversed */
+		BIT_FIELD blinkFast : 1;
+		/* a bit indicating the foreground and background color should be reversed */
 		BIT_FIELD reverse : 1;
 		// usually highly is bolder, perhaps it's
       // a highlighter effect and changes the background
@@ -3010,6 +3074,8 @@ typedef struct format_info_tag
 		BIT_FIELD bAlign:2;
       /* format op indicates one of the enum FORMAT_OPS applies to this segment */
 		BIT_FIELD format_op : 7;
+		BIT_FIELD rgb_foreground : 24;
+		BIT_FIELD rgb_background : 24;
 	} flags;
 	// if x,y are valid segment will have TF_POSFORMAT set...
 	union {
@@ -3465,6 +3531,14 @@ TYPELIB_PROC  PTEXT TYPELIB_CALLTYPE  SegCreateFromFloatEx( double value DBG_PAS
    source :  source list to add to
    other :   additional segments to add to source.                  */
 TYPELIB_PROC  PTEXT TYPELIB_CALLTYPE  SegAppend   ( PTEXT source, PTEXT other );
+/* Appends a list of segments to an existing list of segments. This
+   assumes that the additional segment is referncing the head of
+   the segment list.
+   Parameters
+   source :  first segment to append to
+	... :   additional segments to add to source.
+	        MUST PASS NULL AS LAST APPEND         */
+TYPELIB_PROC  PTEXT TYPELIB_CALLTYPE  SegAppends(PTEXT source, ...);
 /* Inserts a segment before another segment.
    Parameters
    what :    what to insert into the list
@@ -3926,7 +4000,15 @@ TYPELIB_PROC  void TYPELIB_CALLTYPE  VarTextEmptyEx( PVARTEXT pvt DBG_PASS);
    c :         character to add
    DBG_PASS :  optional debug information         */
 TYPELIB_PROC  void TYPELIB_CALLTYPE  VarTextAddCharacterEx( PVARTEXT pvt, TEXTCHAR c DBG_PASS );
+/* Add a unicode RUNE to a buffer (rune should only be up to 21 bits, but encoding probably supports
+ runes up to the full 32 bits
+ */
 TYPELIB_PROC  void TYPELIB_CALLTYPE  VarTextAddRuneEx( PVARTEXT pvt, TEXTRUNE c, LOGICAL overlong DBG_PASS );
+/* Aadd a string of text tokens to a vartext output.  This uses
+ the same logic as BuildLine to resolve end of lines and tabs/spaces
+ encoded into text segments.
+ */
+TYPELIB_PROC void TYPELIB_CALLTYPE VarTextAddText( PVARTEXT pvt, PTEXT line, int bSingle );
 /* Adds a single character to a PVARTEXT collector.
    Example
    <code lang="c++">
@@ -3959,9 +4041,9 @@ TYPELIB_PROC  void TYPELIB_CALLTYPE  VarTextAddDataEx( PVARTEXT pvt, CTEXTSTR bl
 #define VarTextAddData(pvt,block,length) VarTextAddDataEx( (pvt),(block),(length) DBG_SRC )
 /* Commits the currently collected text to segment, and adds the
    segment to the internal line accumulator.
-		 returns true if any data was added...
+		 returns new segment added (can be treated as bool) if any data was added...
        move any collected text to commit... */
-TYPELIB_PROC  LOGICAL TYPELIB_CALLTYPE  VarTextEndEx( PVARTEXT pvt DBG_PASS );
+TYPELIB_PROC  PTEXT TYPELIB_CALLTYPE  VarTextEndEx( PVARTEXT pvt DBG_PASS );
 /* <combine sack::containers::text::VarTextEndEx@PVARTEXT pvt>
    \ \                                                         */
 #define VarTextEnd(pvt) VarTextEndEx( (pvt) DBG_SRC )
@@ -5194,6 +5276,10 @@ typedef void (CPROC*TaskOutput)(uintptr_t, PTASK_INFO task, CTEXTSTR buffer, siz
 // this is a Linux option - uses forkpty() instead of just fork() to
 // start a process - meant for interactive processes.
 #define LPP_OPTION_INTERACTIVE        2048
+// on windows, enable nShow as minimized (else normal)
+#define LPP_OPTION_MINIMIZED          4096
+// on windows, enable nShow as maximized (else normal)
+#define LPP_OPTION_MAXIMIZED          8192
 struct environmentValue {
 	char* field;
 	char* value;
@@ -5220,7 +5306,7 @@ SYSTEM_PROC( PTASK_INFO, LaunchPeerProgram_v2 )( CTEXTSTR program, CTEXTSTR path
                                                , TaskOutput OutputHandler2
                                                , TaskEnd EndNotice
                                                , uintptr_t psv
-                                               , PLIST envStrings
+                                               , PNVLIST envStrings
                                                 DBG_PASS
                                                );
 SYSTEM_PROC( PTASK_INFO, LaunchProgramEx )( CTEXTSTR program, CTEXTSTR path, PCTEXTSTR args, TaskEnd EndNotice, uintptr_t psv );
@@ -5305,6 +5391,17 @@ SYSTEM_PROC( generic_function, LoadFunctionExx )( CTEXTSTR library, CTEXTSTR fun
 SYSTEM_PROC( generic_function, LoadFunctionEx )( CTEXTSTR library, CTEXTSTR function DBG_PASS);
 SYSTEM_PROC( void *, GetPrivateModuleHandle )( CTEXTSTR libname );
 /*
+* Send win32 PTY key event to a task running with a pseudo console. (ANSI code for key event)
+*
+*/
+SYSTEM_PROC( int, SendPTYKeyEvent )( PTASK_INFO task, uint32_t key );
+/*
+*    Set the console size for a task which is running with a pseudo console.
+ *   cols, rows are in characters
+ *   width, height are in pixels
+ */
+SYSTEM_PROC( int, SetProcessConsoleSize )( PTASK_INFO task, int cols, int rows, int width, int height );
+/*
   Add a custom loaded library; attach a name to the DLL space; this should allow
   getcustomsybmol to resolve these
   */
@@ -5373,6 +5470,11 @@ SYSTEM_PROC( void, AddKillSignalCallback )( int( *cb )( uintptr_t ), uintptr_t )
   Remove a callback which was added to event callback list.
 */
 SYSTEM_PROC( void, RemoveKillSignalCallback )( int( *cb )( uintptr_t ), uintptr_t );
+#ifdef _WIN32
+SYSTEM_PROC( uint32_t, GetTaskProcessId )( PTASK_INFO task );
+#elif defined( __LINUX__ )
+SYSTEM_PROC( pid_t, GetTaskProcessId )( PTASK_INFO task );
+#endif
 #if _WIN32
 /*
   moves the window of the task; if there is a main window for the task within the timeout perioud.
@@ -5454,7 +5556,7 @@ struct process_tree_pair {
       }
     }
 */
-SYSTEM_PROC( PDATALIST, GetProcessTree )( PTASK_INFO task );
+SYSTEM_PROC( PNVDATALIST, GetProcessTree )( PTASK_INFO task );
 #endif
 #ifdef __LINUX__
 /*
@@ -6259,6 +6361,24 @@ MEM_PROC  uint32_t MEM_API  LockedIncrement ( volatile uint32_t* p );
    Parameters
    p :  pointer to a 32 bit value to decrement.         */
 MEM_PROC  uint32_t MEM_API  LockedDecrement ( volatile uint32_t* p );
+/* Multi-processor safe bitwise OR into a variable.  Use this instead of
+   `flags |= bits` for any flag word written from more than one thread - a plain
+   |= is a read-modify-write, so two threads setting different bits can lose one
+   of them entirely.
+   Parameters
+   p :     pointer to a 32 bit value to OR into.
+   bits :  bits to set.
+   Returns
+   The value *before* the OR (matching InterlockedOr / __atomic_fetch_or).  */
+MEM_PROC  uint32_t MEM_API  LockedOr ( volatile uint32_t* p, uint32_t bits );
+/* Multi-processor safe bitwise AND into a variable.  Use this instead of
+   `flags &= ~bits`; see LockedOr for why.  Pass the mask already inverted.
+   Parameters
+   p :     pointer to a 32 bit value to AND into.
+   mask :  mask to AND with (i.e. ~bits to clear those bits).
+   Returns
+   The value *before* the AND.                                              */
+MEM_PROC  uint32_t MEM_API  LockedAnd ( volatile uint32_t* p, uint32_t mask );
 #ifdef __cplusplus
 // like also __if_assembly__
 //extern "C" {
@@ -7208,9 +7328,11 @@ DeclareThreadLocal struct timespec global_static_time_ts;
 #define timeGetTime() (uint32_t)(timeGetTime64())
 #endif
 #define tickToTimeSpec(ts,tick) (((ts).tv_sec = (tick) / 1000ULL),((ts).tv_nsec=((tick)%1000ULL)*1000000ULL))
-#define tickToFileTime(ft,tick) ((((ft).highPart).tv_sec = ((tick*10000)+EPOCH_DIFF_MS)>>32 ),(((ft).lowPart)=((tick*10000)+EPOCH_DIFF_MS) & 0XFFFFFFFF ))
+// FILETIME counts 100ns units since 1601, so the epoch shift has to be applied in the
+// source unit and the whole thing scaled after -- not added to an already-scaled value.
+#define tickToFileTime(ft,tick) ((((ft).highPart) = ((((tick)+EPOCH_DIFF_MS)*10000ULL)>>32 )),(((ft).lowPart)=(((tick)+EPOCH_DIFF_MS)*10000ULL) & 0XFFFFFFFF ))
 #define tickNsToTimeSpec(ts,tick) (((ts).tv_sec = (tick) / 1000000000ULL),((ts).tv_nsec=(tick)%1000000000ULL))
-#define tickNsToFileTime(ft,tick) ((((ft).highPart).tv_sec = ((tick)+EPOCH_DIFF_NS)>>32 ),(((ft).lowPart)=((tick)+EPOCH_DIFF_NS) & 0XFFFFFFFF ))
+#define tickNsToFileTime(ft,tick) ((((ft).highPart) = ((((tick)+EPOCH_DIFF_NS)/100ULL)>>32 )),(((ft).lowPart)=((((tick)+EPOCH_DIFF_NS)/100ULL)) & 0XFFFFFFFF ))
 //  these are rude defines overloading otherwise very practical types
 // but - they have to be dispatched after all standard headers.
 #ifndef FINAL_TYPES
@@ -7560,32 +7682,53 @@ enum SackNetworkErrorIdentifier {
 	SACK_NETWORK_ERROR_HTTP_UNSUPPORTED,
  // host name could not be resolved
 	SACK_NETWORK_ERROR_HOST_NOT_FOUND,
+	// a websocket peer's fragmented message exceeded WEBSOCKET_MAX_MESSAGE_SIZE; the
+	// message is refused and the socket closed rather than growing the collection
+	// buffer without bound.  Reported so an application can react (rate limit, ban,
+	// firewall rule, ...) rather than just seeing a closed connection.
+	SACK_NETWORK_ERROR_WS_MESSAGE_TOO_BIG,
+	// a websocket peer sent a control frame (close/ping/pong) whose length field
+	// exceeds the RFC 6455 5.5 limit of 125 -- i.e. it used the 126/127 extended
+	// length encoding, which control frames may never do.  The frame cannot be
+	// parsed and a stream protocol cannot be resynchronised mid-frame, so the
+	// connection is dropped; reported so an application can react rather than
+	// just seeing a connection vanish.
+	SACK_NETWORK_ERROR_WS_BAD_CONTROL_FRAME,
 };
-typedef void (CPROC*cErrorCallback)(uintptr_t psvError, PCLIENT pc, enum SackNetworkErrorIdentifier error, ... );
-NETWORK_PROC( void, SetNetworkWriteComplete )( PCLIENT, cWriteComplete );
+/* Upper bound on a single (possibly fragmented) inbound websocket message.  The
+   frame length is attacker-controlled - a 64-bit length frame can claim up to
+   2^63 bytes - so the fragment collection buffer needs a ceiling. */
+#ifndef WEBSOCKET_MAX_MESSAGE_SIZE
+#  define WEBSOCKET_MAX_MESSAGE_SIZE ( 128 * 1024 * 1024 )
+#endif
+/* Anchor type for the last named parameter of error callbacks.
+   C++ makes va_start() on a parameter that undergoes default argument
+   promotion (any unscoped enum) undefined behavior [-Wvarargs], so C++
+   builds use int; the values are enum SackNetworkErrorIdentifier either way. */
 #ifdef __cplusplus
+typedef int SackNetworkError;
+#else
+typedef enum SackNetworkErrorIdentifier SackNetworkError;
+#endif
+typedef void (CPROC*cErrorCallback)(uintptr_t psvError, PCLIENT pc, SackNetworkError error, ... );
+NETWORK_PROC( void, SetNetworkWriteComplete )( PCLIENT, cWriteComplete );
 /* <combine sack::network::SetNetworkWriteComplete@PCLIENT@cWriteComplete>
    \ \                                                                     */
 NETWORK_PROC( void, SetCPPNetworkWriteComplete )( PCLIENT, cppWriteComplete, uintptr_t );
-#endif
 /* <combine sack::network::SetNetworkWriteComplete@PCLIENT@cWriteComplete>
    \ \                                                                     */
 #define SetWriteCallback SetNetworkWriteComplete
 NETWORK_PROC( void, SetNetworkReadComplete )( PCLIENT, cReadComplete );
-#ifdef __cplusplus
 /* <combine sack::network::SetNetworkReadComplete@PCLIENT@cReadComplete>
    \ \                                                                   */
 NETWORK_PROC( void, SetCPPNetworkReadComplete )( PCLIENT, cppReadComplete, uintptr_t );
-#endif
 /* <combine sack::network::SetNetworkReadComplete@PCLIENT@cReadComplete>
    \ \                                                                   */
 #define SetReadCallback SetNetworkReadComplete
 NETWORK_PROC( void, SetNetworkCloseCallback )( PCLIENT, cCloseCallback );
-#ifdef __cplusplus
 /* <combine sack::network::SetNetworkCloseCallback@PCLIENT@cCloseCallback>
    \ \                                                                     */
 NETWORK_PROC( void, SetCPPNetworkCloseCallback )( PCLIENT, cppCloseCallback, uintptr_t );
-#endif
 /* <combine sack::network::SetNetworkCloseCallback@PCLIENT@cCloseCallback>
    \ \                                                                     */
 #define SetCloseCallback SetNetworkCloseCallback
@@ -7690,7 +7833,7 @@ NETWORK_PROC( LOGICAL, IsThisAddressMe )( SOCKADDR *addr, uint16_t myport );
 /*
  *  Get the list of SOCKADDR addresses that are on this box (for this name)
  */
-NETWORK_PROC( PLIST, GetLocalAddresses )( void );
+NETWORK_PROC( PNVLIST, GetLocalAddresses )( void );
 /*
  * Return the text of a socket's IP address
  */
@@ -7723,12 +7866,10 @@ NETWORK_PROC( SOCKADDR*, DuplicateAddress_6to4_Ex )( SOCKADDR *pAddr DBG_PASS );
 /* Transmission Control Protocol connection methods. This
    controls opening sockets that are based on TCP.        */
 _TCP_NAMESPACE
-#ifdef __cplusplus
 /* <combine sack::network::tcp::OpenTCPListenerAddrEx@SOCKADDR *@cNotifyCallback>
    \ \                                                                            */
 NETWORK_PROC( PCLIENT, CPPOpenTCPListenerAddrExx )( SOCKADDR *, cppNotifyCallback NotifyCallback, uintptr_t psvConnect DBG_PASS );
 #define CPPOpenTCPListenerAddrEx(a,b,c)  CPPOpenTCPListenerAddrExx(a,b,c DBG_SRC )
-#endif
 /* Opens a TCP socket which listens for connections. Other TCP
    sockets may be connected to this one once it has been
    created.
@@ -7756,12 +7897,10 @@ NETWORK_PROC( PCLIENT, OpenTCPListenerAddr_v2d )(SOCKADDR *, cNotifyCallback Not
 /* <combine sack::network::tcp::OpenTCPListenerAddrEx@SOCKADDR *@cNotifyCallback>
    \ \                                                                            */
 #define OpenTCPListenerAddr( pAddr ) OpenTCPListenerAddrExxx( paddr, NULL, FALSE DBG_SRC );
-#ifdef __cplusplus
-/* <combine sack::network::tcp::OpenTCPListenerEx@uint16_t@cNotifyCallback>
+   /* <combine sack::network::tcp::OpenTCPListenerEx@uint16_t@cNotifyCallback>
    \ \                                                                 */
 NETWORK_PROC( PCLIENT, CPPOpenTCPListenerExx )( uint16_t wPort, cppNotifyCallback NotifyCallback, uintptr_t psvConnect DBG_PASS );
 #define CPPOpenTCPListenerEx(a,b,c) CPPOpenTCPListenerExx(a,b,c DBG_SRC )
-#endif
 /* <combine sack::network::tcp::OpenTCPListenerAddrEx@SOCKADDR *@cNotifyCallback>
    \ \                                                                            */
 NETWORK_PROC( PCLIENT, OpenTCPListener_v2d )(uint16_t wPort, cNotifyCallback NotifyCallback, LOGICAL waitForReady DBG_PASS);
@@ -7813,7 +7952,6 @@ NETWORK_PROC( void, SetNetworkListenerReady )( PCLIENT pListen );
 #define OPEN_TCP_FLAG_SSL_CLIENT 2
 #define OPEN_TCP_FLAG_PREFER_V6  4
 #define OPEN_TCP_FLAG_PREFER_V4  8
-#ifdef __cplusplus
 /* <combine sack::network::tcp::OpenTCPClientAddrExx@SOCKADDR *@cReadComplete@cCloseCallback@cWriteComplete@cConnectCallback>
    \ \                                                                                                                        */
 NETWORK_PROC( PCLIENT, CPPOpenTCPClientAddrExxx )(SOCKADDR *lpAddr,
@@ -7822,7 +7960,6 @@ NETWORK_PROC( PCLIENT, CPPOpenTCPClientAddrExxx )(SOCKADDR *lpAddr,
 																  cppWriteComplete WriteComplete, uintptr_t,
 																  cppConnectCallback pConnectComplete,  uintptr_t, int DBG_PASS );
 #define CPPOpenTCPClientAddrExx(a,b,c,d,e,f,g,h,i,j) CPPOpenTCPClientAddrExxx(a,b,c,d,e,f,g,h,i,j DBG_SRC )
-#endif
 NETWORK_PROC( PCLIENT, OpenTCPClientAddrFromAddrEx )( SOCKADDR *lpAddr, SOCKADDR *pFromAddr
                                                      , cReadComplete     pReadComplete
                                                      , cCloseCallback    CloseCallback
@@ -7879,7 +8016,6 @@ NETWORK_PROC( PCLIENT, OpenTCPClientAddrExxx )(SOCKADDR *lpAddr,
 /* <combine sack::network::tcp::OpenTCPClientAddrExx@SOCKADDR *@cReadComplete@cCloseCallback@cWriteComplete@cConnectCallback>
    \ \                                                                                                                        */
 #define OpenTCPClientAddrExx(a,r,clo,w,con) OpenTCPClientAddrExxx( a,r,clo,w,con,0 DBG_SRC )
-#ifdef __cplusplus
 /* <combine sack::network::tcp::OpenTCPClientAddrExx@SOCKADDR *@cReadComplete@cCloseCallback@cWriteComplete@cConnectCallback>
    \ \                                                                                                                        */
 NETWORK_PROC( PCLIENT, CPPOpenTCPClientAddrEx )(SOCKADDR *
@@ -7888,7 +8024,6 @@ NETWORK_PROC( PCLIENT, CPPOpenTCPClientAddrEx )(SOCKADDR *
                                                , cppWriteComplete, uintptr_t
                                                , int flags
                                                );
-#endif
 /* <combine sack::network::tcp::OpenTCPClientAddrExx@SOCKADDR *@cReadComplete@cCloseCallback@cWriteComplete@cConnectCallback>
    \ \                                                                                                                        */
 NETWORK_PROC( PCLIENT, OpenTCPClientAddrExEx )(SOCKADDR *, cReadComplete,
@@ -7896,7 +8031,6 @@ NETWORK_PROC( PCLIENT, OpenTCPClientAddrExEx )(SOCKADDR *, cReadComplete,
 /* <combine sack::network::tcp::OpenTCPClientAddrExx@SOCKADDR *@cReadComplete@cCloseCallback@cWriteComplete@cConnectCallback>
    \ \                                                                                                                        */
 #define OpenTCPClientAddrEx(a,b,c,d) OpenTCPClientAddrExEx(a,b,c,d DBG_SRC )
-#ifdef __cplusplus
 /* <combine sack::network::tcp::OpenTCPClientExx@CTEXTSTR@uint16_t@cReadComplete@cCloseCallback@cWriteComplete@cConnectCallback>
    \ \                                                                                                                      */
 NETWORK_PROC( PCLIENT, CPPOpenTCPClientExEx )(CTEXTSTR lpName,uint16_t wPort
@@ -7905,7 +8039,6 @@ NETWORK_PROC( PCLIENT, CPPOpenTCPClientExEx )(CTEXTSTR lpName,uint16_t wPort
                          , cppWriteComplete WriteComplete, uintptr_t
 															, cppConnectCallback pConnectComplete, uintptr_t, int DBG_PASS );
 #define CPPOpenTCPClientExx(name,port,read,rd,close,cd,write,wd,connect,cod,flg) CPPOpenTCPClientExEx(name,port,read,rd,close,cd,write,wd,connect,cod,flg DBG_SRC)
-#endif
 /* <combine sack::network::tcp::OpenTCPClientAddrExx@SOCKADDR *@cReadComplete@cCloseCallback@cWriteComplete@cConnectCallback>
    \ \                                                                                                                        */
 NETWORK_PROC( PCLIENT, OpenTCPClientExxx )(CTEXTSTR lpName,uint16_t wPort
@@ -8165,8 +8298,25 @@ enum GetNetworkLongAccessInternal{
 NETWORK_PROC( int, GetMacAddress)(PCLIENT pc, uint8_t* bufLocal, size_t *bufLocalLen, uint8_t* bufRemote, size_t *bufRemoteLen );
 //NETWORK_PROC( int, GetMacAddress)(PCLIENT pc );
 //int get_mac_addr (char *device, unsigned char *buffer)
-NETWORK_PROC( PLIST, GetMacAddresses)( void );
+NETWORK_PROC( PNVLIST, GetMacAddresses)( void );
 NETWORK_PROC( LOGICAL, sack_network_is_active )( PCLIENT pc );
+// get the connection generation of a client.  The serial changes when the
+// connection closes; capture it while the connection is known alive (in a
+// network callback) and pass it to NetworkClientValid at time of use.
+NETWORK_PROC( uint32_t, NetworkClientSerial )( PCLIENT pc );
+// TRUE only while pc is still the same connection the serial was captured
+// from.  sack_network_is_active alone cannot tell a recycled client (a new
+// connection reusing this PCLIENT) from the connection a stored pointer meant.
+NETWORK_PROC( LOGICAL, NetworkClientValid )( PCLIENT pc, uint32_t serial );
+// diagnostic: TRUE if the client has data queued in its own pending-send chain.
+NETWORK_PROC( LOGICAL, NetworkClientHasPendingSend )( PCLIENT pc );
+// diagnostic: raw connection flags (CF_*).
+NETWORK_PROC( uint32_t, NetworkClientFlags )( PCLIENT pc );
+// diagnostic: bit0 = attached to event thread, bit1 = event object signaled,
+// bit2 = thread busy processing; byte1 = thread nWaitEvents, byte2 = nEvents.
+NETWORK_PROC( int, NetworkClientEventState )( PCLIENT pc );
+// diagnostic: count of this client's writes held in the deferred write queue.
+NETWORK_PROC( uint32_t, NetworkClientWritesPended )( PCLIENT pc );
 // mark that a socket has outstanding work.  If a close is handled while in network read
 // prevent the automatic close until work is cleared.
 NETWORK_PROC( void, AddNetWork )( PCLIENT lpClient, uintptr_t psv );
@@ -8174,6 +8324,16 @@ NETWORK_PROC( void, AddNetWork )( PCLIENT lpClient, uintptr_t psv );
 // to close, then a oustanding close operation will be performed when the last work is cleared.
 //
 NETWORK_PROC( void, ClearNetWork )( PCLIENT lpClient, uintptr_t psv );
+/*
+   Get the reference of the list of oustanding work on this client.
+   Someone put it there, they might want to know it... it holds a lock
+   for the list until the list is dropped.
+*/
+NETWORK_PROC( PLIST*, GetNetWork )( PCLIENT lpClient );
+/*
+   drops the lock held on the NetWork list returned.
+*/
+NETWORK_PROC( void, DropNetWork )( PCLIENT lpClient );
 NETWORK_PROC( void, RemoveClientExx )(PCLIENT lpClient, LOGICAL bBlockNofity, LOGICAL bLinger DBG_PASS );
 /* <combine sack::network::RemoveClientExx@PCLIENT@LOGICAL@LOGICAL bLinger>
    \ \                                                                      */
@@ -9099,7 +9259,8 @@ struct rt_init
                           //   also used when walking table to flag
                           //   completed entries
  // - priority (0-highest 255-lowest)
-    __type_rtp  priority;
+	 __type_rtp  priority;
+#define RUNTIME_PRIORITY_FILTER(x)  (((x)>255)?255:(x))
       // - routine
     __type_rtn  rtn;
 };
@@ -9109,8 +9270,8 @@ struct rt_init
 // watcom
 //------------------------------------------------------------------------------------
 //void RegisterStartupProc( void (*proc)(void) );
-#define PRIORITY_PRELOAD(name,priority) static void pastejunk(schedule_,name)(void); static void CPROC name(void);	 static struct rt_init __based(__segname("XI")) pastejunk(name,_ctor_label)={0,(DEADSTART_PRELOAD_PRIORITY-1),pastejunk(schedule_,name)};	 static void pastejunk(schedule_,name)(void) {	                 RegisterPriorityStartupProc( name,TOSTR(name),priority,&pastejunk(name,_ctor_label) DBG_SRC );	}	                                       void name(void)
-#define ATEXIT_PRIORITY(name,priority) static void pastejunk(schedule_exit_,name)(void); static void CPROC name(void);	 static struct rt_init __based(__segname("XI")) pastejunk(name,_dtor_label)={0,69,pastejunk(schedule_exit_,name)};	 static void pastejunk(schedule_exit_,name)(void) {	                                              RegisterPriorityShutdownProc( name,TOSTR(name),priority,&name##_dtor_label DBG_SRC );	}	                                       void name(void)
+#define PRIORITY_PRELOAD(name,priority) static void pastejunk(schedule_,name)(void); static void CPROC name(void);	 static struct rt_init __based(__segname("XI")) pastejunk(name,_ctor_label)={0,(DEADSTART_PRELOAD_PRIORITY-1),pastejunk(schedule_,name)};	 static void pastejunk(schedule_,name)(void) {	                 RegisterPriorityStartupProc( name,TOSTR(name),RUNTIME_PRIORITY_FILTER(priority),&pastejunk(name,_ctor_label) DBG_SRC );	}	                                       void name(void)
+#define ATEXIT_PRIORITY(name,priority) static void pastejunk(schedule_exit_,name)(void); static void CPROC name(void);	 static struct rt_init __based(__segname("XI")) pastejunk(name,_dtor_label)={0,69,pastejunk(schedule_exit_,name)};	 static void pastejunk(schedule_exit_,name)(void) {	                                              RegisterPriorityShutdownProc( name,TOSTR(name),RUNTIME_PRIORITY_FILTER(priority),&name##_dtor_label DBG_SRC );	}	                                       void name(void)
 // syslog runs preload at priority 65
 // message service runs preload priority 66
 // deadstart itself tries to run at priority 70 (after all others have registered)
@@ -9136,26 +9297,21 @@ static void name(void); static void name##_x_(void);	static struct rt_init __bas
 #elif defined( __GNUC__ )
 /* code taken from openwatcom/bld/watcom/h/rtinit.h */
 typedef unsigned char   __type_rtp;
+typedef unsigned short   __type_rtp_priority;
 typedef void(*__type_rtn ) ( void );
  // structure placed in XI/YI segment
 struct rt_init
 {
 #define DEADSTART_RT_LIST_START 0xFF
  // - near=0/far=1 routine indication
-    __type_rtp  rtn_type;
+    __type_rtp       rtn_type;
                           //   also used when walking table to flag
                           //   completed entries
  // has this been scheduled? (0 if no)
-    __type_rtp  scheduled;
+    __type_rtp       scheduled;
  // - priority (0-highest 255-lowest)
-    __type_rtp  priority;
-#if defined( __64__ ) ||defined( __arm__ )||defined( __GNUC__ )
-#define INIT_PADDING ,{0}
- // need this otherwise it's 23 bytes and that'll be bad.
-	 char padding[1];
-#else
-#define INIT_PADDING
-#endif
+    __type_rtp_priority  priority;
+#define RT_LIST_INIT_PADDING
  // 32 bits in 64 bits....
 	 int line;
 // this ends up being nicely aligned for 64 bit platforms
@@ -9174,7 +9330,16 @@ struct rt_init
 	 struct rt_init *junk2[3];
 #endif
 #endif
-} __attribute__((packed));
+}
+#ifdef __MAC__
+// ld64 on arm64 warns that the packed (alignment 1) atoms placed in the
+// deadstart section may produce unaligned pointers.  The struct is already
+// sized to a multiple of 8 (see the padding notes above), so advertise 8-byte
+// alignment to silence the warning without changing the packed layout/size.
+__attribute__((packed, aligned(8)));
+#else
+__attribute__((packed));
+#endif
 #if defined( _DEBUG ) || defined( _DEBUG_INFO )
 #  if defined( __GNUC__ ) && defined( __64__)
 #    define JUNKINIT(name) ,&pastejunk(name,_ctor_label), {0,0}
@@ -9197,14 +9362,14 @@ struct rt_init
 #  define DEADSTART_SECTION "deadstart_list"
 #endif
 #ifdef __MANUAL_PRELOAD__
-#define PRIORITY_PRELOAD(name,pr) static void name(void);	 RTINIT_STATIC struct rt_init pastejunk(name,_ctor_label)		__attribute__((section(DEADSTART_SECTION))) __attribute__((used))	 =	 {0,0,pr INIT_PADDING, __LINE__, name PASS_FILENAME	, TOSTR(name) JUNKINIT(name)} ;	 void name(void);	 void pastejunk(registerStartup,name)(void) __attribute__((constructor));	 void pastejunk(registerStartup,name)(void) {	 RegisterPriorityStartupProc(name,TOSTR(name),pr,NULL DBG_SRC); }	 void name(void)
+#define PRIORITY_PRELOAD(name,pr) static void name(void);	 RTINIT_STATIC struct rt_init pastejunk(name,_ctor_label)		__attribute__((section(DEADSTART_SECTION))) __attribute__((used))	 =	 {0,0,pr RT_LIST_INIT_PADDING, __LINE__, name PASS_FILENAME	, TOSTR(name) JUNKINIT(name)} ;	 void name(void);	 void pastejunk(registerStartup,name)(void) __attribute__((constructor));	 void pastejunk(registerStartup,name)(void) {	 RegisterPriorityStartupProc(name,TOSTR(name),pr,NULL DBG_SRC); }	 void name(void)
 #else
 #if defined( _WIN32 ) || defined( __GNUC__ )
 #  define HIDDEN_VISIBILITY
 #else
 #  define HIDDEN_VISIBILITY  __attribute__((visibility("hidden")))
 #endif
-#define PRIORITY_PRELOAD(name,pr) static void name(void);	         RTINIT_STATIC struct rt_init pastejunk(name,_ctor_label)	         __attribute__((section(DEADSTART_SECTION))) __attribute__((used))	  ={0,0,pr INIT_PADDING	                                           ,__LINE__,name	                                                 PASS_FILENAME	                                                 ,TOSTR(name)	                                                   JUNKINIT(name)};	                                               static void name(void) __attribute__((used));	 void name(void)
+#define PRIORITY_PRELOAD(name,pr) static void name(void);	         RTINIT_STATIC struct rt_init pastejunk(name,_ctor_label)	         __attribute__((section(DEADSTART_SECTION))) __attribute__((used))	  ={0,0,pr RT_LIST_INIT_PADDING	                                   ,__LINE__,name	                                                 PASS_FILENAME	                                                 ,TOSTR(name)	                                                   JUNKINIT(name)};	                                               static void name(void) __attribute__((used));	 void name(void)
 #endif
 typedef void(*atexit_priority_proc)(void (*)(void),CTEXTSTR,int DBG_PASS);
 #define PRIORITY_ATEXIT(name,priority) static void name(void);           static void pastejunk(atexit,name)(void) __attribute__((constructor));   void pastejunk(atexit,name)(void)                                        {	                                                                        RegisterPriorityShutdownProc(name,TOSTR(name),priority,NULL DBG_SRC); }                                                                        void name(void)
@@ -9217,6 +9382,7 @@ typedef void(*atexit_priority_proc)(void (*)(void),CTEXTSTR,int DBG_PASS);
 #elif defined( __CYGWIN__ )
 /* code taken from openwatcom/bld/watcom/h/rtinit.h */
 typedef unsigned char   __type_rtp;
+typedef unsigned short  __type_rtp_priority;
 typedef void(*__type_rtn ) ( void );
  // structure placed in XI/YI segment
 struct rt_init
@@ -9242,14 +9408,8 @@ struct rt_init
  // has this been scheduled? (0 if no)
     __type_rtp  scheduled;
  // - priority (0-highest 255-lowest)
-    __type_rtp  priority;
-#if defined( __GNUC__ ) || defined( __64__ ) || defined( __arm__ ) || defined( __CYGWIN__ )
-#define INIT_PADDING ,{0}
- // need this otherwise it's 23 bytes and that'll be bad.
-	 char padding[1];
-#else
-#define INIT_PADDING
-#endif
+    __type_rtp_priority  priority;
+#define RT_LIST_INIT_PADDING
  // 32 bits in 64 bits....
 	 int line;
 // this ends up being nicely aligned for 64 bit platforms
@@ -9264,7 +9424,16 @@ struct rt_init
     // to 32 bytes...
 	 struct rt_init *junk2[3];
 #endif
-} __attribute__((packed));
+}
+#ifdef __MAC__
+// ld64 on arm64 warns that the packed (alignment 1) atoms placed in the
+// deadstart section may produce unaligned pointers.  The struct is already
+// sized to a multiple of 8 (see the padding notes above), so advertise 8-byte
+// alignment to silence the warning without changing the packed layout/size.
+__attribute__((packed, aligned(8)));
+#else
+__attribute__((packed));
+#endif
 #define JUNKINIT(name) ,&pastejunk(name,_ctor_label)
 #ifdef __cplusplus
 #define RTINIT_STATIC
@@ -9278,7 +9447,7 @@ typedef void(*atexit_priority_proc)(void (*)(void),CTEXTSTR,int DBG_PASS);
 #else
 #  define PASS_FILENAME
 #endif
-#define PRIORITY_PRELOAD(name,pr) static void name(void);	 RTINIT_STATIC struct pastejunk(rt_init name,_ctor_label)	   __attribute__((section("deadstart_list")))	 ={0,0,pr INIT_PADDING	     ,__LINE__,name	          PASS_FILENAME	        ,TOSTR(name)	        JUNKINIT(name)};	 static void name(void)
+#define PRIORITY_PRELOAD(name,pr) static void name(void);	 RTINIT_STATIC struct pastejunk(rt_init name,_ctor_label)	   __attribute__((section("deadstart_list")))	 ={0,0,pr RT_LIST_INIT_PADDING	     ,__LINE__,name	          PASS_FILENAME	        ,TOSTR(name)	        JUNKINIT(name)};	 static void name(void)
 #define ATEXIT(name)      ATEXIT_PRIORITY(name,ATEXIT_PRIORITY_DEFAULT)
 #define PRIORITY_ATEXIT ATEXIT_PRIORITY
 #define ROOT_ATEXIT(name) static void name(void) __attribute__((destructor));    static void name(void)
@@ -10128,16 +10297,20 @@ enum ProcessHttpResult{
 };
 /* Creates an empty http state, the next operation should be
    AddHttpData.                                              */
-HTTP_EXPORT HTTPState  HTTPAPI CreateHttpState( PCLIENT *pc );
+HTTP_EXPORT HTTPState  HTTPAPI CreateHttpState(PCLIENT *ppc);
 /*Get the http state associated with a network client */
-HTTP_EXPORT HTTPState HTTPAPI GetHttpState( PCLIENT pc );
+//HTTP_EXPORT HTTPState HTTPAPI GetHttpState( PCLIENT pc );
 HTTP_EXPORT void HTTPAPI LockHttp( struct HttpState *state );
 HTTP_EXPORT void HTTPAPI UnlockHttp( struct HttpState *state );
+/* closes an http state, which should trigger Destroy once the socket has closed.
+ */
+HTTP_EXPORT void HTTPAPI ShutdownHttpStateEx( struct HttpState *pHttpState DBG_PASS );
+#define ShutdownHttpState(state)  ShutdownHttpStateEx(state DBG_SRC )
 /* Destroys a http state, releasing all resources associated
    with it.                                                  */
-HTTP_EXPORT void HTTPAPI DestroyHttpState( HTTPState pHttpState );
-HTTP_EXPORT
- /* Add another bit of data to the block. After adding data,
+HTTP_EXPORT void HTTPAPI DestroyHttpStateEx( HTTPState pHttpState DBG_PASS );
+#define DestroyHttpState(state) DestroyHttpStateEx(state DBG_SRC )
+/* Add another bit of data to the block. After adding data,
    ProcessHttp should be called to see if the data has completed
    a packet.
    Parameters
@@ -10146,7 +10319,7 @@ HTTP_EXPORT
    size :        length of data bytes
    Returns: TRUE if content is added... if collecting chunked encoding may return FALSE.
    */
-LOGICAL HTTPAPI AddHttpData( HTTPState pHttpState, CPOINTER buffer, size_t size );
+HTTP_EXPORT LOGICAL HTTPAPI AddHttpData( HTTPState pHttpState, CPOINTER buffer, size_t size );
 /* \returns TRUE if completed until content-length if
    content-length is not specified, data is still collected, but
    the status never results TRUE.
@@ -10189,7 +10362,7 @@ HTTP_EXPORT PTEXT HTTPAPI GetHttpResource( HTTPState pHttpState );
    members of the list are of type struct HttpField.
    see also: ProcessHttpFields and ProcessCGIFields
 */
-HTTP_EXPORT PLIST HTTPAPI GetHttpHeaderFields( HTTPState pHttpState );
+HTTP_EXPORT PNVLIST HTTPAPI GetHttpHeaderFields( HTTPState pHttpState );
 //HTTP_EXPORT int HTTPAPI GetHttpVersion( HTTPState pHttpState );
 /* get the version of the current reply which has been parsed into the state.
     will be 0 if it is a reply and not a reply.
@@ -10262,6 +10435,57 @@ HTTP_EXPORT HTTPState  HTTPAPI PostHttpQuery( PTEXT site, PTEXT resource, PTEXT 
 HTTP_EXPORT HTTPState  HTTPAPI GetHttpQuery( PTEXT site, PTEXT resource );
 /* results with the http state of the message response; Allows getting other detailed information about the result */
 HTTP_EXPORT HTTPState HTTPAPI GetHttpsQuery( PTEXT site, PTEXT resource, const char *certChain );
+//--------------------------------------------------------------
+// Streaming client connections - several requests over one socket.
+//
+// GetHttpsQueryEx above is one request per connection and blocks its caller
+// until the reply arrives.  These open the connection once and then let
+// requests be issued against it; every result is delivered by callback, so
+// nothing blocks.  Replies are matched to requests strictly in the order they
+// were sent, which is all HTTP/1.1 offers - one slow reply holds up the ones
+// queued behind it.
+//--------------------------------------------------------------
+/* The connection finished connecting (and for TLS, handshaking).  error is 0 on
+   success, otherwise the socket error; the connection is dead in that case and
+   the closed callback follows. */
+typedef void ( CPROC*httpConnectionOpened )( uintptr_t psv, HTTPState connection, int error );
+/* One reply has been parsed.  'request' is the options pointer that was passed
+   to SendHttpConnectionRequest for it.
+   This runs on the network thread, and the connection's parse state is reset
+   for the next reply as soon as it returns - read everything wanted out of it
+   (GetHttpResponseCode, GetHttpHeaderFields, GetHttpContent...) before then. */
+typedef void ( CPROC*httpConnectionResponse )( uintptr_t psv, HTTPState connection, struct HTTPRequestOptions *request );
+/* The socket closed - by the peer, by CloseHttpConnection, or by a failed
+   connect.  Any requests still queued or unanswered are reported to the
+   response callback first with the connection's response code left at 0.
+   The connection is not usable after this; DestroyHttpState it. */
+typedef void ( CPROC*httpConnectionClosed )( uintptr_t psv, HTTPState connection );
+/* Open a connection.  'options' supplies the connection-level settings - ssl,
+   certChain, addrFlags, rejectUnauthorized, hostname - and must stay valid for
+   the life of the connection; per-request settings on it are ignored.
+   Returns immediately, before the connection is up; requests may be queued
+   right away and go out when the opened callback would fire.
+   Returns NULL only if the socket could not be created at all. */
+HTTP_EXPORT HTTPState HTTPAPI OpenHttpConnection( PTEXT address, const char *certChain
+                                                , struct HTTPRequestOptions *options
+                                                , httpConnectionOpened opened
+                                                , httpConnectionResponse response
+                                                , httpConnectionClosed closed
+                                                , uintptr_t psv );
+/* Queue a request.  'options' is the caller's, must stay valid until its
+   response callback, and is handed back there to identify the reply.
+   Returns FALSE if the connection is already closed. */
+HTTP_EXPORT LOGICAL HTTPAPI SendHttpConnectionRequest( HTTPState connection, PTEXT url, struct HTTPRequestOptions *options );
+/* How many requests may be on the wire at once.  1 (the default) writes the
+   next request only when the previous reply has arrived; higher packs that many
+   ahead.  Pipelining deeper than 1 is opt-in on purpose: it is head-of-line
+   blocked, and plenty of servers and proxies handle it badly. */
+HTTP_EXPORT void HTTPAPI SetHttpConnectionPipeline( HTTPState connection, int depth );
+/* Close the connection; the closed callback still fires. */
+HTTP_EXPORT void HTTPAPI CloseHttpConnection( HTTPState connection );
+/* How many requests are queued or awaiting a reply. */
+HTTP_EXPORT int HTTPAPI GetHttpConnectionPending( HTTPState connection );
+//--------------------------------------------------------------
 /* return the numeric response code of a http reply. */
 HTTP_EXPORT int HTTPAPI GetHttpResponseCode( HTTPState pHttpState );
 /* return the text response code of an http reply */
@@ -10515,12 +10739,12 @@ HTML5_WEBSOCKET_PROC( PCLIENT, WebSocketSetProtocols )( PCLIENT pc, const char *
 /* a server side utility to get the request headers that came in.
 this is for going through proxy agents mostly where the header might have x-forwarded-for
 */
-HTML5_WEBSOCKET_PROC( PLIST, GetWebSocketHeaders )( PCLIENT pc );
+HTML5_WEBSOCKET_PROC( PNVLIST, GetWebSocketHeaders )( PCLIENT pc );
 /* for server side sockets, get the requested resource path from the client request.
 */
 HTML5_WEBSOCKET_PROC( PTEXT, GetWebSocketResource )( PCLIENT pc );
 HTML5_WEBSOCKET_PROC( HTTPState, GetWebSocketHttpState )( PCLIENT pc );
-HTML5_WEBSOCKET_PROC( PLIST, GetWebSocketPipeHeaders )( struct html5_web_socket* socket );
+HTML5_WEBSOCKET_PROC( PNVLIST, GetWebSocketPipeHeaders )( struct html5_web_socket* socket );
 HTML5_WEBSOCKET_PROC( PTEXT, GetWebSocketPipeResource )( struct html5_web_socket* socket );
 HTML5_WEBSOCKET_PROC( HTTPState, GetWebSocketPipeHttpState )( struct html5_web_socket* socket );
 HTML5_WEBSOCKET_PROC( void, ResetWebsocketRequestHandler )( PCLIENT pc_client );
@@ -10675,7 +10899,7 @@ JSON_EMITTER_PROC( int, json_parse_add_data )( struct json_parse_state *context
                                              , size_t msglen
                                              );
 // these are common functions that work for json or json6 stream parsers
-JSON_EMITTER_PROC( PDATALIST, json_parse_get_data )( struct json_parse_state *context );
+JSON_EMITTER_PROC( PNVDATALIST, json_parse_get_data )( struct json_parse_state *context );
 // get actual allocated root for a value... allows holding that.
 JSON_EMITTER_PROC( const char *, json_get_parse_buffer )(struct json_parse_state *pState, const char *buf);
 JSON_EMITTER_PROC( void, json_parse_dispose_state )( struct json_parse_state **context );
@@ -10716,7 +10940,7 @@ JSON_EMITTER_PROC( int, json6_parse_add_data )( struct json_parse_state *context
                                               , size_t msglen
                                               );
 JSON_EMITTER_PROC( LOGICAL, json_decode_message )( struct json_context *format
-                                                 , PDATALIST parsedMsg
+                                                 , PNVDATALIST parsedMsg
                                                  , struct json_context_object **result_format
                                                  , POINTER *msg_data_out
                                                  );
@@ -10951,7 +11175,7 @@ JSOX_PARSER_PROC( int, jsox_parse_add_data )(struct jsox_parse_state *context
 	, size_t msglen
 	);
 JSOX_PARSER_PROC( PTEXT, jsox_parse_get_error )(struct jsox_parse_state *state);
-JSOX_PARSER_PROC( PDATALIST, jsox_parse_get_data )(struct jsox_parse_state *context);
+JSOX_PARSER_PROC( PNVDATALIST, jsox_parse_get_data )(struct jsox_parse_state *context);
 // single all-in-one parsing of an input buffer.
 JSOX_PARSER_PROC( LOGICAL, jsox_parse_message )(const char * msg
 	, size_t msglen
@@ -10986,7 +11210,7 @@ JSOX_PARSER_PROC( char *, jsox_escape_string )(const char *string);
 	jsox_get_parsed_value() returns a value from a PDATALIST
 	jsox_get_parsed_object_value() and jsox_get_parsed_array_value() :  returns a value from a value member.
 */
-JSOX_PARSER_PROC( struct jsox_value_container *, jsox_get_parsed_value )(PDATALIST pdlMessage, const char *path
+JSOX_PARSER_PROC( struct jsox_value_container *, jsox_get_parsed_value )(PNVDATALIST pdlMessage, const char *path
 	, void( *callback )(uintptr_t psv, struct jsox_value_container *val), uintptr_t psv
 	);
 JSOX_PARSER_PROC( struct jsox_value_container *, jsox_get_parsed_object_value )(struct jsox_value_container *pdlMessage, const char *path
@@ -11065,6 +11289,7 @@ namespace sack {
 #if ( !defined( IMAGE_LIBRARY_SOURCE_MAIN ) && ( !defined( FORCE_NO_INTERFACE ) || defined( ALLOW_IMAGE_INTERFACE ) ) )      && !defined( FORCE_COLOR_MACROS )
 #define Color( r,g,b ) MakeColor(r,g,b)
 #define AColor( r,g,b,a ) MakeAlphaColor(r,g,b,a)
+#define GLColor( c )      (c)
 #define SetAlpha( rgb, a ) SetAlphaValue( rgb, a )
 #define SetGreen( rgb, g ) SetGreeValue(rgb,g )
 #define AlphaVal(color) GetAlphaValue( color )
@@ -12611,6 +12836,13 @@ PSSQL_PROC( int, DoSQLCommandEx )( CTEXTSTR command DBG_PASS);
    Parameters
    odbc :  connection to database to commit                      */
 PSSQL_PROC( void, SQLCommit )( PODBC odbc );
+/* Generate a rollback for any outstanding transactions. Connections
+   also have the feature to auto generate begin transaction, and
+   flush after a period of idle.  This also interacts with the auto
+   transact; so a rollback without a transaction is harmless.
+   Parameters
+   odbc :  connection to database to rollback                     */
+PSSQL_PROC( void, SQLRollback )( PODBC odbc );
 /* generates the begin transaction for a commection.
    Parameters
    odbc :  connection to database to start a transaction        */
@@ -13175,7 +13407,7 @@ PSSQL_PROC( int, SQLRecordQuery_js )( PODBC odbc
 	, CTEXTSTR query
 	, size_t queryLen
 	, PDATALIST *pdlResults
-	, PDATALIST pdlParams
+	, PNVDATALIST pdlParams
 	DBG_PASS );
 /*
 	this properly releases the list and all allocated strings within the entires
@@ -13208,7 +13440,7 @@ PSSQL_PROC( int, SQLRecordQuery_v4 )( PODBC odbc
                                    , CTEXTSTR **result
                                    , size_t **resultLengths
                                    , CTEXTSTR **fields
-                                   , PDATALIST pdlParameters
+                                   , PNVDATALIST pdlParameters
                                    DBG_PASS);
 /* <combine sack::sql::SQLRecordQueryEx@PODBC@CTEXTSTR@int *@CTEXTSTR **@CTEXTSTR **fields>
    \ \                                                                                      */
@@ -13624,6 +13856,13 @@ PSSQL_PROC( void, SetSQLAutoTransact )( PODBC odbc, LOGICAL bEnable );
    odbc :     connection to set auto transact on
    callback :  not NULL to enable, NULL to disable.                         */
 PSSQL_PROC( void, SetSQLAutoTransactCallback )( PODBC odbc, void (CPROC*callback)(uintptr_t,PODBC), uintptr_t psv );
+/* Set a callback for SQLRollback completion. This does not enable
+   AutoTransact; rollback observes whichever auto or explicit
+   transaction is already pending.
+   Parameters
+   odbc :     connection to set rollback callback on
+   callback :  not NULL to enable, NULL to disable.                         */
+PSSQL_PROC( void, SetSQLRollbackCallback )( PODBC odbc, void (CPROC*callback)(uintptr_t,PODBC), uintptr_t psv );
 /* Relevant for SQLite databases. After a certain period of
    inactivity the database is closed (allowing the file to be
    not-in-use during idle). PODBC odject remains valid, and
@@ -13861,6 +14100,23 @@ SQLGETOPTION_PROC( int, SACK_GetProfileBlob )( CTEXTSTR pSection, CTEXTSTR pOptn
 /* <combine sack::sql::options::SACK_GetPrivateProfileStringEx@CTEXTSTR@CTEXTSTR@CTEXTSTR@TEXTCHAR *@size_t@CTEXTSTR@LOGICAL>
    \ \                                                                                                                        */
 SQLGETOPTION_PROC( int, SACK_GetProfileBlobOdbc )( PODBC odbc, CTEXTSTR pSection, CTEXTSTR pOptname, TEXTCHAR **pBuffer, size_t *pnBuffer );
+/* Read an option's string value without a default and without creating the option.
+   Unlike SACK_GetProfileString(), no default is taken or applied, a missing option is not
+   materialized in the option tree, and the value is returned by reference (like
+   SACK_GetProfileBlob) so no maximum option length need be known.  The returned buffer is
+   allocated for the caller to Release(); the length is in characters and the buffer is also
+   null terminated.  Returns TRUE if the option exists (an empty value reads TRUE with length
+   0), else FALSE leaving the caller's pointer untouched.                                     */
+SQLGETOPTION_PROC( int, SACK_ReadProfileString )( CTEXTSTR pSection, CTEXTSTR pOptname, TEXTCHAR **pBuffer, size_t *pnBuffer );
+/* <combine sack::sql::options::SACK_ReadProfileString@CTEXTSTR@CTEXTSTR@TEXTCHAR **@size_t *>
+   \ \                                                                                                                        */
+SQLGETOPTION_PROC( int, SACK_ReadProfileStringOdbc )( PODBC odbc, CTEXTSTR pSection, CTEXTSTR pOptname, TEXTCHAR **pBuffer, size_t *pnBuffer );
+/* <combine sack::sql::options::SACK_ReadProfileString@CTEXTSTR@CTEXTSTR@TEXTCHAR **@size_t *>
+   \ \                                                                                                                        */
+SQLGETOPTION_PROC( int, SACK_ReadPrivateProfileString )( CTEXTSTR pSection, CTEXTSTR pOptname, TEXTCHAR **pBuffer, size_t *pnBuffer, CTEXTSTR pINIFile );
+/* <combine sack::sql::options::SACK_ReadProfileString@CTEXTSTR@CTEXTSTR@TEXTCHAR **@size_t *>
+   \ \                                                                                                                        */
+SQLGETOPTION_PROC( int, SACK_ReadPrivateProfileStringOdbc )( PODBC odbc, CTEXTSTR pSection, CTEXTSTR pOptname, TEXTCHAR **pBuffer, size_t *pnBuffer, CTEXTSTR pINIFile );
 /* <combine sack::sql::options::SACK_GetPrivateProfileStringEx@CTEXTSTR@CTEXTSTR@CTEXTSTR@TEXTCHAR *@size_t@CTEXTSTR@LOGICAL>
    \ \                                                                                                                        */
 SQLGETOPTION_PROC( int32_t, SACK_GetProfileInt )( CTEXTSTR pSection, CTEXTSTR pOptname, int32_t defaultval );
@@ -14450,15 +14706,12 @@ namespace fs {
 }
 #endif
 #ifdef __cplusplus
-/* Object storage system, uses a optimized hash map to index unique identifiers and data associated with them.
-Timeline exists, Multi-versioning support possible using the same file and different timestamps with associated data.
-*/
+/* Object storage system, uses a optimized hash map to index unique identifiers and data associated with them. */
 namespace objStore {
 #endif
 	struct sack_vfs_os_volume;
 	struct sack_vfs_os_file;
 	struct sack_vfs_os_find_info;
-	struct sack_vfs_os_time_cursor;
 	/* thse should probably be moved to sack_vfs_os.h being file system specific extensions. */
 	enum sack_object_store_file_system_file_ioctl_ops {
   // psvInstance should be a file handle pass (char*, size_t length )
@@ -14606,10 +14859,10 @@ namespace objStore {
 #define sack_vfs_os_ioctl_patch_sealed_object( vol, objId,objIdLen, obj,objlen, seal,seallen, result, resultlen ) sack_fs_ioctl( vol, SOSFSSIO_PATCH_OBJECT, FALSE, FALSE, objId, objIdLen, authId, authIdLen, obj, objlen, seal, seallen, result, resultlen )
 #define sack_vfs_os_ioctl_create_index( file, indexName ) sack_vfs_os_file_ioctl( file, SOSFSFIO_CREATE_INDEX, indexName )
 #define sack_vfs_os_ioctl_get_times( file, timeArray,tzArray,timeCount ) sack_vfs_os_file_ioctl( file, SOSFSFIO_GET_TIMES, timeArray,tzArray,timeCount )
-// get the last write timeline index of a file
+// get the last write time of a file
 //     sack_vfs_os_ioctl_get_time( file )
 #define sack_vfs_os_ioctl_get_time( file ) sack_vfs_os_file_ioctl( file, SOSFSFIO_GET_TIME )
-#define sack_vfs_os_ioctl_set_time( file, timestamp,tz )            sack_vfs_os_file_ioctl( file, SOSFSFIO_SETTIME, timestamp,tz )
+#define sack_vfs_os_ioctl_set_time( file, timestamp,tz )            sack_vfs_os_file_ioctl( file, SOSFSFIO_SET_TIME, timestamp,tz )
 // open a volume at the specified pathname.
 // if the volume does not exist, will create it.
 // if the volume does exist, a quick validity check is made on it, and then the result is opened
@@ -14698,8 +14951,6 @@ SACK_VFS_PROC size_t sack_vfs_os_find_get_size( struct sack_vfs_os_find_info *in
 SACK_VFS_PROC LOGICAL sack_vfs_os_get_times( struct sack_vfs_os_file* file, uint64_t** timeArray, int8_t**tzArray, size_t* timeCount );
 // set last time for object in storage. (overwrites current tick used to update on write)
 SACK_VFS_PROC LOGICAL sack_vfs_os_set_time( struct sack_vfs_os_file* file, uint64_t time, int8_t tz );
-SACK_VFS_PROC struct sack_vfs_os_time_cursor* sack_vfs_os_get_time_cursor( struct sack_vfs_os_volume* vol );
-SACK_VFS_PROC LOGICAL sack_vfs_os_read_time_cursor( struct sack_vfs_os_time_cursor* cursor, int step, uint64_t time_, uint64_t* entry, const char** filename, uint64_t* result_timestamp, int8_t* result_tz, const char** buffer, size_t* size );
 // force disabling any further writes to the volue; for unit-testing journal recovery.
 SACK_VFS_PROC LOGICAL sack_vfs_os_halt( struct sack_vfs_os_volume* volume );
 // generate a report about the internal structure of the volue...
@@ -14821,7 +15072,7 @@ VESL_EMITTER_PROC( int, vesl_parse_add_data )( struct vesl_parse_state *context
                                                  , size_t msglen
                                                  );
 // these are common functions that work for VESL stream parsers
-VESL_EMITTER_PROC( PDATALIST, vesl_parse_get_data )( struct vesl_parse_state *context );
+VESL_EMITTER_PROC( PNVDATALIST, vesl_parse_get_data )( struct vesl_parse_state *context );
 VESL_EMITTER_PROC( void, vesl_parse_dispose_state )( struct vesl_parse_state **context );
 // when an error occurs during streaming, use this to reset the parser and continue
 // using the existing parser.
@@ -15285,16 +15536,16 @@ TRANSLATION_PROC void TRANSLATION_API LoadTranslationDataFromFile( FILE *file );
 /*
    return: PLIST is a list of PTranslation
 */
-TRANSLATION_PROC PLIST TRANSLATION_API GetTranslations( void );
+TRANSLATION_PROC PNVLIST TRANSLATION_API GetTranslations( void );
 TRANSLATION_PROC CTEXTSTR TRANSLATION_API GetTranslationName( struct translation *translation );
 /*
 	return: PLIST of CTEXTSTR which are result strings of this translation
 */
-TRANSLATION_PROC PLIST TRANSLATION_API GetTranslationStrings( struct translation *translation );
+TRANSLATION_PROC PNVLIST TRANSLATION_API GetTranslationStrings( struct translation *translation );
 /*
   return: PLIST of CTEXTSTR which are source index strings
   */
-TRANSLATION_PROC PLIST TRANSLATION_API GetTranslationIndexStrings( );
+TRANSLATION_PROC PNVLIST TRANSLATION_API GetTranslationIndexStrings( );
 SACK_TRANSLATION_NAMESPACE_END
 USE_TRANSLATION_NAMESPACE
 #endif

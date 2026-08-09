@@ -43,6 +43,14 @@
 #  ifndef _GNU_SOURCE
 #    define _GNU_SOURCE
 #  endif
+/* On macOS the BSD/Darwin extensions (e.g. the termios baud constants
+   B57600/B115200/B230400 used by the commlib serial code) are hidden when
+   _POSIX_C_SOURCE is defined - which we force below.  Enabling
+   _DARWIN_C_SOURCE keeps those extensions visible while still requesting
+   the POSIX feature set.  Must be set before any system header. */
+#  if defined( __APPLE__ ) && !defined( _DARWIN_C_SOURCE )
+#    define _DARWIN_C_SOURCE
+#  endif
 #ifndef STANDARD_HEADERS_INCLUDED
 /* multiple inclusion protection symbol */
 #define STANDARD_HEADERS_INCLUDED
@@ -197,7 +205,17 @@ __declspec(dllimport) DWORD WINAPI timeGetTime(void);
 #    define getenv(name)       OSALOT_GetEnvironmentVariable(name)
 #    define setenv(name,val)   SetEnvironmentVariable(name,val)
 #  endif
-#  define Relinquish()       Sleep(0)
+// Spin-wait hint issued before yielding.  Relinquish() is only ever reached
+// after an acquire has already failed, so this costs nothing on the fast path.
+// It buys three things: PAUSE prevents the memory-order-violation pipeline
+// flush that a naive spin takes when the watched line finally changes (i.e.
+// exactly at hand-off, when you want to be fastest); it frees issue slots for
+// an SMT sibling, which matters when a spinner and a real worker share a
+// physical core; and it lets Intel Thread Director recognise a spin-wait, so
+// hybrid parts stop scheduling spinners onto P-cores against threads doing
+// real work.  YieldProcessor() resolves to _mm_pause on x86 and __yield on ARM64.
+#  define SpinHint()         YieldProcessor()
+#  define Relinquish()       do { SpinHint(); Sleep(0); } while( 0 )
 //#pragma pragnoteonly("GetFunctionAddress is lazy and has no library cleanup - needs to be a lib func")
 //#define GetFunctionAddress( lib, proc ) GetProcAddress( LoadLibrary( lib ), (proc) )
 #  ifdef __cplusplus_cli
@@ -244,7 +262,17 @@ extern __sighandler_t bsd_signal(int, __sighandler_t);
 #  endif
 // moved into timers - please linnk vs timers to get Sleep...
 //#define Sleep(n) (usleep((n)*1000))
-#  define Relinquish() sched_yield()
+// See the SpinHint note in the _WIN32 branch above.  No portable intrinsic
+// here, so pick per architecture; the fallback is a no-op, which just restores
+// the previous behaviour rather than breaking an unlisted target.
+#  if defined( __i386__ ) || defined( __x86_64__ )
+#    define SpinHint() __builtin_ia32_pause()
+#  elif defined( __aarch64__ ) || defined( __arm__ )
+#    define SpinHint() __asm__ __volatile__( "yield" ::: "memory" )
+#  else
+#    define SpinHint() ((void)0)
+#  endif
+#  define Relinquish() do { SpinHint(); sched_yield(); } while( 0 )
 #  define GetLastError() (int32_t)errno
 /* return with a THREAD_ID that is a unique, universally
    identifier for the thread for inter process communication. */
@@ -1638,6 +1666,7 @@ _CONTAINER_NAMESPACE
 	POINTER pNode[1];
 } LIST;
 typedef struct LinkBlock volatile* volatile PLIST;
+typedef struct LinkBlock volatile* PNVLIST;
 _LINKLIST_NAMESPACE_END
 #ifdef __cplusplus
 using namespace sack::containers::list;
@@ -1647,6 +1676,7 @@ _DATALIST_NAMESPACE
 typedef struct DataBlock  DATALIST;
 /* A typedef of a pointer to a DATALIST struct DataList. */
 typedef struct DataBlock volatile * volatile PDATALIST;
+typedef struct DataBlock volatile * PNVDATALIST;
 /* Data Blocks are like LinkBlocks, and store blocks of data in
    slab format. If the count of elements exceeds available, the
    structure is grown, to always contain a continuous array of
@@ -1691,6 +1721,7 @@ _DATALIST_NAMESPACE_END
 	POINTER pNode[1];
 } LINKSTACK;
 typedef struct LinkStack volatile* volatile PLINKSTACK;
+typedef struct LinkStack volatile* PNVLINKSTACK;
 /* A Stack that stores information in an array of structures of
    known size.
    Remarks
@@ -1714,6 +1745,7 @@ typedef struct DataListStack
 	uint8_t      data[1];
 } DATASTACK;
 typedef struct DataListStack volatile* volatile PDATASTACK;
+typedef struct DataListStack volatile* PNVDATASTACK;
 /* A queue which contains pointers to user objects. If the queue
    is filled to capacity and new queue is allocated, and all
    existing pointers are transferred.                            */
@@ -1737,6 +1769,7 @@ typedef struct LinkQueue
 	POINTER pNode[2];
 } LINKQUEUE;
 typedef struct LinkQueue volatile* volatile PLINKQUEUE;
+typedef struct LinkQueue volatile* PNVLINKQUEUE;
 /* A queue of structure elements.
    Remarks
    The size of each element must be known at stack creation
@@ -1768,6 +1801,7 @@ typedef struct DataQueue
 	uint8_t      data[1];
 } DATAQUEUE;
 typedef struct DataQueue volatile* volatile PDATAQUEUE;
+typedef struct DataQueue volatile* PNVDATAQUEUE;
 /* A mostly obsolete function, but can return the status of
    whether all initially scheduled startups are completed. (Or
    maybe whether we are not complete, and are processing
@@ -1806,7 +1840,8 @@ _CONTAINER_NAMESPACE_END
 namespace list {
 #  endif
 //--------------------------------------------------------
-TYPELIB_PROC  PLIST TYPELIB_CALLTYPE        CreateListEx   ( DBG_VOIDPASS );
+TYPELIB_PROC  PNVLIST TYPELIB_CALLTYPE        CreateListEx   ( DBG_VOIDPASS );
+TYPELIB_PROC  PNVLIST TYPELIB_CALLTYPE        CreateList2Ex(PLIST *ppList DBG_PASS);
 TYPELIB_PROC  void TYPELIB_CALLTYPE        MakeListEx   ( PLIST *pList DBG_PASS );
 /* Destroy a PLIST. */
 TYPELIB_PROC  void TYPELIB_CALLTYPE        DeleteListEx   ( PLIST *plist DBG_PASS );
@@ -1855,9 +1890,14 @@ TYPELIB_PROC  INDEX TYPELIB_CALLTYPE        FindLink       ( PLIST *pList, POINT
 	Return Value
 	   number of things in the list.
 */
-TYPELIB_PROC  INDEX TYPELIB_CALLTYPE        GetLinkCount   ( PLIST pList );
+TYPELIB_PROC  INDEX TYPELIB_CALLTYPE        GetLinkCount   ( PNVLIST pList );
 #define GetLinkCount(l) GetLinksUsed(&(l))
 TYPELIB_PROC  INDEX TYPELIB_CALLTYPE        GetLinksUsed( PLIST *pList );
+/* pack items in the list, moving items from the end into any empty spots
+ that are found.
+   return the count of items in the list.
+*/
+TYPELIB_PROC  INDEX TYPELIB_CALLTYPE        PackLinks( PNVLIST pList );
 /* Uses FindLink on the list for the value to delete, and then
    sets the index of the found link to NULL.
    Parameters
@@ -2029,7 +2069,8 @@ namespace data_list {
 /* Creates a data list which hold data elements of the specified
    size.
                                                                  */
-TYPELIB_PROC  PDATALIST TYPELIB_CALLTYPE  CreateDataListEx ( uintptr_t nSize DBG_PASS );
+TYPELIB_PROC  PNVDATALIST TYPELIB_CALLTYPE  CreateDataListEx ( uintptr_t nSize DBG_PASS );
+TYPELIB_PROC  PNVDATALIST TYPELIB_CALLTYPE  CreateDataList2Ex( PDATALIST *ppdl, uintptr_t nSize DBG_PASS);
 /* <combine sack::containers::data_list::DeleteDataList>
    \ \                                                   */
 TYPELIB_PROC  void TYPELIB_CALLTYPE       DeleteDataListEx ( PDATALIST *ppdl DBG_PASS );
@@ -2139,7 +2180,15 @@ TYPELIB_PROC  void TYPELIB_CALLTYPE       EmptyDataList ( PDATALIST *ppdl );
                allocation of the stack.
    Returns
    Pointer to a new link stack.                               */
-TYPELIB_PROC  PLINKSTACK TYPELIB_CALLTYPE   CreateLinkStackEx( DBG_VOIDPASS );
+TYPELIB_PROC  PNVLINKSTACK TYPELIB_CALLTYPE   CreateLinkStackEx( DBG_VOIDPASS );
+/* Creates a new stack for links (POINTERS).
+   Parameters
+   ppls :       address of a link stack pointer
+   DBG_PASS :  Debug file and line information to use for the
+			   allocation of the stack.
+   Returns
+   Pointer to a new link stack.                               */
+TYPELIB_PROC  PNVLINKSTACK TYPELIB_CALLTYPE   CreateLinkStack2Ex(PLINKSTACK *ppls DBG_PASS);
 /* Creates a new stack for links (POINTERS).  Link stack has a limited number of entries.
     When the stack fills, the oldest item on the stack is removed automatically.
 	 Parameters
@@ -2149,7 +2198,8 @@ TYPELIB_PROC  PLINKSTACK TYPELIB_CALLTYPE   CreateLinkStackEx( DBG_VOIDPASS );
    Returns
    Pointer to a new link stack.                               */
          // creates a link stack with maximum entries - any extra entries are pushed off the bottom into NULL
-TYPELIB_PROC  PLINKSTACK TYPELIB_CALLTYPE      CreateLinkStackLimitedEx        ( int max_entries  DBG_PASS );
+TYPELIB_PROC  PNVLINKSTACK TYPELIB_CALLTYPE      CreateLinkStackLimitedEx        ( int max_entries  DBG_PASS );
+TYPELIB_PROC  PNVLINKSTACK TYPELIB_CALLTYPE      CreateLinkStackLimited2Ex( PLINKSTACK *ppls, int max_entries  DBG_PASS);
 /* <combine sack::containers::link_stack::CreateLinkStackLimitedEx@int max_entries>
    Macro to pass default debug file and line information.                           */
 #define CreateLinkStackLimited(n) CreateLinkStackLimitedEx(n DBG_SRC)
@@ -2222,7 +2272,7 @@ TYPELIB_PROC  void TYPELIB_CALLTYPE   MakeDataStackEx( PDATASTACK *pds, size_t s
    Parameters
    size :       size of elements in the stack
    DBG_PASS :  debug file and line information.                 */
-TYPELIB_PROC  PDATASTACK TYPELIB_CALLTYPE   CreateDataStackEx( size_t size DBG_PASS );
+TYPELIB_PROC  PNVDATASTACK TYPELIB_CALLTYPE   CreateDataStackEx( size_t size DBG_PASS );
 /* Creates a data stack for data element of the specified size.
    Parameters
    size :       size of items in the stack
@@ -2234,7 +2284,14 @@ TYPELIB_PROC  void TYPELIB_CALLTYPE   MakeDataStackLimitedEx( PDATASTACK *pds, s
    size :       size of items in the stack
    count :      max items in stack (oldest gets deleted)
    DBG_PASS :  debug file and line information.                 */
-TYPELIB_PROC PDATASTACK TYPELIB_CALLTYPE CreateDataStackLimitedEx( size_t size, INDEX count DBG_PASS );
+TYPELIB_PROC PNVDATASTACK TYPELIB_CALLTYPE CreateDataStackLimitedEx( size_t size, INDEX count DBG_PASS );
+/* Creates a data stack for data element of the specified size.
+   Parameters
+   ppds :       address of a data stack pointer
+   size :       size of items in the stack
+   count :      max items in stack (oldest gets deleted)
+   DBG_PASS :  debug file and line information.                 */
+TYPELIB_PROC PNVDATASTACK TYPELIB_CALLTYPE CreateDataStackLimited2Ex(PDATASTACK *ppds, size_t size, INDEX count DBG_PASS);
 /* Destroys a data stack.
    Parameters
    pds :       address of a data stack pointer. The pointer will
@@ -2298,7 +2355,7 @@ TYPELIB_PROC  void TYPELIB_CALLTYPE   MakeLinkQueueEx( PLINKQUEUE *into DBG_PASS
 /* Creates a <link sack::containers::PLINKQUEUE, LinkQueue>. In
    debug mode, gets passed the current source and file so it can
    blame the user for the allocation.                            */
-TYPELIB_PROC  PLINKQUEUE TYPELIB_CALLTYPE   CreateLinkQueueEx( DBG_VOIDPASS );
+TYPELIB_PROC  PNVLINKQUEUE TYPELIB_CALLTYPE   CreateLinkQueueEx( DBG_VOIDPASS );
 /* Delete a link queue. Pass the address of the pointer to the
    queue to delete, this function sets the pointer to NULL if
    the queue is actually deleted.                              */
@@ -2318,15 +2375,15 @@ TYPELIB_PROC POINTER  TYPELIB_CALLTYPE      DequeLinkNL      ( PLINKQUEUE *pplq 
 /* Return TRUE/FALSE if the queue is empty or not. */
 TYPELIB_PROC  LOGICAL TYPELIB_CALLTYPE      IsQueueEmpty     ( PLINKQUEUE *pplq );
 /* Gets the number of elements current in the queue. */
-TYPELIB_PROC  INDEX TYPELIB_CALLTYPE        GetQueueLength   ( PLINKQUEUE plq );
+TYPELIB_PROC  INDEX TYPELIB_CALLTYPE        GetQueueLength   ( PNVLINKQUEUE plq );
 // get a PLINKQUEUE element at index
 //  If idx < 0 then count from the end of the queue, otherwise count from the start of the queue
 // start of the queue is the next element to be dequeue, end of the queue is the last element added to the queue.
-TYPELIB_PROC  POINTER TYPELIB_CALLTYPE      PeekQueueEx    ( PLINKQUEUE plq, int idx );
+TYPELIB_PROC  POINTER TYPELIB_CALLTYPE      PeekQueueEx    ( PNVLINKQUEUE plq, int idx );
 /* Can be used to look at the next element in the queue without
    removing it from the queue. PeekQueueEx allows you to specify
    an index of an item in the queue to get.                      */
-TYPELIB_PROC  POINTER TYPELIB_CALLTYPE      PeekQueue    ( PLINKQUEUE plq );
+TYPELIB_PROC  POINTER TYPELIB_CALLTYPE      PeekQueue    ( PNVLINKQUEUE plq );
 /* <combinewith sack::containers::queue::CreateLinkQueueEx@DBG_VOIDPASS>
    \ \                                                                   */
 #define     CreateLinkQueue()     CreateLinkQueueEx( DBG_VOIDSRC )
@@ -2361,7 +2418,7 @@ TYPELIB_PROC  POINTER TYPELIB_CALLTYPE      PeekQueue    ( PLINKQUEUE plq );
 TYPELIB_PROC  void TYPELIB_CALLTYPE   MakeDataQueueEx( PDATAQUEUE *into, INDEX size DBG_PASS );
 /* Creates a PDATAQUEUE. Can pass DBG_FILELINE information to
    blame other code for the allocation.                       */
-TYPELIB_PROC  PDATAQUEUE TYPELIB_CALLTYPE   CreateDataQueueEx( INDEX size DBG_PASS );
+TYPELIB_PROC  PNVDATAQUEUE TYPELIB_CALLTYPE   CreateDataQueueEx( INDEX size DBG_PASS );
 /* Creates a PDATAQUEUE that has an overridden expand-by amount
    and initial amount of entries in the queue. (expecting
    something like 1000 to start and expand by 500, instead of
@@ -2371,7 +2428,7 @@ TYPELIB_PROC void TYPELIB_CALLTYPE MakeLargeDataQueueEx( PDATAQUEUE *pdq, INDEX 
    and initial amount of entries in the queue. (expecting
    something like 1000 to start and expand by 500, instead of
    the default 0, and expand by 1.                              */
-TYPELIB_PROC  PDATAQUEUE TYPELIB_CALLTYPE   CreateLargeDataQueueEx( INDEX size, INDEX entries, INDEX expand DBG_PASS );
+TYPELIB_PROC  PNVDATAQUEUE TYPELIB_CALLTYPE   CreateLargeDataQueueEx( INDEX size, INDEX entries, INDEX expand DBG_PASS );
 /* Destroys a data queue. */
 TYPELIB_PROC  void TYPELIB_CALLTYPE         DeleteDataQueueEx( PDATAQUEUE *pplq DBG_PASS );
 /* Add a data element into the queue. */
@@ -2391,7 +2448,7 @@ TYPELIB_PROC  LOGICAL TYPELIB_CALLTYPE      IsDataQueueEmpty ( PDATAQUEUE *pplq 
 /* Empty a dataqueue of all data. (Sets head=tail). */
 TYPELIB_PROC  void TYPELIB_CALLTYPE         EmptyDataQueue ( PDATAQUEUE *pplq );
 /* returns how many entries are in the queue. */
-TYPELIB_PROC  INDEX   TYPELIB_CALLTYPE      GetDataQueueLength( PDATAQUEUE pdq );
+TYPELIB_PROC  INDEX   TYPELIB_CALLTYPE      GetDataQueueLength( PNVDATAQUEUE pdq );
 /*
  * get a PDATAQUEUE element at index
  * result buffer is a pointer to the type of structure expected to be
@@ -2874,6 +2931,12 @@ TYPELIB_PROC  uintptr_t TYPELIB_CALLTYPE  _ForAllInSet( GENERICSET *pSet, int un
    ForEachSetMember'                                       */
 typedef uintptr_t (CPROC *FESMCallback)(INDEX,uintptr_t);
 TYPELIB_PROC  uintptr_t TYPELIB_CALLTYPE  ForEachSetMember ( GENERICSET *pSet, int unitsize, int max, FESMCallback f, uintptr_t psv );
+/*
+ StoreSetIntoEx() - stores a set into a packed linear array passed in.
+ to get the size to create the array, can use CountUsedInSet()...
+ doing it this way is less calls then a for-each-set-member self-copy.
+    */
+TYPELIB_PROC  void * TYPELIB_CALLTYPE  StoreSetIntoEx( GENERICSET *pSet, void*unit, int unitsize, int max );
  //def __cplusplus
 #if 0
 #define DeclareSet(name)	                                struct name##set_tag {	               uint32_t set_size;	                             uint32_t element_size;	                         uint32_t element_cnt;	                          PGENERICSET pool;	                        name##set_tag() {	                        element_size = sizeof( name );	             element_cnt = MAX##name##SPERSET;	          set_size = (element_size * element_cnt )+ ((((element_cnt + 31 )/ 32 )- 1 ) * 4) + sizeof( GENERICSET );	 pool = NULL;	                               }	    ~name##set_tag() { DeleteSet( &pool ); }	 name* grab() { return (name*)GetFromSetEx( &pool, set_size, element_size, element_cnt DBG_SRC ); }	 name* grab(INDEX member) { return (name*)GetSetMemberEx( &pool, member, set_size, element_size, element_cnt DBG_SRC ); }	 name* get(INDEX member) { return (this)?(name*)GetUsedSetMemberEx( &pool, member, set_size, element_size, element_cnt DBG_SRC ):(NULL); }	 void drop( name* member ) { DeleteFromSetEx( pool, (POINTER)member, element_size, element_cnt ); }	 int valid( name* member ) { return MemberValidInSetEx( pool, (POINTER)member, element_size, element_cnt ); }	 uintptr_t forall( FAISCallback f, uintptr_t psv ) { if( this ) return _ForAllInSet( pool, element_size, element_cnt, f, psv ); else return 0; }	 };	       typedef struct name##set_tag *P##name##SET, name##SET;
@@ -2989,7 +3052,8 @@ typedef struct format_info_tag
 		BIT_FIELD background : 4;
       /* a bit indicating the text should blink if supported */
 		BIT_FIELD blink : 1;
-      /* a bit indicating the foreground and background color should be reversed */
+		BIT_FIELD blinkFast : 1;
+		/* a bit indicating the foreground and background color should be reversed */
 		BIT_FIELD reverse : 1;
 		// usually highly is bolder, perhaps it's
       // a highlighter effect and changes the background
@@ -3031,6 +3095,8 @@ typedef struct format_info_tag
 		BIT_FIELD bAlign:2;
       /* format op indicates one of the enum FORMAT_OPS applies to this segment */
 		BIT_FIELD format_op : 7;
+		BIT_FIELD rgb_foreground : 24;
+		BIT_FIELD rgb_background : 24;
 	} flags;
 	// if x,y are valid segment will have TF_POSFORMAT set...
 	union {
@@ -3486,6 +3552,14 @@ TYPELIB_PROC  PTEXT TYPELIB_CALLTYPE  SegCreateFromFloatEx( double value DBG_PAS
    source :  source list to add to
    other :   additional segments to add to source.                  */
 TYPELIB_PROC  PTEXT TYPELIB_CALLTYPE  SegAppend   ( PTEXT source, PTEXT other );
+/* Appends a list of segments to an existing list of segments. This
+   assumes that the additional segment is referncing the head of
+   the segment list.
+   Parameters
+   source :  first segment to append to
+	... :   additional segments to add to source.
+	        MUST PASS NULL AS LAST APPEND         */
+TYPELIB_PROC  PTEXT TYPELIB_CALLTYPE  SegAppends(PTEXT source, ...);
 /* Inserts a segment before another segment.
    Parameters
    what :    what to insert into the list
@@ -3947,7 +4021,15 @@ TYPELIB_PROC  void TYPELIB_CALLTYPE  VarTextEmptyEx( PVARTEXT pvt DBG_PASS);
    c :         character to add
    DBG_PASS :  optional debug information         */
 TYPELIB_PROC  void TYPELIB_CALLTYPE  VarTextAddCharacterEx( PVARTEXT pvt, TEXTCHAR c DBG_PASS );
+/* Add a unicode RUNE to a buffer (rune should only be up to 21 bits, but encoding probably supports
+ runes up to the full 32 bits
+ */
 TYPELIB_PROC  void TYPELIB_CALLTYPE  VarTextAddRuneEx( PVARTEXT pvt, TEXTRUNE c, LOGICAL overlong DBG_PASS );
+/* Aadd a string of text tokens to a vartext output.  This uses
+ the same logic as BuildLine to resolve end of lines and tabs/spaces
+ encoded into text segments.
+ */
+TYPELIB_PROC void TYPELIB_CALLTYPE VarTextAddText( PVARTEXT pvt, PTEXT line, int bSingle );
 /* Adds a single character to a PVARTEXT collector.
    Example
    <code lang="c++">
@@ -3980,9 +4062,9 @@ TYPELIB_PROC  void TYPELIB_CALLTYPE  VarTextAddDataEx( PVARTEXT pvt, CTEXTSTR bl
 #define VarTextAddData(pvt,block,length) VarTextAddDataEx( (pvt),(block),(length) DBG_SRC )
 /* Commits the currently collected text to segment, and adds the
    segment to the internal line accumulator.
-		 returns true if any data was added...
+		 returns new segment added (can be treated as bool) if any data was added...
        move any collected text to commit... */
-TYPELIB_PROC  LOGICAL TYPELIB_CALLTYPE  VarTextEndEx( PVARTEXT pvt DBG_PASS );
+TYPELIB_PROC  PTEXT TYPELIB_CALLTYPE  VarTextEndEx( PVARTEXT pvt DBG_PASS );
 /* <combine sack::containers::text::VarTextEndEx@PVARTEXT pvt>
    \ \                                                         */
 #define VarTextEnd(pvt) VarTextEndEx( (pvt) DBG_SRC )
@@ -5215,6 +5297,10 @@ typedef void (CPROC*TaskOutput)(uintptr_t, PTASK_INFO task, CTEXTSTR buffer, siz
 // this is a Linux option - uses forkpty() instead of just fork() to
 // start a process - meant for interactive processes.
 #define LPP_OPTION_INTERACTIVE        2048
+// on windows, enable nShow as minimized (else normal)
+#define LPP_OPTION_MINIMIZED          4096
+// on windows, enable nShow as maximized (else normal)
+#define LPP_OPTION_MAXIMIZED          8192
 struct environmentValue {
 	char* field;
 	char* value;
@@ -5241,7 +5327,7 @@ SYSTEM_PROC( PTASK_INFO, LaunchPeerProgram_v2 )( CTEXTSTR program, CTEXTSTR path
                                                , TaskOutput OutputHandler2
                                                , TaskEnd EndNotice
                                                , uintptr_t psv
-                                               , PLIST envStrings
+                                               , PNVLIST envStrings
                                                 DBG_PASS
                                                );
 SYSTEM_PROC( PTASK_INFO, LaunchProgramEx )( CTEXTSTR program, CTEXTSTR path, PCTEXTSTR args, TaskEnd EndNotice, uintptr_t psv );
@@ -5326,6 +5412,17 @@ SYSTEM_PROC( generic_function, LoadFunctionExx )( CTEXTSTR library, CTEXTSTR fun
 SYSTEM_PROC( generic_function, LoadFunctionEx )( CTEXTSTR library, CTEXTSTR function DBG_PASS);
 SYSTEM_PROC( void *, GetPrivateModuleHandle )( CTEXTSTR libname );
 /*
+* Send win32 PTY key event to a task running with a pseudo console. (ANSI code for key event)
+*
+*/
+SYSTEM_PROC( int, SendPTYKeyEvent )( PTASK_INFO task, uint32_t key );
+/*
+*    Set the console size for a task which is running with a pseudo console.
+ *   cols, rows are in characters
+ *   width, height are in pixels
+ */
+SYSTEM_PROC( int, SetProcessConsoleSize )( PTASK_INFO task, int cols, int rows, int width, int height );
+/*
   Add a custom loaded library; attach a name to the DLL space; this should allow
   getcustomsybmol to resolve these
   */
@@ -5394,6 +5491,11 @@ SYSTEM_PROC( void, AddKillSignalCallback )( int( *cb )( uintptr_t ), uintptr_t )
   Remove a callback which was added to event callback list.
 */
 SYSTEM_PROC( void, RemoveKillSignalCallback )( int( *cb )( uintptr_t ), uintptr_t );
+#ifdef _WIN32
+SYSTEM_PROC( uint32_t, GetTaskProcessId )( PTASK_INFO task );
+#elif defined( __LINUX__ )
+SYSTEM_PROC( pid_t, GetTaskProcessId )( PTASK_INFO task );
+#endif
 #if _WIN32
 /*
   moves the window of the task; if there is a main window for the task within the timeout perioud.
@@ -5475,7 +5577,7 @@ struct process_tree_pair {
       }
     }
 */
-SYSTEM_PROC( PDATALIST, GetProcessTree )( PTASK_INFO task );
+SYSTEM_PROC( PNVDATALIST, GetProcessTree )( PTASK_INFO task );
 #endif
 #ifdef __LINUX__
 /*
@@ -6280,6 +6382,24 @@ MEM_PROC  uint32_t MEM_API  LockedIncrement ( volatile uint32_t* p );
    Parameters
    p :  pointer to a 32 bit value to decrement.         */
 MEM_PROC  uint32_t MEM_API  LockedDecrement ( volatile uint32_t* p );
+/* Multi-processor safe bitwise OR into a variable.  Use this instead of
+   `flags |= bits` for any flag word written from more than one thread - a plain
+   |= is a read-modify-write, so two threads setting different bits can lose one
+   of them entirely.
+   Parameters
+   p :     pointer to a 32 bit value to OR into.
+   bits :  bits to set.
+   Returns
+   The value *before* the OR (matching InterlockedOr / __atomic_fetch_or).  */
+MEM_PROC  uint32_t MEM_API  LockedOr ( volatile uint32_t* p, uint32_t bits );
+/* Multi-processor safe bitwise AND into a variable.  Use this instead of
+   `flags &= ~bits`; see LockedOr for why.  Pass the mask already inverted.
+   Parameters
+   p :     pointer to a 32 bit value to AND into.
+   mask :  mask to AND with (i.e. ~bits to clear those bits).
+   Returns
+   The value *before* the AND.                                              */
+MEM_PROC  uint32_t MEM_API  LockedAnd ( volatile uint32_t* p, uint32_t mask );
 #ifdef __cplusplus
 // like also __if_assembly__
 //extern "C" {
@@ -7229,9 +7349,11 @@ DeclareThreadLocal struct timespec global_static_time_ts;
 #define timeGetTime() (uint32_t)(timeGetTime64())
 #endif
 #define tickToTimeSpec(ts,tick) (((ts).tv_sec = (tick) / 1000ULL),((ts).tv_nsec=((tick)%1000ULL)*1000000ULL))
-#define tickToFileTime(ft,tick) ((((ft).highPart).tv_sec = ((tick*10000)+EPOCH_DIFF_MS)>>32 ),(((ft).lowPart)=((tick*10000)+EPOCH_DIFF_MS) & 0XFFFFFFFF ))
+// FILETIME counts 100ns units since 1601, so the epoch shift has to be applied in the
+// source unit and the whole thing scaled after -- not added to an already-scaled value.
+#define tickToFileTime(ft,tick) ((((ft).highPart) = ((((tick)+EPOCH_DIFF_MS)*10000ULL)>>32 )),(((ft).lowPart)=(((tick)+EPOCH_DIFF_MS)*10000ULL) & 0XFFFFFFFF ))
 #define tickNsToTimeSpec(ts,tick) (((ts).tv_sec = (tick) / 1000000000ULL),((ts).tv_nsec=(tick)%1000000000ULL))
-#define tickNsToFileTime(ft,tick) ((((ft).highPart).tv_sec = ((tick)+EPOCH_DIFF_NS)>>32 ),(((ft).lowPart)=((tick)+EPOCH_DIFF_NS) & 0XFFFFFFFF ))
+#define tickNsToFileTime(ft,tick) ((((ft).highPart) = ((((tick)+EPOCH_DIFF_NS)/100ULL)>>32 )),(((ft).lowPart)=((((tick)+EPOCH_DIFF_NS)/100ULL)) & 0XFFFFFFFF ))
 //  these are rude defines overloading otherwise very practical types
 // but - they have to be dispatched after all standard headers.
 #ifndef FINAL_TYPES
@@ -7726,7 +7848,8 @@ struct rt_init
                           //   also used when walking table to flag
                           //   completed entries
  // - priority (0-highest 255-lowest)
-    __type_rtp  priority;
+	 __type_rtp  priority;
+#define RUNTIME_PRIORITY_FILTER(x)  (((x)>255)?255:(x))
       // - routine
     __type_rtn  rtn;
 };
@@ -7736,8 +7859,8 @@ struct rt_init
 // watcom
 //------------------------------------------------------------------------------------
 //void RegisterStartupProc( void (*proc)(void) );
-#define PRIORITY_PRELOAD(name,priority) static void pastejunk(schedule_,name)(void); static void CPROC name(void);	 static struct rt_init __based(__segname("XI")) pastejunk(name,_ctor_label)={0,(DEADSTART_PRELOAD_PRIORITY-1),pastejunk(schedule_,name)};	 static void pastejunk(schedule_,name)(void) {	                 RegisterPriorityStartupProc( name,TOSTR(name),priority,&pastejunk(name,_ctor_label) DBG_SRC );	}	                                       void name(void)
-#define ATEXIT_PRIORITY(name,priority) static void pastejunk(schedule_exit_,name)(void); static void CPROC name(void);	 static struct rt_init __based(__segname("XI")) pastejunk(name,_dtor_label)={0,69,pastejunk(schedule_exit_,name)};	 static void pastejunk(schedule_exit_,name)(void) {	                                              RegisterPriorityShutdownProc( name,TOSTR(name),priority,&name##_dtor_label DBG_SRC );	}	                                       void name(void)
+#define PRIORITY_PRELOAD(name,priority) static void pastejunk(schedule_,name)(void); static void CPROC name(void);	 static struct rt_init __based(__segname("XI")) pastejunk(name,_ctor_label)={0,(DEADSTART_PRELOAD_PRIORITY-1),pastejunk(schedule_,name)};	 static void pastejunk(schedule_,name)(void) {	                 RegisterPriorityStartupProc( name,TOSTR(name),RUNTIME_PRIORITY_FILTER(priority),&pastejunk(name,_ctor_label) DBG_SRC );	}	                                       void name(void)
+#define ATEXIT_PRIORITY(name,priority) static void pastejunk(schedule_exit_,name)(void); static void CPROC name(void);	 static struct rt_init __based(__segname("XI")) pastejunk(name,_dtor_label)={0,69,pastejunk(schedule_exit_,name)};	 static void pastejunk(schedule_exit_,name)(void) {	                                              RegisterPriorityShutdownProc( name,TOSTR(name),RUNTIME_PRIORITY_FILTER(priority),&name##_dtor_label DBG_SRC );	}	                                       void name(void)
 // syslog runs preload at priority 65
 // message service runs preload priority 66
 // deadstart itself tries to run at priority 70 (after all others have registered)
@@ -7763,26 +7886,21 @@ static void name(void); static void name##_x_(void);	static struct rt_init __bas
 #elif defined( __GNUC__ )
 /* code taken from openwatcom/bld/watcom/h/rtinit.h */
 typedef unsigned char   __type_rtp;
+typedef unsigned short   __type_rtp_priority;
 typedef void(*__type_rtn ) ( void );
  // structure placed in XI/YI segment
 struct rt_init
 {
 #define DEADSTART_RT_LIST_START 0xFF
  // - near=0/far=1 routine indication
-    __type_rtp  rtn_type;
+    __type_rtp       rtn_type;
                           //   also used when walking table to flag
                           //   completed entries
  // has this been scheduled? (0 if no)
-    __type_rtp  scheduled;
+    __type_rtp       scheduled;
  // - priority (0-highest 255-lowest)
-    __type_rtp  priority;
-#if defined( __64__ ) ||defined( __arm__ )||defined( __GNUC__ )
-#define INIT_PADDING ,{0}
- // need this otherwise it's 23 bytes and that'll be bad.
-	 char padding[1];
-#else
-#define INIT_PADDING
-#endif
+    __type_rtp_priority  priority;
+#define RT_LIST_INIT_PADDING
  // 32 bits in 64 bits....
 	 int line;
 // this ends up being nicely aligned for 64 bit platforms
@@ -7801,7 +7919,16 @@ struct rt_init
 	 struct rt_init *junk2[3];
 #endif
 #endif
-} __attribute__((packed));
+}
+#ifdef __MAC__
+// ld64 on arm64 warns that the packed (alignment 1) atoms placed in the
+// deadstart section may produce unaligned pointers.  The struct is already
+// sized to a multiple of 8 (see the padding notes above), so advertise 8-byte
+// alignment to silence the warning without changing the packed layout/size.
+__attribute__((packed, aligned(8)));
+#else
+__attribute__((packed));
+#endif
 #if defined( _DEBUG ) || defined( _DEBUG_INFO )
 #  if defined( __GNUC__ ) && defined( __64__)
 #    define JUNKINIT(name) ,&pastejunk(name,_ctor_label), {0,0}
@@ -7824,14 +7951,14 @@ struct rt_init
 #  define DEADSTART_SECTION "deadstart_list"
 #endif
 #ifdef __MANUAL_PRELOAD__
-#define PRIORITY_PRELOAD(name,pr) static void name(void);	 RTINIT_STATIC struct rt_init pastejunk(name,_ctor_label)		__attribute__((section(DEADSTART_SECTION))) __attribute__((used))	 =	 {0,0,pr INIT_PADDING, __LINE__, name PASS_FILENAME	, TOSTR(name) JUNKINIT(name)} ;	 void name(void);	 void pastejunk(registerStartup,name)(void) __attribute__((constructor));	 void pastejunk(registerStartup,name)(void) {	 RegisterPriorityStartupProc(name,TOSTR(name),pr,NULL DBG_SRC); }	 void name(void)
+#define PRIORITY_PRELOAD(name,pr) static void name(void);	 RTINIT_STATIC struct rt_init pastejunk(name,_ctor_label)		__attribute__((section(DEADSTART_SECTION))) __attribute__((used))	 =	 {0,0,pr RT_LIST_INIT_PADDING, __LINE__, name PASS_FILENAME	, TOSTR(name) JUNKINIT(name)} ;	 void name(void);	 void pastejunk(registerStartup,name)(void) __attribute__((constructor));	 void pastejunk(registerStartup,name)(void) {	 RegisterPriorityStartupProc(name,TOSTR(name),pr,NULL DBG_SRC); }	 void name(void)
 #else
 #if defined( _WIN32 ) || defined( __GNUC__ )
 #  define HIDDEN_VISIBILITY
 #else
 #  define HIDDEN_VISIBILITY  __attribute__((visibility("hidden")))
 #endif
-#define PRIORITY_PRELOAD(name,pr) static void name(void);	         RTINIT_STATIC struct rt_init pastejunk(name,_ctor_label)	         __attribute__((section(DEADSTART_SECTION))) __attribute__((used))	  ={0,0,pr INIT_PADDING	                                           ,__LINE__,name	                                                 PASS_FILENAME	                                                 ,TOSTR(name)	                                                   JUNKINIT(name)};	                                               static void name(void) __attribute__((used));	 void name(void)
+#define PRIORITY_PRELOAD(name,pr) static void name(void);	         RTINIT_STATIC struct rt_init pastejunk(name,_ctor_label)	         __attribute__((section(DEADSTART_SECTION))) __attribute__((used))	  ={0,0,pr RT_LIST_INIT_PADDING	                                   ,__LINE__,name	                                                 PASS_FILENAME	                                                 ,TOSTR(name)	                                                   JUNKINIT(name)};	                                               static void name(void) __attribute__((used));	 void name(void)
 #endif
 typedef void(*atexit_priority_proc)(void (*)(void),CTEXTSTR,int DBG_PASS);
 #define PRIORITY_ATEXIT(name,priority) static void name(void);           static void pastejunk(atexit,name)(void) __attribute__((constructor));   void pastejunk(atexit,name)(void)                                        {	                                                                        RegisterPriorityShutdownProc(name,TOSTR(name),priority,NULL DBG_SRC); }                                                                        void name(void)
@@ -7844,6 +7971,7 @@ typedef void(*atexit_priority_proc)(void (*)(void),CTEXTSTR,int DBG_PASS);
 #elif defined( __CYGWIN__ )
 /* code taken from openwatcom/bld/watcom/h/rtinit.h */
 typedef unsigned char   __type_rtp;
+typedef unsigned short  __type_rtp_priority;
 typedef void(*__type_rtn ) ( void );
  // structure placed in XI/YI segment
 struct rt_init
@@ -7869,14 +7997,8 @@ struct rt_init
  // has this been scheduled? (0 if no)
     __type_rtp  scheduled;
  // - priority (0-highest 255-lowest)
-    __type_rtp  priority;
-#if defined( __GNUC__ ) || defined( __64__ ) || defined( __arm__ ) || defined( __CYGWIN__ )
-#define INIT_PADDING ,{0}
- // need this otherwise it's 23 bytes and that'll be bad.
-	 char padding[1];
-#else
-#define INIT_PADDING
-#endif
+    __type_rtp_priority  priority;
+#define RT_LIST_INIT_PADDING
  // 32 bits in 64 bits....
 	 int line;
 // this ends up being nicely aligned for 64 bit platforms
@@ -7891,7 +8013,16 @@ struct rt_init
     // to 32 bytes...
 	 struct rt_init *junk2[3];
 #endif
-} __attribute__((packed));
+}
+#ifdef __MAC__
+// ld64 on arm64 warns that the packed (alignment 1) atoms placed in the
+// deadstart section may produce unaligned pointers.  The struct is already
+// sized to a multiple of 8 (see the padding notes above), so advertise 8-byte
+// alignment to silence the warning without changing the packed layout/size.
+__attribute__((packed, aligned(8)));
+#else
+__attribute__((packed));
+#endif
 #define JUNKINIT(name) ,&pastejunk(name,_ctor_label)
 #ifdef __cplusplus
 #define RTINIT_STATIC
@@ -7905,7 +8036,7 @@ typedef void(*atexit_priority_proc)(void (*)(void),CTEXTSTR,int DBG_PASS);
 #else
 #  define PASS_FILENAME
 #endif
-#define PRIORITY_PRELOAD(name,pr) static void name(void);	 RTINIT_STATIC struct pastejunk(rt_init name,_ctor_label)	   __attribute__((section("deadstart_list")))	 ={0,0,pr INIT_PADDING	     ,__LINE__,name	          PASS_FILENAME	        ,TOSTR(name)	        JUNKINIT(name)};	 static void name(void)
+#define PRIORITY_PRELOAD(name,pr) static void name(void);	 RTINIT_STATIC struct pastejunk(rt_init name,_ctor_label)	   __attribute__((section("deadstart_list")))	 ={0,0,pr RT_LIST_INIT_PADDING	     ,__LINE__,name	          PASS_FILENAME	        ,TOSTR(name)	        JUNKINIT(name)};	 static void name(void)
 #define ATEXIT(name)      ATEXIT_PRIORITY(name,ATEXIT_PRIORITY_DEFAULT)
 #define PRIORITY_ATEXIT ATEXIT_PRIORITY
 #define ROOT_ATEXIT(name) static void name(void) __attribute__((destructor));    static void name(void)
@@ -8662,15 +8793,6 @@ PROCREG_NAMESPACE_END
 #endif
 #endif
 #define MY_OFFSETOF( ppstruc, member ) ((uintptr_t)&((*ppstruc)->member)) - ((uintptr_t)(*ppstruc))
-#ifndef USE_CUSTOM_ALLOCER
-#define USE_SACK_CUSTOM_MEMORY_ALLOCATION
- // this has to be a compile option (option from cmake)
-#ifdef USE_SACK_CUSTOM_MEMORY_ALLOCATION
-#define USE_CUSTOM_ALLOCER 1
-#else
-#define USE_CUSTOM_ALLOCER 0
-#endif
-#endif
 #ifdef __cplusplus
 namespace sack {
 	namespace containers {
@@ -8695,7 +8817,7 @@ namespace sack {
 #ifdef UNDER_CE
 #define LockedExchange InterlockedExchange
 #endif
-			PLIST  CreateListEx( DBG_VOIDPASS )
+			PNVLIST  CreateListEx( DBG_VOIDPASS )
 			{
 				PLIST pl;
 				INDEX size;
@@ -8708,17 +8830,18 @@ namespace sack {
 			{
 				PLIST pl;
 				INDEX size;
-				(*into) = pl = (PLIST)AllocateEx( (size = (INDEX)offsetof( LIST, pNode[0] )) DBG_RELAY );
+				pl = (PLIST)AllocateEx( (size = (INDEX)offsetof( LIST, pNode[0] )) DBG_RELAY );
+				(*into) = pl;
 				MemSet( (POINTER)pl, 0, size );
 			}
 			//--------------------------------------------------------------------------
 			void  DeleteListEx( PLIST* pList DBG_PASS )
 			{
-				PLIST ppList;
+				PNVLIST ppList;
 				while (LockedExchange( list_local_lock, 1 ))
 					Relinquish();
 				if (pList &&
-					(ppList = (PLIST)LockedExchangePtrSzVal( (uintptr_t*)pList, 0 ))
+					(ppList = (PNVLIST)LockedExchangePtrSzVal( (uintptr_t*)pList, 0 ))
 					)
 				{
 					ReleaseEx( (POINTER)ppList DBG_RELAY );
@@ -8753,7 +8876,10 @@ namespace sack {
 					// copy old list to new list
 					MemCpy( (POINTER)pl, (POINTER)*pList, old_size );
 					if (amount == 1)
-						pl->pNode[pl->Cnt++] = NULL;
+					{
+						pl->pNode[pl->Cnt] = NULL;
+						pl->Cnt = pl->Cnt + 1;
+					}
 					else
 					{
 						// clear the new additions to the list
@@ -8841,6 +8967,41 @@ namespace sack {
 				list_local_lock[0] = 0;
 			}
 			//--------------------------------------------------------------------------
+			INDEX PackLinks( PNVLIST pList )
+			{
+				INDEX to = 0;
+				INDEX from = pList->Cnt-1;
+				INDEX last = pList->Cnt-1;
+				if (!pList)
+ // no list has no items.
+					return 0;
+				while (LockedExchange( list_local_lock, 1 ))
+					Relinquish();
+				do {
+					for( ; to < from; to++ ) {
+ // found empty spot at 'to'
+						if( !pList->pNode[to] ) {
+							if( to > last ) last = to;
+							break;
+						}
+					}
+					if( to < pList->Cnt ) {
+						for( ; from > to; from-- ) {
+							POINTER p = pList->pNode[from];
+							if( p ) {
+								if( from > last ) last = from;
+								pList->pNode[to] = p;
+								pList->pNode[from] = NULL;
+								from--;
+								break;
+							}
+						}
+					}
+				} while( from > to );
+				list_local_lock[0] = 0;
+				return last;
+			}
+			//--------------------------------------------------------------------------
 			POINTER  GetLink( PLIST* pList, INDEX idx )
 			{
 				// must lock the list so that it's not expanded out from under us...
@@ -8906,7 +9067,7 @@ namespace sack {
 				return result;
 			}
 			//--------------------------------------------------------------------------
-			INDEX GetLinkCount_( PLIST pList ) {
+			INDEX GetLinkCount_( PNVLIST pList ) {
 				INDEX i;
 				POINTER p;
 				INDEX count = 0;
@@ -8987,7 +9148,7 @@ namespace sack {
 #endif
 #endif
 			//--------------------------------------------------------------------------
-			PDATALIST ExpandDataListEx( PDATALIST* ppdl, INDEX entries DBG_PASS )
+			PNVDATALIST ExpandDataListEx( PDATALIST* ppdl, INDEX entries DBG_PASS )
 			{
  //-V595
 				PDATALIST pdl = (*ppdl);
@@ -9008,13 +9169,20 @@ namespace sack {
 				return pNewList;
 			}
 			//--------------------------------------------------------------------------
-			PDATALIST  CreateDataListEx( uintptr_t nSize DBG_PASS )
+			PNVDATALIST  CreateDataList2Ex(PDATALIST *ppdl, uintptr_t nSize DBG_PASS)
 			{
-				PDATALIST pdl = (PDATALIST)AllocateEx( sizeof( DATALIST ) + (nSize * 8) - 1 DBG_RELAY );
+				PDATALIST pdl = (PDATALIST)AllocateEx(sizeof(DATALIST) + (nSize * 8) - 1 DBG_RELAY);
+				(*ppdl) = pdl;
 				pdl->Cnt = 0;
 				pdl->Avail = 8;
 				pdl->Size = nSize;
 				return pdl;
+			}
+			//--------------------------------------------------------------------------
+			PNVDATALIST  CreateDataListEx( uintptr_t nSize DBG_PASS )
+			{
+				PDATALIST pdl;
+				return CreateDataList2Ex( &pdl, nSize DBG_RELAY );
 			}
 			//--------------------------------------------------------------------------
 			void  DeleteDataListEx( PDATALIST* ppdl DBG_PASS )
@@ -9067,7 +9235,7 @@ namespace sack {
 						MemCpy( (POINTER)((*ppdl)->data + ((*ppdl)->Size * idx))
 							, (POINTER)((*ppdl)->data + ((*ppdl)->Size * (idx + 1)))
 							, (*ppdl)->Size * ( (*ppdl)->Cnt - idx - 1 ) );
-					(*ppdl)->Cnt--;
+					(*ppdl)->Cnt = (*ppdl)->Cnt - 1;
 				}
 			}
 			//--------------------------------------------------------------------------
@@ -9087,19 +9255,26 @@ namespace sack {
 			void		MakeLinkStackLimitedEx( PLINKSTACK *into, int max_entries  DBG_PASS )
 			{
 				PLINKSTACK pls;
-				(*into) = pls = (PLINKSTACK)AllocateEx( sizeof( LINKSTACK ) DBG_RELAY );
+				pls = (PLINKSTACK)AllocateEx( sizeof( LINKSTACK ) DBG_RELAY );
+				(*into) = pls;
 				pls->Top = 0;
 				pls->Cnt = 0;
 				pls->Max = max_entries;
 			}
-			PLINKSTACK		CreateLinkStackLimitedEx( int max_entries  DBG_PASS )
+			PNVLINKSTACK		CreateLinkStackLimited2Ex(PLINKSTACK* ppls, int max_entries  DBG_PASS)
 			{
 				PLINKSTACK pls;
-				pls = (PLINKSTACK)AllocateEx( sizeof( LINKSTACK ) DBG_RELAY );
+				pls = (PLINKSTACK)AllocateEx(sizeof(LINKSTACK) DBG_RELAY);
+				(*ppls) = pls;
 				pls->Top = 0;
 				pls->Cnt = 0;
 				pls->Max = max_entries;
 				return pls;
+			}
+			PNVLINKSTACK		CreateLinkStackLimitedEx( int max_entries  DBG_PASS )
+			{
+				PLINKSTACK pls;
+				return CreateLinkStackLimited2Ex(&pls, max_entries DBG_RELAY);
 			}
 			//--------------------------------------------------------------------------
 			void  MakeLinkStackEx( PLINKSTACK *into DBG_PASS )
@@ -9107,9 +9282,13 @@ namespace sack {
 				MakeLinkStackLimitedEx( into, 0 DBG_RELAY );
 			}
 			//--------------------------------------------------------------------------
-			PLINKSTACK  CreateLinkStackEx( DBG_VOIDPASS )
+			PNVLINKSTACK  CreateLinkStackEx( DBG_VOIDPASS )
 			{
 				return CreateLinkStackLimitedEx( 0 DBG_RELAY );
+			}
+			PNVLINKSTACK  CreateLinkStack2Ex(PLINKSTACK *ppls DBG_PASS)
+			{
+				return CreateLinkStackLimited2Ex(ppls, 0 DBG_RELAY);
 			}
 			//--------------------------------------------------------------------------
 			void  DeleteLinkStackEx( PLINKSTACK* pls DBG_PASS )
@@ -9138,7 +9317,11 @@ namespace sack {
 			POINTER  PopLink( PLINKSTACK* pls )
 			{
 				if (pls && *pls && (*pls)->Top)
-					return (*pls)->pNode[--(*pls)->Top];
+				{
+					INDEX top = (*pls)->Top - 1;
+					(*pls)->Top = top;
+					return (*pls)->pNode[top];
+				}
 				return NULL;
 			}
 			//--------------------------------------------------------------------------
@@ -9182,10 +9365,10 @@ namespace sack {
 					if (((*pls)->Top) >= (*pls)->Max)
 					{
 						MemCpy( (POINTER)(*pls)->pNode, (POINTER)((*pls)->pNode + 1), (*pls)->Top - 1 );
-						(*pls)->Top--;
+						(*pls)->Top = (*pls)->Top - 1;
 					}
 				(*pls)->pNode[(*pls)->Top] = p;
-				(*pls)->Top++;
+				(*pls)->Top = (*pls)->Top + 1;
 			}
 #ifdef __cplusplus
 //namespace link_stack
@@ -9201,13 +9384,13 @@ namespace sack {
 				POINTER p = NULL;
 				if ((pds) && (*pds) && (*pds)->Top)
 				{
-					(*pds)->Top--;
+					(*pds)->Top = (*pds)->Top - 1;
 					p = (POINTER)((*pds)->data + ((*pds)->Size * ((*pds)->Top)));
 				}
 				return p;
 			}
 			//--------------------------------------------------------------------------
-			static PDATASTACK ExpandDataStackEx( PDATASTACK* ppds, INDEX entries DBG_PASS )
+			static PNVDATASTACK ExpandDataStackEx( PDATASTACK* ppds, INDEX entries DBG_PASS )
 			{
 				PDATASTACK pNewStack;
 				PDATASTACK pds = (*ppds);
@@ -9236,10 +9419,10 @@ namespace sack {
 						if (((*pds)->Top) >= (*pds)->Max)
 						{
 							MemCpy( (POINTER)(*pds)->data, (POINTER)((*pds)->data + (*pds)->Size), ((*pds)->Top - 1) * (*pds)->Size );
-							(*pds)->Top--;
+							(*pds)->Top = (*pds)->Top - 1;
 						}
 					MemCpy( (POINTER)((*pds)->data + ((*pds)->Top * (*pds)->Size)), pdata, (*pds)->Size );
-					(*pds)->Top++;
+					(*pds)->Top = (*pds)->Top + 1;
 					return;
 				}
 			}
@@ -9269,15 +9452,23 @@ namespace sack {
 					(*pds)->Top = 0;
 			}
 			//--------------------------------------------------------------------------
-			PDATASTACK  CreateDataStackEx( size_t size DBG_PASS )
-			{
-				return CreateDataStackLimitedEx( size, 0 DBG_RELAY );
-			}
-			//--------------------------------------------------------------------------
-			PDATASTACK  CreateDataStackLimitedEx( size_t size, INDEX max_items DBG_PASS )
+			PNVDATASTACK  CreateDataStackEx( size_t size DBG_PASS )
 			{
 				PDATASTACK pds;
-				pds = (PDATASTACK)AllocateEx( sizeof( DATASTACK ) + (10 * size) DBG_RELAY );
+				return CreateDataStackLimited2Ex( &pds, size, 0 DBG_RELAY );
+			}
+			//--------------------------------------------------------------------------
+			PNVDATASTACK  CreateDataStackLimitedEx( size_t size, INDEX max_items DBG_PASS )
+			{
+				PDATASTACK pds;
+				return CreateDataStackLimited2Ex(&pds, size, max_items DBG_RELAY);
+			}
+			//--------------------------------------------------------------------------
+			PNVDATASTACK  CreateDataStackLimited2Ex( PDATASTACK *ppds,size_t size, INDEX max_items DBG_PASS)
+			{
+				PDATASTACK pds;
+				pds = (PDATASTACK)AllocateEx(sizeof(DATASTACK) + (10 * size) DBG_RELAY);
+				(*ppds) = pds;
 				pds->Cnt = 10;
 				pds->Top = 0;
 				pds->Size = size;
@@ -9319,11 +9510,12 @@ namespace sack {
 #  define link_queue_local_thread  ((_link_queue_local)?(*_link_queue_local).thread:(s_link_queue_local.thread))
 #  define link_queue_local_lock  ((_link_queue_local)?(&_link_queue_local->lock):(&s_link_queue_local.lock))
 #endif
-			PLINKQUEUE CreateLinkQueueEx( DBG_VOIDPASS )
+			PNVLINKQUEUE CreateLinkQueue2Ex(PLINKQUEUE *pplq DBG_PASS)
 			{
 				PLINKQUEUE plq = 0;
  //-V557
-				plq = (PLINKQUEUE)AllocateEx( MY_OFFSETOF( &plq, pNode[8] ) DBG_RELAY );
+				plq = (PLINKQUEUE)AllocateEx(MY_OFFSETOF(&plq, pNode[8]) DBG_RELAY);
+				(*pplq) = plq;
 #if USE_CUSTOM_ALLOCER
 				plq->Lock = 0;
 #endif
@@ -9334,6 +9526,11 @@ namespace sack {
  // shrug
 				plq->pNode[1] = NULL;
 				return plq;
+			}
+			PNVLINKQUEUE CreateLinkQueueEx( DBG_VOIDPASS )
+			{
+				PLINKQUEUE plq = 0;
+				return CreateLinkQueue2Ex(&plq DBG_RELAY);
 			}
 			//--------------------------------------------------------------------------
 			void DeleteLinkQueueEx( PLINKQUEUE* pplq DBG_PASS )
@@ -9377,7 +9574,7 @@ namespace sack {
 				//link_queue_local_lock[0] = 0;
 			}
 			//--------------------------------------------------------------------------
-			static PLINKQUEUE ExpandLinkQueueEx( PLINKQUEUE* pplq, INDEX entries DBG_PASS )
+			static PNVLINKQUEUE ExpandLinkQueueEx( PLINKQUEUE* pplq, INDEX entries DBG_PASS )
 			{
 				PLINKQUEUE plqNew = NULL;
 #if USE_CUSTOM_ALLOCER
@@ -9398,6 +9595,9 @@ namespace sack {
 					plqNew = (PLINKQUEUE)AllocateEx( size DBG_RELAY );
 					plqNew->Cnt = plq->Cnt + entries;
 					plqNew->Bottom = 0;
+#if USE_CUSTOM_ALLOCER
+					plqNew->Lock = 1;
+#endif
 					if (plq->Bottom > plq->Top)
 					{
 						INDEX bottom_half;
@@ -9596,7 +9796,7 @@ namespace sack {
 				return FALSE;
 			}
 			//--------------------------------------------------------------------------
-			INDEX  GetQueueLength( PLINKQUEUE plq )
+			INDEX  GetQueueLength( PNVLINKQUEUE plq )
 			{
 				INDEX used = 0;
 				if (plq)
@@ -9608,7 +9808,7 @@ namespace sack {
 				return used;
 			}
 			//--------------------------------------------------------------------------
-			POINTER  PeekQueueEx( PLINKQUEUE plq, int idx )
+			POINTER  PeekQueueEx( PNVLINKQUEUE plq, int idx )
 			{
 				size_t top;
 				if (!plq)
@@ -9650,7 +9850,7 @@ namespace sack {
 				}
 				return NULL;
 			}
-			POINTER  PeekQueue( PLINKQUEUE plq )
+			POINTER  PeekQueue( PNVLINKQUEUE plq )
 			{
 				return PeekQueueEx( plq, 0 );
 			}
@@ -9764,16 +9964,22 @@ namespace sack {
 #  define data_queue_local  ((_data_queue_local)?(*_data_queue_local):(s_data_queue_local))
 #  define data_queue_local_lock ((_data_queue_local)?(&_data_queue_local->lock):(&s_data_queue_local.lock))
 #endif
-			PDATAQUEUE CreateDataQueueEx( INDEX size DBG_PASS )
+			PNVDATAQUEUE CreateDataQueue2Ex( PDATAQUEUE *ppdq, INDEX size DBG_PASS )
 			{
 				PDATAQUEUE pdq;
 				pdq = (PDATAQUEUE)AllocateEx( ((sizeof( DATAQUEUE ) + (2 * size)) - 1) DBG_RELAY );
+				(*ppdq) = pdq;
 				pdq->Top = 0;
 				pdq->Bottom = 0;
 				pdq->ExpandBy = 16;
 				pdq->Size = size;
 				pdq->Cnt = 2;
 				return pdq;
+			}
+			PNVDATAQUEUE CreateDataQueueEx(INDEX size DBG_PASS)
+			{
+				PDATAQUEUE pdq;
+				return CreateDataQueue2Ex(&pdq, size DBG_RELAY);
 			}
 			//--------------------------------------------------------------------------
 			void DeleteDataQueueEx( PDATAQUEUE* ppdq DBG_PASS )
@@ -9786,7 +9992,7 @@ namespace sack {
 				}
 			}
 			//--------------------------------------------------------------------------
-			static PDATAQUEUE ExpandDataQueueEx( PDATAQUEUE* ppdq, INDEX entries DBG_PASS )
+			static PNVDATAQUEUE ExpandDataQueueEx( PDATAQUEUE* ppdq, INDEX entries DBG_PASS )
 			{
 				PDATAQUEUE pdqNew = NULL;
 				if (ppdq)
@@ -9822,12 +10028,20 @@ namespace sack {
 				}
 				return pdqNew;
 			}
-			PDATAQUEUE  CreateLargeDataQueueEx( INDEX size, INDEX entries, INDEX expand DBG_PASS )
+			PNVDATAQUEUE  CreateLargeDataQueueEx( INDEX size, INDEX entries, INDEX expand DBG_PASS )
 			{
-				PDATAQUEUE pdq = CreateDataQueueEx( size DBG_RELAY );
+				PNVDATAQUEUE pdq = CreateDataQueueEx( size DBG_RELAY );
 				pdq->ExpandBy = expand;
 				ExpandDataQueueEx( &pdq, entries DBG_RELAY );
 				return pdq;
+			}
+			PNVDATAQUEUE  CreateLargeDataQueue2Ex(PDATAQUEUE *ppdq, INDEX size, INDEX entries, INDEX expand DBG_PASS)
+			{
+				PNVDATAQUEUE pdq = CreateDataQueue2Ex(ppdq, size DBG_RELAY);
+				pdq->ExpandBy = expand;
+				// expand through ppdq so the caller's pointer tracks the reallocation
+				ExpandDataQueueEx(ppdq, entries DBG_RELAY);
+				return *ppdq;
 			}
 			//--------------------------------------------------------------------------
 			void  EnqueDataEx( PDATAQUEUE* ppdq, POINTER link DBG_PASS )
@@ -10038,12 +10252,13 @@ namespace sack {
 				{
 					while (LockedExchange( data_queue_local_lock, 1 ))
 						Relinquish();
-					(*ppdq)->Bottom = (*ppdq)->Top = 0;
+					(*ppdq)->Top = 0;
+					(*ppdq)->Bottom = 0;
 					data_queue_local_lock[0] = 0;
 				}
 			}
 			//--------------------------------------------------------------------------
-			INDEX  GetDataQueueLength( PDATAQUEUE pdq )
+			INDEX  GetDataQueueLength( PNVDATAQUEUE pdq )
 			{
 				INDEX used = 0;
 				if (pdq)
@@ -10677,23 +10892,27 @@ INDEX  GetSegmentLength ( PTEXT segment, size_t position, int nTabSize )
 //---------------------------------------------------------------------------
 PTEXT SegAppend(PTEXT source,PTEXT other)
 {
+   return SegAppends( source, other, NULL );
+}
+PTEXT SegAppends(PTEXT source, ...)
+{
 	PTEXT temp=source;
-	if( temp )
+	PTEXT other;
+	va_list args;
+	va_start( args, source );
+	while( ( other = va_arg( args, PTEXT ) ) )
 	{
-		if( other )
-		{
+		if( temp ) {
 			SetEnd(temp);
 			SETNEXTLINE(temp,other);
 			SETPRIORLINE(other,temp);
+		} else {
+			source = temp = other;
 		}
-	}
-	else
-	{
-  // nothing was before...
-		source=other;
 	}
 	return(source);
 }
+//---------------------------------------------------------------------------
 //---------------------------------------------------------------------------
 void SegReleaseEx( PTEXT seg DBG_PASS)
 {
@@ -12273,7 +12492,72 @@ void VarTextAddDataEx( PVARTEXT pvt, CTEXTSTR block, size_t length DBG_PASS )
 	}
 }
 //---------------------------------------------------------------------------
-LOGICAL VarTextEndEx( PVARTEXT pvt DBG_PASS )
+// combines BuildLine with VarTextOutput (one less move, since we can just output
+// into the vartext without copying to a temporary buffer
+void VarTextAddText( PVARTEXT pvt, PTEXT pt, int bSingle ) {
+	int   TopSingle = bSingle;
+	PTEXT pStack[32];
+	int   nStack, spaces = 0;
+	nStack = 0;
+	while( pt )
+	{
+		if( !(pt->flags& (TF_INDIRECT|IS_DATA_FLAGS)) &&
+			 !pt->data.size
+		  )
+		{
+			VarTextAddCharacter( pvt, '\r' );
+			VarTextAddCharacter( pvt, '\n' );
+		}
+		else
+		{
+			spaces = pt->format.position.offset.tabs;
+			// else we cannot collapse into single line (similar to colors.)
+			while( spaces-- )
+			{
+				VarTextAddCharacter( pvt, '\t' );
+			}
+			spaces = pt->format.position.offset.spaces;
+			// else we cannot collapse into single line (similar to colors.)
+			while( spaces-- )
+			{
+				VarTextAddCharacter( pvt, ' ' );
+			}
+			// at this point spaces before tags, and after tags
+			// which used to be expression level parsed are not
+			// reconstructed correctly...
+			if( pt->flags&TF_INDIRECT )
+			{
+				// will be restored when we get back to top.
+				bSingle = FALSE;
+				pStack[nStack++] = pt;
+				pt = GetIndirect( pt );
+				//if( nStack >= 32 )
+				//	DebugBreak();
+				continue;
+			}
+			else
+			{
+				VarTextAddDataEx( pvt, GetText( pt ), GetTextSize( pt ) DBG_SRC );
+			}
+stack_resume: ;
+		}
+		if( bSingle )
+		{
+			bSingle = FALSE;
+			break;
+		}
+		pt = NEXTLINE( pt );
+	}
+	if( nStack )
+	{
+		pt = pStack[--nStack];
+		if( !nStack )
+			bSingle = TopSingle;
+		goto stack_resume;
+	}
+}
+//---------------------------------------------------------------------------
+PTEXT VarTextEndEx( PVARTEXT pvt DBG_PASS )
 {
  // otherwise ofs will be 0...
 	if( pvt && pvt->collect_used )
@@ -12309,11 +12593,11 @@ LOGICAL VarTextEndEx( PVARTEXT pvt DBG_PASS )
 			pvt->collect_used = 0;
 		}
 		pvt->commit = SegAppend( pvt->commit, segs );
-		return 1;
+		return segs;
 	}
-	if( pvt && pvt->commit )
-		return 1;
-	return 0;
+	//if( pvt && pvt->commit )
+	//	return NULL;
+	return NULL;
 }
 //---------------------------------------------------------------------------
 PTEXT VarTextGetEx( PVARTEXT pvt DBG_PASS )
@@ -13820,7 +14104,13 @@ uint8_t *DecodeBase64Ex( const char* buf, size_t length, size_t *outsize, const 
 			(*outsize) = (((length + 3) / 4) * 3) - 2;
 		else if( length % 4 == 3 )
 			(*outsize) = (((length + 3) / 4) * 3) - 1;
-		else if( buf[length - 1] == '=' ) {
+		// An empty input has length % 4 == 0, so without this it falls through to the
+		// padding check and reads buf[-1] -- and buf is NULL when there was no payload
+		// at all, which is a hard crash rather than a stray byte.  Decoding nothing
+		// yields nothing: the else below computes ((0+3)/4)*3 == 0 correctly.
+		// (length % 4 == 0 and length > 0 implies length >= 4, so buf[length-2] below
+		// is in bounds once zero is excluded.)
+		else if( length && buf[length - 1] == '=' ) {
 			if( buf[length - 2] == '=' ) {
 				(*outsize) = (((length + 3) / 4) * 3) - 2;
 			}
@@ -14419,14 +14709,14 @@ void DeleteUserInput( PUSER_INPUT_BUFFER pci )
 			PTEXT remaining;
 			if( pNext == pci->CollectionBuffer )
 			{
-				if( remaining = NEXTLINE( pNext ) )
+				if( ( remaining = NEXTLINE( pNext ) ) )
 				{
 					SegUnlink( pNext );
 					LineRelease( pNext );
 					pci->CollectionBuffer = remaining;
 					pci->CollectionIndex = 0;
 				}
-				else if( remaining = PRIORLINE( pNext ) )
+				else if( ( remaining = PRIORLINE( pNext ) ) )
 				{
 					SegUnlink( pNext );
 					LineRelease( pNext );
@@ -15147,6 +15437,13 @@ PSSQL_PROC( int, DoSQLCommandEx )( CTEXTSTR command DBG_PASS);
    Parameters
    odbc :  connection to database to commit                      */
 PSSQL_PROC( void, SQLCommit )( PODBC odbc );
+/* Generate a rollback for any outstanding transactions. Connections
+   also have the feature to auto generate begin transaction, and
+   flush after a period of idle.  This also interacts with the auto
+   transact; so a rollback without a transaction is harmless.
+   Parameters
+   odbc :  connection to database to rollback                     */
+PSSQL_PROC( void, SQLRollback )( PODBC odbc );
 /* generates the begin transaction for a commection.
    Parameters
    odbc :  connection to database to start a transaction        */
@@ -15711,7 +16008,7 @@ PSSQL_PROC( int, SQLRecordQuery_js )( PODBC odbc
 	, CTEXTSTR query
 	, size_t queryLen
 	, PDATALIST *pdlResults
-	, PDATALIST pdlParams
+	, PNVDATALIST pdlParams
 	DBG_PASS );
 /*
 	this properly releases the list and all allocated strings within the entires
@@ -15744,7 +16041,7 @@ PSSQL_PROC( int, SQLRecordQuery_v4 )( PODBC odbc
                                    , CTEXTSTR **result
                                    , size_t **resultLengths
                                    , CTEXTSTR **fields
-                                   , PDATALIST pdlParameters
+                                   , PNVDATALIST pdlParameters
                                    DBG_PASS);
 /* <combine sack::sql::SQLRecordQueryEx@PODBC@CTEXTSTR@int *@CTEXTSTR **@CTEXTSTR **fields>
    \ \                                                                                      */
@@ -16160,6 +16457,13 @@ PSSQL_PROC( void, SetSQLAutoTransact )( PODBC odbc, LOGICAL bEnable );
    odbc :     connection to set auto transact on
    callback :  not NULL to enable, NULL to disable.                         */
 PSSQL_PROC( void, SetSQLAutoTransactCallback )( PODBC odbc, void (CPROC*callback)(uintptr_t,PODBC), uintptr_t psv );
+/* Set a callback for SQLRollback completion. This does not enable
+   AutoTransact; rollback observes whichever auto or explicit
+   transaction is already pending.
+   Parameters
+   odbc :     connection to set rollback callback on
+   callback :  not NULL to enable, NULL to disable.                         */
+PSSQL_PROC( void, SetSQLRollbackCallback )( PODBC odbc, void (CPROC*callback)(uintptr_t,PODBC), uintptr_t psv );
 /* Relevant for SQLite databases. After a certain period of
    inactivity the database is closed (allowing the file to be
    not-in-use during idle). PODBC odject remains valid, and
@@ -16393,6 +16697,23 @@ SQLGETOPTION_PROC( int, SACK_GetProfileBlob )( CTEXTSTR pSection, CTEXTSTR pOptn
 /* <combine sack::sql::options::SACK_GetPrivateProfileStringEx@CTEXTSTR@CTEXTSTR@CTEXTSTR@TEXTCHAR *@size_t@CTEXTSTR@LOGICAL>
    \ \                                                                                                                        */
 SQLGETOPTION_PROC( int, SACK_GetProfileBlobOdbc )( PODBC odbc, CTEXTSTR pSection, CTEXTSTR pOptname, TEXTCHAR **pBuffer, size_t *pnBuffer );
+/* Read an option's string value without a default and without creating the option.
+   Unlike SACK_GetProfileString(), no default is taken or applied, a missing option is not
+   materialized in the option tree, and the value is returned by reference (like
+   SACK_GetProfileBlob) so no maximum option length need be known.  The returned buffer is
+   allocated for the caller to Release(); the length is in characters and the buffer is also
+   null terminated.  Returns TRUE if the option exists (an empty value reads TRUE with length
+   0), else FALSE leaving the caller's pointer untouched.                                     */
+SQLGETOPTION_PROC( int, SACK_ReadProfileString )( CTEXTSTR pSection, CTEXTSTR pOptname, TEXTCHAR **pBuffer, size_t *pnBuffer );
+/* <combine sack::sql::options::SACK_ReadProfileString@CTEXTSTR@CTEXTSTR@TEXTCHAR **@size_t *>
+   \ \                                                                                                                        */
+SQLGETOPTION_PROC( int, SACK_ReadProfileStringOdbc )( PODBC odbc, CTEXTSTR pSection, CTEXTSTR pOptname, TEXTCHAR **pBuffer, size_t *pnBuffer );
+/* <combine sack::sql::options::SACK_ReadProfileString@CTEXTSTR@CTEXTSTR@TEXTCHAR **@size_t *>
+   \ \                                                                                                                        */
+SQLGETOPTION_PROC( int, SACK_ReadPrivateProfileString )( CTEXTSTR pSection, CTEXTSTR pOptname, TEXTCHAR **pBuffer, size_t *pnBuffer, CTEXTSTR pINIFile );
+/* <combine sack::sql::options::SACK_ReadProfileString@CTEXTSTR@CTEXTSTR@TEXTCHAR **@size_t *>
+   \ \                                                                                                                        */
+SQLGETOPTION_PROC( int, SACK_ReadPrivateProfileStringOdbc )( PODBC odbc, CTEXTSTR pSection, CTEXTSTR pOptname, TEXTCHAR **pBuffer, size_t *pnBuffer, CTEXTSTR pINIFile );
 /* <combine sack::sql::options::SACK_GetPrivateProfileStringEx@CTEXTSTR@CTEXTSTR@CTEXTSTR@TEXTCHAR *@size_t@CTEXTSTR@LOGICAL>
    \ \                                                                                                                        */
 SQLGETOPTION_PROC( int32_t, SACK_GetProfileInt )( CTEXTSTR pSection, CTEXTSTR pOptname, int32_t defaultval );
@@ -16657,7 +16978,6 @@ ExtendSet:
 		{
 			uintptr_t base = ( (uintptr_t)set->bUsed ) + ofs;
 			// quick skip for 32 bit blocks of used members...
-			n = 0;
 			for( n = 0; n < maxcnt && ((maxcnt-n) >= 32) && AllUsed( set,n ); n+=32 );
 			if( n == maxcnt )
 			{
@@ -16778,8 +17098,6 @@ POINTER GetSetMemberEx( GENERICSET **pSet, INDEX nMember, int setsize, int units
 	int bUsed;
 	if( nMember == INVALID_INDEX )
 		return NULL;
-	//if( nMember > 1000 )
-	//	DebugBreak();
 	result = GetSetMemberExx( pSet, nMember, setsize, unitsize, maxcnt, &bUsed DBG_RELAY );
 	if( !bUsed )
 		SetUsed( *pSet, nMember );
@@ -16815,8 +17133,7 @@ INDEX GetMemberIndex(GENERICSET **ppSet, POINTER unit, int unitsize, int max )
 }
 #define GetMemberIndex(name,set,member) GetMemberIndex( (GENERICSET**)set, member, sizeof( name ), MAX##name##SPERSET )
 //----------------------------------------------------------------------------
-#undef MemberValidInSet
-int MemberValidInSet( GENERICSET *pSet, void *unit, int unitsize, int max )
+int MemberValidInSetEx( GENERICSET *pSet, void *unit, int unitsize, int max )
 {
 	uintptr_t nUnit = (uintptr_t)unit;
 	int ofs = ( ( max + (FLAGSET_MIN_SIZE-1) ) / FLAGSET_MIN_SIZE) * (FLAGSET_MIN_SIZE/8);
@@ -16980,6 +17297,59 @@ void **GetLinearSetArrayEx( GENERICSET *pSet, int *pCount, int unitsize, int max
 	return array;
 }
 //----------------------------------------------------------------------------
+void *StoreSetIntoEx( GENERICSET *pSet, void*unit, int unitsize, int max )
+{
+   // get a byte countable pointer
+	uint8_t    *array = (uint8_t*)unit;
+	int cnt, n, ofs;
+	INDEX nMin, nNewMin;
+	GENERICSET *pCur;
+ // useless initialization.  nNewMin will be set if this is valid; and there was no error generated for using THAT uninitialized.
+	GENERICSET *pNewMin = NULL;
+	ofs = ( ( max + (FLAGSET_MIN_SIZE-1)) / FLAGSET_MIN_SIZE ) * (FLAGSET_MIN_SIZE/8);
+ // 0
+	nMin = 0;
+	uint8_t *base;
+	  cnt = 0;
+	do
+	{
+		pCur = pSet;
+ // 0xFFFFFFFF (max)
+		nNewMin = INVALID_INDEX;
+		while( pCur )
+		{
+			if( (uintptr_t)pCur->nBias < nNewMin &&
+				 (uintptr_t)pCur->nBias >= nMin )
+			{
+				pNewMin = pCur;
+				nNewMin = pCur->nBias;
+			}
+			pCur = pCur->next;
+		}
+		if( (uintptr_t)nNewMin != INVALID_INDEX )
+		{
+			do {
+				base = ((uint8_t*)pNewMin->bUsed) + ofs;
+				for( n = 0; n < max; n++ )
+					if( IsUsed( pNewMin, n ) )
+					{
+						memcpy( array+cnt*unitsize, base + n*unitsize, unitsize );
+						cnt++;
+					}
+				nMin = nNewMin+1;
+				// check if the next block is the continued bias
+				if( pNewMin != pSet && ((GENERICSET *)pNewMin->me )->nBias == nMin ) {
+					pNewMin = (GENERICSET *)pNewMin->me;
+					nNewMin = pNewMin->nBias;
+					continue;
+				}
+				break;
+			} while(1);
+		}
+	}while( nNewMin != INVALID_INDEX );
+	return array;
+}
+//----------------------------------------------------------------------------
 int FindInArray( void **pArray, int nArraySize, void *unit )
 {
 	//int32_t idx;
@@ -17131,6 +17501,7 @@ uintptr_t ForEachSetMember( GENERICSET *pSet, int unitsize, int max, FESMCallbac
  * see also - include/typelib.h
  *
  */
+//#define DEBUG_AVL_VALIDATION
 //#define DEFINE_BINARYLIST_PERF_COUNTERS
 #ifdef DEFINE_BINARYLIST_PERF_COUNTERS
 #endif
@@ -17266,7 +17637,8 @@ void ValidateTreeNode( PTREENODE node ) {
 void ValidateTree( PTREEROOT root ) {
 	//lprintf( "--------------------------- VALIDATE TREE -----------------------------" );
 	//DumpTree( root, NULL );
-	ValidateTreeNode( root->tree );
+	if( root->tree )
+		ValidateTreeNode( root->tree );
 }
 #endif
 //---------------------------------------------------------------------------
@@ -17306,11 +17678,11 @@ static void AVLbalancer( PTREEROOT root, PTREENODE node ) {
 		height++;
 #endif
 		doBalance = FALSE;
-		if( tmp = _z->greater )
+		if( ( tmp = _z->greater ) )
 			rightDepth = tmp->depth;
 		else
 			rightDepth = 0;
-		if( tmp = _z->lesser )
+		if( ( tmp = _z->lesser ) )
 			leftDepth = tmp->depth;
 		else
 			leftDepth = 0;
@@ -17556,6 +17928,7 @@ static void NativeRemoveBinaryNode( PTREEROOT root, PTREENODE node )
 		if( !node->lesser ) {
 			if( node->greater ) {
 				bottom = (*node->me) = node->greater;
+				bottom->me = node->me;
 				bottom->parent = node->parent;
 			} else {
 				(*node->me) = NULL;
@@ -17564,6 +17937,7 @@ static void NativeRemoveBinaryNode( PTREEROOT root, PTREENODE node )
 			}
 		} else if( !node->greater ) {
 			bottom = (*node->me) = node->lesser;
+			bottom->me = node->me;
 			bottom->parent = node->parent;
 		} else {
 			node->children--;
@@ -17590,90 +17964,67 @@ static void NativeRemoveBinaryNode( PTREEROOT root, PTREENODE node )
 			}
 		}
 		{
-			LOGICAL updating = 1;
-			backtrack = bottom;
+			// Start the walk at the unhooked successor (two-child case) so its
+			// old parent gets its decrement and rebalance too; otherwise start
+			// at 'bottom' (the removed node, or its promoted child).  The walk
+			// runs in two legs when transplanting: the successor's parent up to
+			// 'node' (exclusive), then - after the transplant clears 'node' -
+			// from the shell's parent up to the root.
+			backtrack = least ? least : bottom;
 			do {
-				backtrack = backtrack->parent;
-				while( backtrack && ( no_children || backtrack != node ) ) {
-					backtrack->children--;
-					if( updating )
-						if( backtrack->lesser )
-							if( backtrack->greater ) {
-								int tmp1, tmp2;
-/*, x_*/
-								PTREENODE z_, y_;
-								if( (tmp1=backtrack->lesser->depth) > (tmp2=backtrack->greater->depth) ) {
-									if( backtrack->depth != ( tmp1 + 1 ) )
-										backtrack->depth = tmp1 + 1;
-									else
-										updating = 0;
-									if( (tmp1-tmp2) > 1 ) {
-										// unblanced here...
-										int tmp3, tmp4;
-										tmp3 = backtrack->lesser->lesser?backtrack->lesser->lesser->depth:0;
-										tmp4 = backtrack->lesser->greater?backtrack->lesser->greater->depth:0;
-										z_ = backtrack;
-										y_ = backtrack->lesser;
-										if( tmp3 > tmp4 ) {
-											//x_ = backtrack->lesser->lesser;
-											// left-left Rotate Right(Z)
-											AVL_RotateToRight( z_ );
-										} else {
-											// left-right
-											//x_ = backtrack->lesser->greater;
-											AVL_RotateToLeft( y_ );
-											AVL_RotateToRight( z_ );
-										}
-									}
-								} else {
-									if( backtrack->depth != ( tmp2 + 1 ) )
-										backtrack->depth = tmp2 + 1;
-									else
-										updating = 0;
-									if( (tmp2-tmp1) > 1 ) {
-										// unblanced here...
-										int tmp3, tmp4;
-										tmp3 = backtrack->greater->lesser?backtrack->greater->lesser->depth:0;
-										tmp4 = backtrack->greater->greater?backtrack->greater->greater->depth:0;
-										z_ = backtrack;
-										y_ = backtrack->greater;
-										if( tmp4 > tmp3 ) {
-											//x_ = y_->greater;
-											// right-right Rotate Right(Z)
-											AVL_RotateToLeft( y_ );
-										} else {
-											// right-left
-											//x_ = y_->lesser;
-											AVL_RotateToRight( y_ );
-											AVL_RotateToLeft( z_ );
-										}
-									}
-								}
-							} else
-									if( backtrack->depth != ( backtrack->lesser->depth + 1 ) )
-										backtrack->depth = backtrack->lesser->depth + 1;
-									else
-										updating = 0;
-						else
-							if( backtrack->greater )
-									if( backtrack->depth != ( backtrack->greater->depth + 1 ) )
-										backtrack->depth = backtrack->greater->depth + 1;
-									else
-										updating = 0;
-							else
-									if( backtrack->depth != 0 )
-										backtrack->depth = 0;
-									else
-										updating = 0;
-					backtrack = backtrack->parent;
+			backtrack = backtrack->parent;
+			while (backtrack && (no_children || backtrack != node)) {
+				backtrack->children--;
+				if (!backtrack->flags.bRoot) {
+					int leftDepth = backtrack->lesser ? backtrack->lesser->depth : 0;
+					int rightDepth = backtrack->greater ? backtrack->greater->depth : 0;
+					backtrack->depth = (leftDepth > rightDepth ? leftDepth : rightDepth) + 1;
+					if ((leftDepth - rightDepth) > 1) {
+						PTREENODE z_ = backtrack, y_ = backtrack->lesser;
+						int tmp3 = y_->lesser ? y_->lesser->depth : 0;
+						int tmp4 = y_->greater ? y_->greater->depth : 0;
+						if (tmp3 >= tmp4) {
+							AVL_RotateToRight(z_);
+						}
+						else {
+							AVL_RotateToLeft(y_);
+							AVL_RotateToRight(z_);
+						}
+ // corrected head; resume above it
+						backtrack = backtrack->parent;
+					}
+					else if ((rightDepth - leftDepth) > 1) {
+						PTREENODE z_ = backtrack, y_ = backtrack->greater;
+						int tmp3 = y_->lesser ? y_->lesser->depth : 0;
+						int tmp4 = y_->greater ? y_->greater->depth : 0;
+						if (tmp4 >= tmp3) {
+							AVL_RotateToLeft(z_);
+						}
+						else {
+							AVL_RotateToRight(y_);
+							AVL_RotateToLeft(z_);
+						}
+						backtrack = backtrack->parent;
+					}
 				}
-				if( least ) {
-					node->userdata = least->userdata;
-					node->key      = least->key;
-					DeleteFromSet( TREENODE, TreeNodeSet, least );
-					node   = NULL;
-					least  = NULL;
+				if (!backtrack->flags.bRoot) backtrack = backtrack->parent;
+				else backtrack = NULL;
+			}
+			// two-child case: the successor's payload takes over the removed
+			// node's shell; clearing 'node' lets the outer loop finish the
+			// walk from the shell's parent up to the root
+			if( least ) {
+				node->userdata = least->userdata;
+				node->key = least->key;
+				{
+					int ld = node->lesser ? node->lesser->depth : 0;
+					int gd = node->greater ? node->greater->depth : 0;
+					node->depth = ( ld > gd ? ld : gd ) + 1;
 				}
+				DeleteFromSet( TREENODE, TreeNodeSet, least );
+				node = NULL;
+				least = NULL;
+			}
 			} while( backtrack );
 		}
 		AVLbalancer( root, bottom );
@@ -17852,7 +18203,7 @@ void DumpTree( PTREEROOT root
 void DumpNodeInOrder( PLINKQUEUE *queue, int (*DumpMethod)( CPOINTER user, uintptr_t key ) )
 {
 	PTREENODE node;
-	while( node = (PTREENODE)DequeLink( queue ) )
+	while( ( node = (PTREENODE)DequeLink( queue ) ) )
 	{
 #ifdef SACK_BINARYLIST_USE_PRIMITIVE_LOGGING
 	static char buf[256];
@@ -18569,32 +18920,53 @@ enum SackNetworkErrorIdentifier {
 	SACK_NETWORK_ERROR_HTTP_UNSUPPORTED,
  // host name could not be resolved
 	SACK_NETWORK_ERROR_HOST_NOT_FOUND,
+	// a websocket peer's fragmented message exceeded WEBSOCKET_MAX_MESSAGE_SIZE; the
+	// message is refused and the socket closed rather than growing the collection
+	// buffer without bound.  Reported so an application can react (rate limit, ban,
+	// firewall rule, ...) rather than just seeing a closed connection.
+	SACK_NETWORK_ERROR_WS_MESSAGE_TOO_BIG,
+	// a websocket peer sent a control frame (close/ping/pong) whose length field
+	// exceeds the RFC 6455 5.5 limit of 125 -- i.e. it used the 126/127 extended
+	// length encoding, which control frames may never do.  The frame cannot be
+	// parsed and a stream protocol cannot be resynchronised mid-frame, so the
+	// connection is dropped; reported so an application can react rather than
+	// just seeing a connection vanish.
+	SACK_NETWORK_ERROR_WS_BAD_CONTROL_FRAME,
 };
-typedef void (CPROC*cErrorCallback)(uintptr_t psvError, PCLIENT pc, enum SackNetworkErrorIdentifier error, ... );
-NETWORK_PROC( void, SetNetworkWriteComplete )( PCLIENT, cWriteComplete );
+/* Upper bound on a single (possibly fragmented) inbound websocket message.  The
+   frame length is attacker-controlled - a 64-bit length frame can claim up to
+   2^63 bytes - so the fragment collection buffer needs a ceiling. */
+#ifndef WEBSOCKET_MAX_MESSAGE_SIZE
+#  define WEBSOCKET_MAX_MESSAGE_SIZE ( 128 * 1024 * 1024 )
+#endif
+/* Anchor type for the last named parameter of error callbacks.
+   C++ makes va_start() on a parameter that undergoes default argument
+   promotion (any unscoped enum) undefined behavior [-Wvarargs], so C++
+   builds use int; the values are enum SackNetworkErrorIdentifier either way. */
 #ifdef __cplusplus
+typedef int SackNetworkError;
+#else
+typedef enum SackNetworkErrorIdentifier SackNetworkError;
+#endif
+typedef void (CPROC*cErrorCallback)(uintptr_t psvError, PCLIENT pc, SackNetworkError error, ... );
+NETWORK_PROC( void, SetNetworkWriteComplete )( PCLIENT, cWriteComplete );
 /* <combine sack::network::SetNetworkWriteComplete@PCLIENT@cWriteComplete>
    \ \                                                                     */
 NETWORK_PROC( void, SetCPPNetworkWriteComplete )( PCLIENT, cppWriteComplete, uintptr_t );
-#endif
 /* <combine sack::network::SetNetworkWriteComplete@PCLIENT@cWriteComplete>
    \ \                                                                     */
 #define SetWriteCallback SetNetworkWriteComplete
 NETWORK_PROC( void, SetNetworkReadComplete )( PCLIENT, cReadComplete );
-#ifdef __cplusplus
 /* <combine sack::network::SetNetworkReadComplete@PCLIENT@cReadComplete>
    \ \                                                                   */
 NETWORK_PROC( void, SetCPPNetworkReadComplete )( PCLIENT, cppReadComplete, uintptr_t );
-#endif
 /* <combine sack::network::SetNetworkReadComplete@PCLIENT@cReadComplete>
    \ \                                                                   */
 #define SetReadCallback SetNetworkReadComplete
 NETWORK_PROC( void, SetNetworkCloseCallback )( PCLIENT, cCloseCallback );
-#ifdef __cplusplus
 /* <combine sack::network::SetNetworkCloseCallback@PCLIENT@cCloseCallback>
    \ \                                                                     */
 NETWORK_PROC( void, SetCPPNetworkCloseCallback )( PCLIENT, cppCloseCallback, uintptr_t );
-#endif
 /* <combine sack::network::SetNetworkCloseCallback@PCLIENT@cCloseCallback>
    \ \                                                                     */
 #define SetCloseCallback SetNetworkCloseCallback
@@ -18699,7 +19071,7 @@ NETWORK_PROC( LOGICAL, IsThisAddressMe )( SOCKADDR *addr, uint16_t myport );
 /*
  *  Get the list of SOCKADDR addresses that are on this box (for this name)
  */
-NETWORK_PROC( PLIST, GetLocalAddresses )( void );
+NETWORK_PROC( PNVLIST, GetLocalAddresses )( void );
 /*
  * Return the text of a socket's IP address
  */
@@ -18732,12 +19104,10 @@ NETWORK_PROC( SOCKADDR*, DuplicateAddress_6to4_Ex )( SOCKADDR *pAddr DBG_PASS );
 /* Transmission Control Protocol connection methods. This
    controls opening sockets that are based on TCP.        */
 _TCP_NAMESPACE
-#ifdef __cplusplus
 /* <combine sack::network::tcp::OpenTCPListenerAddrEx@SOCKADDR *@cNotifyCallback>
    \ \                                                                            */
 NETWORK_PROC( PCLIENT, CPPOpenTCPListenerAddrExx )( SOCKADDR *, cppNotifyCallback NotifyCallback, uintptr_t psvConnect DBG_PASS );
 #define CPPOpenTCPListenerAddrEx(a,b,c)  CPPOpenTCPListenerAddrExx(a,b,c DBG_SRC )
-#endif
 /* Opens a TCP socket which listens for connections. Other TCP
    sockets may be connected to this one once it has been
    created.
@@ -18765,12 +19135,10 @@ NETWORK_PROC( PCLIENT, OpenTCPListenerAddr_v2d )(SOCKADDR *, cNotifyCallback Not
 /* <combine sack::network::tcp::OpenTCPListenerAddrEx@SOCKADDR *@cNotifyCallback>
    \ \                                                                            */
 #define OpenTCPListenerAddr( pAddr ) OpenTCPListenerAddrExxx( paddr, NULL, FALSE DBG_SRC );
-#ifdef __cplusplus
-/* <combine sack::network::tcp::OpenTCPListenerEx@uint16_t@cNotifyCallback>
+   /* <combine sack::network::tcp::OpenTCPListenerEx@uint16_t@cNotifyCallback>
    \ \                                                                 */
 NETWORK_PROC( PCLIENT, CPPOpenTCPListenerExx )( uint16_t wPort, cppNotifyCallback NotifyCallback, uintptr_t psvConnect DBG_PASS );
 #define CPPOpenTCPListenerEx(a,b,c) CPPOpenTCPListenerExx(a,b,c DBG_SRC )
-#endif
 /* <combine sack::network::tcp::OpenTCPListenerAddrEx@SOCKADDR *@cNotifyCallback>
    \ \                                                                            */
 NETWORK_PROC( PCLIENT, OpenTCPListener_v2d )(uint16_t wPort, cNotifyCallback NotifyCallback, LOGICAL waitForReady DBG_PASS);
@@ -18822,7 +19190,6 @@ NETWORK_PROC( void, SetNetworkListenerReady )( PCLIENT pListen );
 #define OPEN_TCP_FLAG_SSL_CLIENT 2
 #define OPEN_TCP_FLAG_PREFER_V6  4
 #define OPEN_TCP_FLAG_PREFER_V4  8
-#ifdef __cplusplus
 /* <combine sack::network::tcp::OpenTCPClientAddrExx@SOCKADDR *@cReadComplete@cCloseCallback@cWriteComplete@cConnectCallback>
    \ \                                                                                                                        */
 NETWORK_PROC( PCLIENT, CPPOpenTCPClientAddrExxx )(SOCKADDR *lpAddr,
@@ -18831,7 +19198,6 @@ NETWORK_PROC( PCLIENT, CPPOpenTCPClientAddrExxx )(SOCKADDR *lpAddr,
 																  cppWriteComplete WriteComplete, uintptr_t,
 																  cppConnectCallback pConnectComplete,  uintptr_t, int DBG_PASS );
 #define CPPOpenTCPClientAddrExx(a,b,c,d,e,f,g,h,i,j) CPPOpenTCPClientAddrExxx(a,b,c,d,e,f,g,h,i,j DBG_SRC )
-#endif
 NETWORK_PROC( PCLIENT, OpenTCPClientAddrFromAddrEx )( SOCKADDR *lpAddr, SOCKADDR *pFromAddr
                                                      , cReadComplete     pReadComplete
                                                      , cCloseCallback    CloseCallback
@@ -18888,7 +19254,6 @@ NETWORK_PROC( PCLIENT, OpenTCPClientAddrExxx )(SOCKADDR *lpAddr,
 /* <combine sack::network::tcp::OpenTCPClientAddrExx@SOCKADDR *@cReadComplete@cCloseCallback@cWriteComplete@cConnectCallback>
    \ \                                                                                                                        */
 #define OpenTCPClientAddrExx(a,r,clo,w,con) OpenTCPClientAddrExxx( a,r,clo,w,con,0 DBG_SRC )
-#ifdef __cplusplus
 /* <combine sack::network::tcp::OpenTCPClientAddrExx@SOCKADDR *@cReadComplete@cCloseCallback@cWriteComplete@cConnectCallback>
    \ \                                                                                                                        */
 NETWORK_PROC( PCLIENT, CPPOpenTCPClientAddrEx )(SOCKADDR *
@@ -18897,7 +19262,6 @@ NETWORK_PROC( PCLIENT, CPPOpenTCPClientAddrEx )(SOCKADDR *
                                                , cppWriteComplete, uintptr_t
                                                , int flags
                                                );
-#endif
 /* <combine sack::network::tcp::OpenTCPClientAddrExx@SOCKADDR *@cReadComplete@cCloseCallback@cWriteComplete@cConnectCallback>
    \ \                                                                                                                        */
 NETWORK_PROC( PCLIENT, OpenTCPClientAddrExEx )(SOCKADDR *, cReadComplete,
@@ -18905,7 +19269,6 @@ NETWORK_PROC( PCLIENT, OpenTCPClientAddrExEx )(SOCKADDR *, cReadComplete,
 /* <combine sack::network::tcp::OpenTCPClientAddrExx@SOCKADDR *@cReadComplete@cCloseCallback@cWriteComplete@cConnectCallback>
    \ \                                                                                                                        */
 #define OpenTCPClientAddrEx(a,b,c,d) OpenTCPClientAddrExEx(a,b,c,d DBG_SRC )
-#ifdef __cplusplus
 /* <combine sack::network::tcp::OpenTCPClientExx@CTEXTSTR@uint16_t@cReadComplete@cCloseCallback@cWriteComplete@cConnectCallback>
    \ \                                                                                                                      */
 NETWORK_PROC( PCLIENT, CPPOpenTCPClientExEx )(CTEXTSTR lpName,uint16_t wPort
@@ -18914,7 +19277,6 @@ NETWORK_PROC( PCLIENT, CPPOpenTCPClientExEx )(CTEXTSTR lpName,uint16_t wPort
                          , cppWriteComplete WriteComplete, uintptr_t
 															, cppConnectCallback pConnectComplete, uintptr_t, int DBG_PASS );
 #define CPPOpenTCPClientExx(name,port,read,rd,close,cd,write,wd,connect,cod,flg) CPPOpenTCPClientExEx(name,port,read,rd,close,cd,write,wd,connect,cod,flg DBG_SRC)
-#endif
 /* <combine sack::network::tcp::OpenTCPClientAddrExx@SOCKADDR *@cReadComplete@cCloseCallback@cWriteComplete@cConnectCallback>
    \ \                                                                                                                        */
 NETWORK_PROC( PCLIENT, OpenTCPClientExxx )(CTEXTSTR lpName,uint16_t wPort
@@ -19174,8 +19536,25 @@ enum GetNetworkLongAccessInternal{
 NETWORK_PROC( int, GetMacAddress)(PCLIENT pc, uint8_t* bufLocal, size_t *bufLocalLen, uint8_t* bufRemote, size_t *bufRemoteLen );
 //NETWORK_PROC( int, GetMacAddress)(PCLIENT pc );
 //int get_mac_addr (char *device, unsigned char *buffer)
-NETWORK_PROC( PLIST, GetMacAddresses)( void );
+NETWORK_PROC( PNVLIST, GetMacAddresses)( void );
 NETWORK_PROC( LOGICAL, sack_network_is_active )( PCLIENT pc );
+// get the connection generation of a client.  The serial changes when the
+// connection closes; capture it while the connection is known alive (in a
+// network callback) and pass it to NetworkClientValid at time of use.
+NETWORK_PROC( uint32_t, NetworkClientSerial )( PCLIENT pc );
+// TRUE only while pc is still the same connection the serial was captured
+// from.  sack_network_is_active alone cannot tell a recycled client (a new
+// connection reusing this PCLIENT) from the connection a stored pointer meant.
+NETWORK_PROC( LOGICAL, NetworkClientValid )( PCLIENT pc, uint32_t serial );
+// diagnostic: TRUE if the client has data queued in its own pending-send chain.
+NETWORK_PROC( LOGICAL, NetworkClientHasPendingSend )( PCLIENT pc );
+// diagnostic: raw connection flags (CF_*).
+NETWORK_PROC( uint32_t, NetworkClientFlags )( PCLIENT pc );
+// diagnostic: bit0 = attached to event thread, bit1 = event object signaled,
+// bit2 = thread busy processing; byte1 = thread nWaitEvents, byte2 = nEvents.
+NETWORK_PROC( int, NetworkClientEventState )( PCLIENT pc );
+// diagnostic: count of this client's writes held in the deferred write queue.
+NETWORK_PROC( uint32_t, NetworkClientWritesPended )( PCLIENT pc );
 // mark that a socket has outstanding work.  If a close is handled while in network read
 // prevent the automatic close until work is cleared.
 NETWORK_PROC( void, AddNetWork )( PCLIENT lpClient, uintptr_t psv );
@@ -19183,6 +19562,16 @@ NETWORK_PROC( void, AddNetWork )( PCLIENT lpClient, uintptr_t psv );
 // to close, then a oustanding close operation will be performed when the last work is cleared.
 //
 NETWORK_PROC( void, ClearNetWork )( PCLIENT lpClient, uintptr_t psv );
+/*
+   Get the reference of the list of oustanding work on this client.
+   Someone put it there, they might want to know it... it holds a lock
+   for the list until the list is dropped.
+*/
+NETWORK_PROC( PLIST*, GetNetWork )( PCLIENT lpClient );
+/*
+   drops the lock held on the NetWork list returned.
+*/
+NETWORK_PROC( void, DropNetWork )( PCLIENT lpClient );
 NETWORK_PROC( void, RemoveClientExx )(PCLIENT lpClient, LOGICAL bBlockNofity, LOGICAL bLinger DBG_PASS );
 /* <combine sack::network::RemoveClientExx@PCLIENT@LOGICAL@LOGICAL bLinger>
    \ \                                                                      */
@@ -19852,16 +20241,20 @@ enum ProcessHttpResult{
 };
 /* Creates an empty http state, the next operation should be
    AddHttpData.                                              */
-HTTP_EXPORT HTTPState  HTTPAPI CreateHttpState( PCLIENT *pc );
+HTTP_EXPORT HTTPState  HTTPAPI CreateHttpState(PCLIENT *ppc);
 /*Get the http state associated with a network client */
-HTTP_EXPORT HTTPState HTTPAPI GetHttpState( PCLIENT pc );
+//HTTP_EXPORT HTTPState HTTPAPI GetHttpState( PCLIENT pc );
 HTTP_EXPORT void HTTPAPI LockHttp( struct HttpState *state );
 HTTP_EXPORT void HTTPAPI UnlockHttp( struct HttpState *state );
+/* closes an http state, which should trigger Destroy once the socket has closed.
+ */
+HTTP_EXPORT void HTTPAPI ShutdownHttpStateEx( struct HttpState *pHttpState DBG_PASS );
+#define ShutdownHttpState(state)  ShutdownHttpStateEx(state DBG_SRC )
 /* Destroys a http state, releasing all resources associated
    with it.                                                  */
-HTTP_EXPORT void HTTPAPI DestroyHttpState( HTTPState pHttpState );
-HTTP_EXPORT
- /* Add another bit of data to the block. After adding data,
+HTTP_EXPORT void HTTPAPI DestroyHttpStateEx( HTTPState pHttpState DBG_PASS );
+#define DestroyHttpState(state) DestroyHttpStateEx(state DBG_SRC )
+/* Add another bit of data to the block. After adding data,
    ProcessHttp should be called to see if the data has completed
    a packet.
    Parameters
@@ -19870,7 +20263,7 @@ HTTP_EXPORT
    size :        length of data bytes
    Returns: TRUE if content is added... if collecting chunked encoding may return FALSE.
    */
-LOGICAL HTTPAPI AddHttpData( HTTPState pHttpState, CPOINTER buffer, size_t size );
+HTTP_EXPORT LOGICAL HTTPAPI AddHttpData( HTTPState pHttpState, CPOINTER buffer, size_t size );
 /* \returns TRUE if completed until content-length if
    content-length is not specified, data is still collected, but
    the status never results TRUE.
@@ -19913,7 +20306,7 @@ HTTP_EXPORT PTEXT HTTPAPI GetHttpResource( HTTPState pHttpState );
    members of the list are of type struct HttpField.
    see also: ProcessHttpFields and ProcessCGIFields
 */
-HTTP_EXPORT PLIST HTTPAPI GetHttpHeaderFields( HTTPState pHttpState );
+HTTP_EXPORT PNVLIST HTTPAPI GetHttpHeaderFields( HTTPState pHttpState );
 //HTTP_EXPORT int HTTPAPI GetHttpVersion( HTTPState pHttpState );
 /* get the version of the current reply which has been parsed into the state.
     will be 0 if it is a reply and not a reply.
@@ -19986,6 +20379,57 @@ HTTP_EXPORT HTTPState  HTTPAPI PostHttpQuery( PTEXT site, PTEXT resource, PTEXT 
 HTTP_EXPORT HTTPState  HTTPAPI GetHttpQuery( PTEXT site, PTEXT resource );
 /* results with the http state of the message response; Allows getting other detailed information about the result */
 HTTP_EXPORT HTTPState HTTPAPI GetHttpsQuery( PTEXT site, PTEXT resource, const char *certChain );
+//--------------------------------------------------------------
+// Streaming client connections - several requests over one socket.
+//
+// GetHttpsQueryEx above is one request per connection and blocks its caller
+// until the reply arrives.  These open the connection once and then let
+// requests be issued against it; every result is delivered by callback, so
+// nothing blocks.  Replies are matched to requests strictly in the order they
+// were sent, which is all HTTP/1.1 offers - one slow reply holds up the ones
+// queued behind it.
+//--------------------------------------------------------------
+/* The connection finished connecting (and for TLS, handshaking).  error is 0 on
+   success, otherwise the socket error; the connection is dead in that case and
+   the closed callback follows. */
+typedef void ( CPROC*httpConnectionOpened )( uintptr_t psv, HTTPState connection, int error );
+/* One reply has been parsed.  'request' is the options pointer that was passed
+   to SendHttpConnectionRequest for it.
+   This runs on the network thread, and the connection's parse state is reset
+   for the next reply as soon as it returns - read everything wanted out of it
+   (GetHttpResponseCode, GetHttpHeaderFields, GetHttpContent...) before then. */
+typedef void ( CPROC*httpConnectionResponse )( uintptr_t psv, HTTPState connection, struct HTTPRequestOptions *request );
+/* The socket closed - by the peer, by CloseHttpConnection, or by a failed
+   connect.  Any requests still queued or unanswered are reported to the
+   response callback first with the connection's response code left at 0.
+   The connection is not usable after this; DestroyHttpState it. */
+typedef void ( CPROC*httpConnectionClosed )( uintptr_t psv, HTTPState connection );
+/* Open a connection.  'options' supplies the connection-level settings - ssl,
+   certChain, addrFlags, rejectUnauthorized, hostname - and must stay valid for
+   the life of the connection; per-request settings on it are ignored.
+   Returns immediately, before the connection is up; requests may be queued
+   right away and go out when the opened callback would fire.
+   Returns NULL only if the socket could not be created at all. */
+HTTP_EXPORT HTTPState HTTPAPI OpenHttpConnection( PTEXT address, const char *certChain
+                                                , struct HTTPRequestOptions *options
+                                                , httpConnectionOpened opened
+                                                , httpConnectionResponse response
+                                                , httpConnectionClosed closed
+                                                , uintptr_t psv );
+/* Queue a request.  'options' is the caller's, must stay valid until its
+   response callback, and is handed back there to identify the reply.
+   Returns FALSE if the connection is already closed. */
+HTTP_EXPORT LOGICAL HTTPAPI SendHttpConnectionRequest( HTTPState connection, PTEXT url, struct HTTPRequestOptions *options );
+/* How many requests may be on the wire at once.  1 (the default) writes the
+   next request only when the previous reply has arrived; higher packs that many
+   ahead.  Pipelining deeper than 1 is opt-in on purpose: it is head-of-line
+   blocked, and plenty of servers and proxies handle it badly. */
+HTTP_EXPORT void HTTPAPI SetHttpConnectionPipeline( HTTPState connection, int depth );
+/* Close the connection; the closed callback still fires. */
+HTTP_EXPORT void HTTPAPI CloseHttpConnection( HTTPState connection );
+/* How many requests are queued or awaiting a reply. */
+HTTP_EXPORT int HTTPAPI GetHttpConnectionPending( HTTPState connection );
+//--------------------------------------------------------------
 /* return the numeric response code of a http reply. */
 HTTP_EXPORT int HTTPAPI GetHttpResponseCode( HTTPState pHttpState );
 /* return the text response code of an http reply */
@@ -20059,6 +20503,13 @@ struct HttpState {
  // parsed anchor (err... doesn't actually get this?)
 	PLIST anchor_fields;
 	int bLine;
+	// how many bytes at the front of 'partial' the header scanner has already
+	// looked at.  A read can end anywhere - including exactly on a line ending -
+	// and everything that has not been recognized as a complete line yet stays in
+	// 'partial'; the next ProcessHttp merges the new bytes onto the end of it and
+	// has to resume where it stopped instead of re-scanning from 0 (re-scanning
+	// re-counts the CR/LF that bLine already counted).
+	size_t scanned;
 	size_t content_length;
  // content of the message, POST,PUT,PATCH and replies have this.
 	PTEXT content;
@@ -20096,10 +20547,43 @@ struct HttpState {
  // prevent issuing network reads... ssl pushes data from internal buffers
 		BIT_FIELD ssl : 1;
 		BIT_FIELD success : 1;
+		// this state is a streaming connection (several requests on one socket)
+		// rather than the one-shot GetHttpsQueryEx conversation.
+		BIT_FIELD connection_mode : 1;
+		// connected (and for TLS, handshaken); queued requests may be written.
+		BIT_FIELD connection_ready : 1;
+		// the opened callback has already been told; it only fires once.
+		BIT_FIELD connection_opened : 1;
 	}flags;
 	CRITICALSECTION lock;
 	struct HTTPRequestOptions* options;
+	// --- streaming connection bookkeeping; all NULL/0 for a one-shot request ---
+   // struct httpConnectionRequest*, queued but not yet written
+	PLINKQUEUE pending;
+  // written, awaiting their response; oldest first
+	PLINKQUEUE inflight;
+	int inflightCount;
+    // how many requests may be on the wire at once
+	int pipelineDepth;
+ // host[:port], reused for Host: on every request
+	PTEXT connectionAddress;
+	const char *connectionCertChain;
+	httpConnectionOpened openedCallback;
+	httpConnectionResponse responseCallback;
+	httpConnectionClosed closedCallback;
+	uintptr_t psvConnection;
+	// options of the request currently being written; writeComplete belongs to
+	// this one, not to the connection's own options.
+	struct HTTPRequestOptions* requestOptions;
 };
+// One queued request on a streaming connection.  options is the caller's and is
+// handed back to the response callback so it can match the reply to the request.
+struct httpConnectionRequest {
+	PTEXT url;
+	struct HTTPRequestOptions *options;
+};
+// defined with the rest of the connection code, below the client section
+static void httpReleaseConnectionRequest( struct httpConnectionRequest *req );
 struct HttpServer {
 	PCLIENT server;
 	PLIST clients;
@@ -20113,8 +20597,8 @@ static struct local_http_data
 	struct http_data_flags {
 		BIT_FIELD bLogReceived : 1;
 	} flags;
-	PLIST pendingConnects;
-	PLIST activeConnects;
+	//PLIST pendingConnects;
+	//PLIST activeConnects;
 }local_http_data;
 #define l local_http_data
 struct pendingConnect {
@@ -20324,9 +20808,21 @@ void GatherHttpData( struct HttpState *pHttpState )
 			pMergedLine = SegConcat( NULL, pNewLine, 0, GetTextSize( pHttpState->partial ) + GetTextSize( pInput ) );
 			LineRelease( pNewLine );
 			pHttpState->partial = pMergedLine;
-			if( !pHttpState->flags.no_content_length ) {
+			// Reaching here means a length is known and it is zero.  Taking
+			// "however much has arrived" as the body is a RESPONSE rule - it is
+			// for a peer that never said how long the content was - and applying
+			// it to a REQUEST is what broke pipelining: GET and PUT request lines
+			// set no_content_length=0 ("GET will never have a body?"), so every
+			// GET swallowed whatever was still buffered as its own body.  With one
+			// request per read that is an empty no-op, which is why it went
+			// unnoticed; with requests coalesced into one read it eats the ones
+			// behind it, and EndHttp's LineRelease( content ) then frees them.
+			// Responses (including the 101 upgrade, whose trailing bytes belong to
+			// the upgraded protocol) keep the old behaviour exactly.
+			if( !pHttpState->flags.no_content_length && pHttpState->response_version ) {
 				pHttpState->content = pHttpState->partial;
 				pHttpState->content_length = GetTextSize( pHttpState->content );
+				pHttpState->partial = NULL;
 			}
 		}
 	}
@@ -20469,6 +20965,11 @@ enum ProcessHttpResult ProcessHttp( struct HttpState *pHttpState, int ( *send )(
 		size_t size, pos;
 		INDEX start = 0;
 		PTEXT pMergedLine;
+		// lock across the whole merge+parse: the prologue below consumes
+		// pvt_collector and replaces pHttpState->partial, and a concurrent
+		// EndHttp / second ProcessHttp on the same state (JS end() thread)
+		// frees the old partial - pCurrent would dangle (use-after-free).
+		lockHttp( pHttpState );
 		PTEXT pInput = VarTextGet( pHttpState->pvt_collector );
 		PTEXT pNewLine = SegAppend( pHttpState->partial, pInput );
 		pMergedLine = SegConcat( NULL, pNewLine, 0, GetTextSize( pHttpState->partial ) + GetTextSize( pInput ) );
@@ -20482,16 +20983,19 @@ enum ProcessHttpResult ProcessHttp( struct HttpState *pHttpState, int ( *send )(
 		{
 			//lprintf( "process HTTP: %s %d", GetText( pCurrent ), pHttpState->bLine );
 			size = GetTextSize( pCurrent );
-			if( !size ) return HTTP_STATE_RESULT_NOTHING;
-			lockHttp( pHttpState );
+			if( !size ) { unlockHttp( pHttpState ); return HTTP_STATE_RESULT_NOTHING; }
 			c = GetText( pCurrent );
 			if( pHttpState->bLine < 4 )
 			{
 				//start = 0; // new packet and still collecting header....
-				for( pos = 0; ( pos < size ) && !pHttpState->final; pos++ )
+				// Resume where the previous read stopped.  Everything before 'scanned'
+				// has already been counted into bLine (and any complete line before it
+				// was split off), so re-examining it would count its CR/LF twice - which
+				// is what used to swallow the status line whenever a read ended exactly
+				// after its CRLF (sqlite.org's 503 arrives that way).
+				pos = ( pHttpState->scanned <= size ) ? pHttpState->scanned : size;
+				for( ; ( pos < size ) && !pHttpState->final; pos++ )
 				{
-					if( ((int)pos - (int)start - (int)pHttpState->bLine) < 0 )
-						continue;
 					if( c[pos] == '\r' )
 						if( !(pHttpState->bLine & 1 ) )
 							pHttpState->bLine++;
@@ -20581,6 +21085,15 @@ enum ProcessHttpResult ProcessHttp( struct HttpState *pHttpState, int ( *send )(
 										PTEXT resource_path = NULL;
 										PTEXT next;
 										if( TextSimilar( request, "GET" ) )
+										{
+ // initialize to assume it's incomplete; NOT OK.  (requests should be OK)
+											pHttpState->numeric_code = HTTP_STATE_RESULT_CONTENT;
+											request = NEXTLINE( request );
+											pHttpState->method = SegBreak( request );
+											//GET will never have a body?
+											pHttpState->flags.no_content_length = 0;
+										}
+										else if( TextSimilar( request, "PUT" ) )
 										{
  // initialize to assume it's incomplete; NOT OK.  (requests should be OK)
 											pHttpState->numeric_code = HTTP_STATE_RESULT_CONTENT;
@@ -20742,6 +21255,11 @@ enum ProcessHttpResult ProcessHttp( struct HttpState *pHttpState, int ( *send )(
 					pHttpState->final = 1;
 					goto FinalCheck;
 				}
+				// what is left in 'partial' after the split below is [start,pos); that
+				// much has been scanned, and the next read continues from its end.
+				// (when the header ended, start==pos and this is 0 - what follows is
+				// body, which this loop does not scan.)
+				pHttpState->scanned = pos - start;
 			}
 			//else
 			//	len += size;
@@ -20788,9 +21306,16 @@ SegSplit( &pCurrent, start );
 					}
 					else if( StrCaseStr( GetText( field->value ), "close" ) ) {
 						// the close defines the length of content...
+						// ... but only when reading a RESPONSE.  On a request this
+						// clobbers the no_content_length=0 that the GET/PUT request-line
+						// parse just set, so the dispatch gate below never fires and the
+						// request is never delivered - the server sits waiting for a body
+						// that a GET/PUT is never going to send.  (node's http client sends
+						// 'Connection: close' whenever it isn't using a keep-alive agent.)
+						if( pHttpState->response_version )
  // might have length already specified...
-						if( !pHttpState->content_length )
-							pHttpState->flags.no_content_length = 1;
+							if( !pHttpState->content_length )
+								pHttpState->flags.no_content_length = 1;
 					}
 				}
 				else if( TextLike( field->name, "Transfer-Encoding" ) )
@@ -20824,18 +21349,29 @@ SegSplit( &pCurrent, start );
 	}
 	unlockHttp( pHttpState );
 	if( pHttpState->final &&
-		( !pHttpState->read_chunks ) &&
-		( ( pHttpState->content_length
-			&& ( ( GetTextSize( pHttpState->partial ) >= pHttpState->content_length )
-				||( GetTextSize( pHttpState->content ) >= pHttpState->content_length ) ) )
-			|| ( !pHttpState->content_length && !pHttpState->flags.no_content_length )
-			) )
+		( ( ( !pHttpState->read_chunks ) &&
+			( ( pHttpState->content_length
+				&& ( ( GetTextSize( pHttpState->partial ) >= pHttpState->content_length )
+					||( GetTextSize( pHttpState->content ) >= pHttpState->content_length ) ) )
+				|| ( !pHttpState->content_length && !pHttpState->flags.no_content_length )
+				) )
+		// A chunked response never satisfied the length tests above (its length is
+		// only known after de-chunking), so this gate could not fire for it and
+		// returned_status was never set - the blocking client in GetHttpsQueryEx then
+		// waited out its ENTIRE timeout budget on every chunked response, and the
+		// reader never woke it.  flags.success is set exactly when the terminating
+		// zero-length chunk is consumed, so that is the chunked completion signal.
+		|| ( pHttpState->read_chunks && pHttpState->flags.success )
+		) )
 	{
 		pHttpState->returned_status = 1;
 		//lprintf( "return http %d l:%d nl:%d",pHttpState->numeric_code, pHttpState->content_length, pHttpState->flags.no_content_length );
 		if( pHttpState->numeric_code == 500 )
 			return HTTP_STATE_INTERNAL_SERVER_ERROR;
 		if( pHttpState->content && ( (pHttpState->numeric_code == 201) || (pHttpState->numeric_code == 200) ) ) {
+ // this returned the correct status for this; no new data,
+			pHttpState->final = FALSE;
+			                           // next should be a NEW request... (or end of stream)
 			return HTTP_STATE_RESULT_CONTENT;
 		}
 		if( pHttpState->numeric_code == 100 )
@@ -20869,15 +21405,19 @@ LOGICAL AddHttpData( struct HttpState *pHttpState, CPOINTER buffer, size_t size 
 		return TRUE;
 	}
 }
-struct HttpState *CreateHttpState( PCLIENT *pc )
+struct HttpState *CreateHttpState( PCLIENT *ppc )
 {
 	struct HttpState *pHttpState;
 	pHttpState = New( struct HttpState );
 	MemSet( pHttpState, 0, sizeof( struct HttpState ) );
 	InitializeCriticalSec( &pHttpState->lock );
 	pHttpState->flags.no_content_length = 1;
+	if (ppc)
+		pHttpState->pc = ppc;
+	else
+		pHttpState->pc = &pHttpState->request_socket;
 	pHttpState->pvt_collector = VarTextCreate();
-	pHttpState->pc = pc;
+	//pHttpState->pc = pc;
 	return pHttpState;
 }
 void EndHttp( struct HttpState *pHttpState )
@@ -20885,6 +21425,9 @@ void EndHttp( struct HttpState *pHttpState )
 	//lprintf( "Ending HTTP %p", pHttpState );
 	lockHttp( pHttpState );
 	pHttpState->bLine = 0;
+	// whatever is left in 'partial' is the start of the NEXT message (see below),
+	// and none of it has been scanned as header yet.
+	pHttpState->scanned = 0;
 	pHttpState->final = 0;
 	pHttpState->response_version = 0;
 	pHttpState->request_version = 0;
@@ -20896,11 +21439,20 @@ void EndHttp( struct HttpState *pHttpState )
 	LineRelease( pHttpState->content );
 	LineRelease( pHttpState->resource );
 	pHttpState->resource = NULL;
-	if( pHttpState->partial != pHttpState->content )
-	{
-		LineRelease( pHttpState->partial );
-	}
-	pHttpState->partial = NULL;
+	// Whatever is left in 'partial' once the content has been split out of it is
+	// the beginning of the NEXT message - the peer coalesced it into the same
+	// read.  This used to be released here, which is what made pipelining lose
+	// requests: a client that packs several requests into one segment got only
+	// the first one answered and the rest silently dropped (measurable as the
+	// server jumping from request 0 straight to request 4).  Keeping it is what
+	// makes the ProcessHttp re-parse loops after EndHttp able to find anything;
+	// the next ProcessHttp merges new input onto the end of it.
+	// GatherHttpData SegGrab'd it off the content chain, so it is independent of
+	// the LineRelease( content ) above.
+	// DestroyHttpStateEx releases it explicitly, since there is no 'next message'
+	// at teardown.
+	if( pHttpState->partial == pHttpState->content )
+		pHttpState->partial = NULL;
 	pHttpState->content = NULL;
 	LineRelease( pHttpState->response_status );
 	pHttpState->response_status = NULL;
@@ -20915,6 +21467,7 @@ void EndHttp( struct HttpState *pHttpState )
 		struct HttpField *field;
 		LIST_FORALL( pHttpState->fields, idx, struct HttpField *, field )
 		{
+			SetLink(&pHttpState->fields, idx, NULL);
 			LineRelease( field->name );
 			LineRelease( field->value );
 			Release( field );
@@ -20922,6 +21475,7 @@ void EndHttp( struct HttpState *pHttpState )
 		EmptyList( &pHttpState->fields );
 		LIST_FORALL( pHttpState->cgi_fields, idx, struct HttpField *, field )
 		{
+			SetLink(&pHttpState->cgi_fields, idx, NULL);
 			LineRelease( field->name );
 			LineRelease( field->value );
 			Release( field );
@@ -20932,18 +21486,18 @@ void EndHttp( struct HttpState *pHttpState )
 }
 PTEXT GetHttpContent( struct HttpState *pHttpState )
 {
+	PTEXT result = NULL;
 	lockHttp( pHttpState );
 	if( pHttpState->read_chunks )
 	{
 		/* did a timeout happen? */
 		if( pHttpState->content_length == pHttpState->read_chunk_total_length )
-			return pHttpState->content;
-		return NULL;
+			result = pHttpState->content;
 	}
+	else if( pHttpState->content_length )
+		result = pHttpState->content;
 	unlockHttp( pHttpState );
-	if( pHttpState->content_length )
-		return pHttpState->content;
-	return NULL;
+	return result;
 }
 void ProcessHttpFields( struct HttpState *pHttpState, void (CPROC*f)( uintptr_t psv, PTEXT name, PTEXT value ), uintptr_t psv )
 {
@@ -20973,15 +21527,18 @@ PTEXT GetHttpField( struct HttpState *pHttpState, CTEXTSTR name )
 {
 	INDEX idx;
 	struct HttpField *field;
+	PTEXT result = NULL;
 	lockHttp( pHttpState );
 	if( pHttpState->fields )
 		LIST_FORALL( pHttpState->fields, idx, struct HttpField *, field )
 		{
-			if( StrCaseCmp( GetText( field->name ), name ) == 0 )
-				return field->value;
+			if( StrCaseCmp( GetText( field->name ), name ) == 0 ) {
+				result = field->value;
+				break;
+			}
 		}
 	unlockHttp( pHttpState );
-	return NULL;
+	return result;
 }
 PTEXT GetHttpResponse( struct HttpState *pHttpState )
 {
@@ -21012,6 +21569,11 @@ PTEXT GetHttpMethod( struct HttpState *pHttpState )
 		return pHttpState->method;
 	return NULL;
 }
+void ShutdownHttpStateEx( struct HttpState *pHttpState DBG_PASS ) {
+	lockHttp( pHttpState );
+	RemoveClient( pHttpState->pc[0] );
+	unlockHttp(pHttpState );
+}
 void DestroyHttpStateEx( struct HttpState *pHttpState DBG_PASS )
 {
 	lockHttp( pHttpState );
@@ -21022,6 +21584,10 @@ void DestroyHttpStateEx( struct HttpState *pHttpState DBG_PASS )
 	//_lprintf(DBG_RELAY)( "Destroy http state... (should clear content too? %p", pHttpState );
  // empties variables
 	EndHttp( pHttpState );
+	// EndHttp deliberately keeps any bytes of a following message; at teardown
+	// there is no following message.
+	LineRelease( pHttpState->partial );
+	pHttpState->partial = NULL;
 	//lprintf( "Fields should have been emptied already?" );
 	DeleteList( &pHttpState->fields );
 	DeleteList( &pHttpState->cgi_fields );
@@ -21030,14 +21596,21 @@ void DestroyHttpStateEx( struct HttpState *pHttpState DBG_PASS )
 	VarTextDestroy( &pHttpState->pvt_chunk );
 	if( pHttpState->buffer )
 		Release( pHttpState->buffer );
+	if( pHttpState->flags.connection_mode ) {
+		struct httpConnectionRequest *req;
+		while( ( req = (struct httpConnectionRequest*)DequeLink( &pHttpState->inflight ) ) )
+			httpReleaseConnectionRequest( req );
+		while( ( req = (struct httpConnectionRequest*)DequeLink( &pHttpState->pending ) ) )
+			httpReleaseConnectionRequest( req );
+		DeleteLinkQueue( &pHttpState->inflight );
+		DeleteLinkQueue( &pHttpState->pending );
+		LineRelease( pHttpState->connectionAddress );
+		pHttpState->connectionAddress = NULL;
+	}
 	unlockHttp( pHttpState );
 	DeleteCriticalSec( &pHttpState->lock );
 	Release( pHttpState );
 }
-void DestroyHttpState( struct HttpState *pHttpState ) {
-	DestroyHttpStateEx( pHttpState DBG_SRC );
-}
-#define DestroyHttpState(state) DestroyHttpStateEx(state DBG_SRC )
 void SendHttpResponse ( struct HttpState *pHttpState, PCLIENT pc, int numeric, CTEXTSTR text, CTEXTSTR content_type, PTEXT body )
 {
 	//int offset = 0;
@@ -21095,39 +21668,183 @@ void SendHttpMessage ( struct HttpState *pHttpState, PCLIENT pc, PTEXT body )
 	SendTCP( pc, GetText( message ), GetTextSize( message ));
 }
 //---------- CLIENT --------------------------------------------
-static void CPROC HttpReader( PCLIENT pc, POINTER buffer, size_t size )
+// Write the request already formatted into state->pvtOut, plus any content, and
+// consume the vartext.  There are two moments this can happen and they used to be
+// two copies of this code: plain sockets send inline right after NetworkConnectTCP,
+// while TLS has to wait for the handshake and sends from HttpReader's initial-read
+// callback (which is why pvtOut has to outlive the plain-path send).  Both call this
+// now, which is also what lets a second request go out on a connection already up.
+// The content paths differ deliberately: SendTCPLong hands the buffer to the network
+// layer (writeComplete fires when it drains) while ssl_Send copies, so the TLS path
+// has to signal writeComplete itself.
+// httpOpenSocket wires up all four socket callbacks, and they are all defined
+// further down this file, so they need declaring here.
+static void CPROC HttpReader( uintptr_t psv, POINTER buffer, size_t size );
+static void CPROC HttpReaderClose( uintptr_t psv );
+static void httpConnected( uintptr_t psv, int error );
+static void writeComplete( uintptr_t psv, CPOINTER buffer, size_t length );
+// defined with the request formatting, down by GetHttpsQueryEx; the connection
+// code up here needs it to format requests 2..N.
+static void httpBuildRequest( struct HttpState *state, PTEXT address, PTEXT url
+                            , struct HTTPRequestOptions *options );
+// Create the socket for an HTTP conversation and attach the state to it.  The
+// connect is deliberately deferred (OPEN_TCP_FLAG_DELAY_CONNECT) so the caller can
+// format the first request - and for TLS begin the session - before the handshake
+// starts; HttpReader's initial-read callback is what sends it on the TLS path.
+// Returns NULL if the socket could not be created; the caller still owns state.
+static PCLIENT httpOpenSocket( PTEXT address, struct HttpState *state, struct HTTPRequestOptions *options ) {
+	PCLIENT pc;
+	SOCKADDR *addr = CreateSockAddressV2( GetText( address ), options->ssl?443:80, options->addrFlags );
+ // clear any previous error.
+	options->connectError = 0;
+	pc = CPPOpenTCPClientAddrExxx( addr, HttpReader, (uintptr_t)state, HttpReaderClose, (uintptr_t)state
+			, writeComplete, (uintptr_t)state, httpConnected, (uintptr_t)state, OPEN_TCP_FLAG_DELAY_CONNECT DBG_SRC );
+	SetTCPNoDelay( pc, TRUE );
+	state->request_socket = pc;
+	ReleaseAddress( addr );
+	if( pc ) {
+		state->last_read_tick = timeGetTime();
+		state->waiter = MakeThread();
+		SetNetworkLong( pc, 0, (uintptr_t)state );
+		state->ssl = options->ssl;
+	}
+	return pc;
+}
+static LOGICAL httpSendRequest( struct HttpState *state, struct HTTPRequestOptions *options ) {
+	PCLIENT pc = state->request_socket;
+	PTEXT send;
+	if( !pc || !state->pvtOut ) return FALSE;
+  // consumes the accumulated text
+	send = VarTextGet( state->pvtOut );
+	if( !send ) return FALSE;
+	if( l.flags.bLogReceived ) {
+		lprintf( "Sending %s...", options ? options->method : "request" );
+		LogBinary( (uint8_t*)GetText( send ), GetTextSize( send ) );
+	}
+	if( state->ssl ) {
+		ssl_Send( pc, GetText( send ), GetTextSize( send ) );
+		if( options && options->content && options->contentLen ) {
+			ssl_Send( pc, options->content, options->contentLen );
+			if( options->writeComplete ) {
+				options->writeComplete( options->userData );
+				options->writeComplete = NULL;
+			}
+		}
+	} else {
+		SendTCP( pc, GetText( send ), GetTextSize( send ) );
+		if( options && options->content && options->contentLen )
+			SendTCPLong( pc, options->content, options->contentLen );
+	}
+	LineRelease( send );
+	return TRUE;
+}
+//---------- streaming connections ------------------------------
+// A streaming connection is one HttpState whose parse state is reused for reply
+// after reply, with the requests it is answering kept in two queues: 'pending'
+// (queued, not written) and 'inflight' (written, waiting).  HTTP/1.1 gives no
+// way to correlate a reply with a request other than order, so the head of
+// 'inflight' is by definition whose reply just arrived.
+static void httpReleaseConnectionRequest( struct httpConnectionRequest *req ) {
+	if( !req ) return;
+	LineRelease( req->url );
+	Release( req );
+}
+// Write as many queued requests as the pipeline depth allows.  Called when the
+// connection comes up, when a new request is queued, and after each reply.
+static void httpFlushRequests( struct HttpState *state ) {
+	if( !state->flags.connection_ready ) return;
+	while( state->request_socket && !state->closed
+	     && state->inflightCount < state->pipelineDepth ) {
+		struct httpConnectionRequest *req = (struct httpConnectionRequest*)DequeLink( &state->pending );
+		if( !req ) break;
+		state->requestOptions = req->options;
+		httpBuildRequest( state, state->connectionAddress, req->url, req->options );
+		if( !httpSendRequest( state, req->options ) ) {
+			// socket went away between the check and the write; put it back so
+			// the close path reports it like any other outstanding request.
+			VarTextDestroy( &state->pvtOut );
+			PrequeLink( &state->inflight, req );
+			state->inflightCount++;
+			break;
+		}
+		VarTextDestroy( &state->pvtOut );
+		EnqueLink( &state->inflight, req );
+		state->inflightCount++;
+	}
+}
+// The connection is up (TLS: handshake done) - tell the owner once, then let
+// anything queued while we were connecting go out.
+static void httpConnectionReady( struct HttpState *state ) {
+	state->flags.connection_ready = 1;
+	if( !state->flags.connection_opened ) {
+		state->flags.connection_opened = 1;
+		if( state->openedCallback )
+			state->openedCallback( state->psvConnection, state, 0 );
+	}
+	httpFlushRequests( state );
+}
+// Hand the reply sitting in the parse state to the owner, then reset the state
+// for the next one.  EndHttp keeps any bytes of a following reply that arrived
+// in the same read, which is what lets the caller loop for another one.
+static void httpDeliverResponse( struct HttpState *state ) {
+	struct httpConnectionRequest *req = (struct httpConnectionRequest*)DequeLink( &state->inflight );
+	if( state->inflightCount ) state->inflightCount--;
+	state->requestOptions = NULL;
+	if( state->responseCallback )
+		state->responseCallback( state->psvConnection, state, req ? req->options : NULL );
+	httpReleaseConnectionRequest( req );
+	EndHttp( state );
+	// EndHttp resets the parse, but not the 'a reply was returned' latch that
+	// ProcessHttp checks before returning another one.
+	state->returned_status = 0;
+}
+// Everything queued or unanswered is reported with the parse state empty (so
+// GetHttpResponseCode reads 0), which is how the owner learns those requests
+// will never be answered.
+static void httpFailOutstanding( struct HttpState *state ) {
+	struct httpConnectionRequest *req;
+	while( ( req = (struct httpConnectionRequest*)DequeLink( &state->inflight ) ) ) {
+		if( state->responseCallback )
+			state->responseCallback( state->psvConnection, state, req->options );
+		httpReleaseConnectionRequest( req );
+	}
+	while( ( req = (struct httpConnectionRequest*)DequeLink( &state->pending ) ) ) {
+		if( state->responseCallback )
+			state->responseCallback( state->psvConnection, state, req->options );
+		httpReleaseConnectionRequest( req );
+	}
+	state->inflightCount = 0;
+}
+static void CPROC HttpReader( uintptr_t psv, POINTER buffer, size_t size )
 {
-	struct HttpState *state = (struct HttpState *)GetNetworkLong( pc, 0 );
+	struct HttpState *state = (struct HttpState *)psv;
+	PCLIENT pc = state->pc[0];
 	if( !buffer )
 	{
 		//lprintf( "Initial read on HTTP requestor" );
 #ifndef NO_SSL
 		if( state && state->ssl )
 		{
-			PTEXT send = VarTextGet( state->pvtOut );
-			if( l.flags.bLogReceived )
-			{
-				lprintf( "Sending Request..." );
-				LogBinary( (uint8_t*)GetText( send ), GetTextSize( send ) );
-			}
 			// had to wait for handshake, so NULL event
 			// on secure has already had time to build the send
 			// but had to wait until now to do that.
-			ssl_Send( pc, GetText( send ), GetTextSize( send ) );
-			if( state->options && state->options->content && state->options->contentLen ) {
-				ssl_Send( pc, state->options->content, state->options->contentLen );
-				if( state->options->writeComplete ) {
-					state->options->writeComplete( state->options->userData );
-					state->options->writeComplete = NULL;
-				}
-			}
-			LineRelease( send );
+			if( state->flags.connection_mode )
+				httpConnectionReady( state );
+			else
+				httpSendRequest( state, state->options );
 		}
 		else
 #endif
-		{
+		if( state ) {
 			state->buffer = Allocate( 4096 );
 			ReadTCP( pc, state->buffer, 4096 );
+			// a plain socket is writable as soon as it is connected, but this
+			// is the point the read side is armed, so it is the same signal for
+			// both transports and keeps the connection paths symmetric.
+			if( state->flags.connection_mode )
+				httpConnectionReady( state );
+		} else {
+			lprintf( "Initial read on http with no state set?" );
 		}
 	}
 	else
@@ -21139,10 +21856,27 @@ static void CPROC HttpReader( PCLIENT pc, POINTER buffer, size_t size )
 			LogBinary( (const uint8_t*) buffer, size );
 		}
 #endif
-		if( AddHttpData( state, buffer, size ) ) {
+		if( !state ) {
+			lprintf( "Http state was stolen before the read into it?" );
+		} else if( AddHttpData( state, buffer, size ) ) {
 			enum ProcessHttpResult r;
+			if( state->flags.connection_mode ) {
+				// A single read can carry more than one reply, so keep parsing
+				// until the buffered bytes stop completing one.
+				while( ( r = ProcessHttp( state, NULL, 0 ) ) ) {
+					LOGICAL closing = state->flags.close || !state->flags.keep_alive;
+					httpDeliverResponse( state );
+					if( closing ) {
+						// peer is done with this connection; whatever is still
+						// queued gets failed by the close callback.
+						RemoveClient( state->pc[0] );
+						return;
+					}
+				}
+				httpFlushRequests( state );
+			}
  // this shouldn't cause any auto send?
-			if( r = ProcessHttp( state, NULL, 0 ) )
+			else if( ( r = ProcessHttp( state, NULL, 0 ) ) )
 			{
 				//lprintf( "this is where we should close and not end...%d %d %d",r, state->flags.close , !state->flags.keep_alive );
 				if( state->flags.close || !state->flags.keep_alive) {
@@ -21162,14 +21896,14 @@ static void CPROC HttpReader( PCLIENT pc, POINTER buffer, size_t size )
 		}
 	}
 	// read is handled by the SSL layer instead of here.  Just trust that someone will give us data later
-	if( buffer && ( !state || ( state && !state->ssl ) ) )
+	if( buffer && state && !state->ssl )
 	{
 		ReadTCP( pc, state->buffer, 4096 );
 	}
 }
-static void CPROC HttpReaderClose( PCLIENT pc )
+static void CPROC HttpReaderClose( uintptr_t psv )
 {
-	struct HttpState *data = (struct HttpState *)GetNetworkLong( pc, 0 );
+	struct HttpState *data = (struct HttpState *)psv;
 	if( !data ) return;
 // (PCLIENT*)GetNetworkLong( pc, 0 );
 	PCLIENT *ppc = data->pc;
@@ -21186,23 +21920,38 @@ static void CPROC HttpReaderClose( PCLIENT pc )
 		ProcessHttp( data, NULL, 0 );
 	}
 	//lprintf( "Closing http: %p ", pc );
-	if( ppc[0] == pc ) {
-		if( ppc )
-			ppc[0] = NULL;
-		//lprintf( "So now i's null?" );
-		data->closed = TRUE;
-		if( data->waiter ) {
-			//lprintf( "(on close) Waking waiting to return with result." );
-			WakeThread( data->waiter );
+	if( ppc )
+		ppc[0] = NULL;
+	data->closed = TRUE;
+	data->flags.connection_ready = 0;
+	if( data->flags.connection_mode ) {
+		// a reply with no content-length is only complete at the close; the
+		// gather above finished it, so hand it over before failing the rest.
+		if( data->returned_status && data->inflightCount )
+			httpDeliverResponse( data );
+		if( !data->flags.connection_opened ) {
+			// never got up in the first place - report the connect failure
+			// through the same callback a successful open would have used.
+			data->flags.connection_opened = 1;
+			if( data->openedCallback )
+				data->openedCallback( data->psvConnection, data
+				                    , data->options && data->options->connectError
+				                      ? data->options->connectError : -1 );
 		}
+		httpFailOutstanding( data );
+		if( data->closedCallback )
+			data->closedCallback( data->psvConnection, data );
+		return;
 	}
-	else {
-		lprintf( "Close resulting on a socket using the same state, but that state is now already busy." );
+	if( data->waiter ) {
+		//lprintf( "(on close) Waking waiting to return with result." );
+		WakeThread( data->waiter );
 	}
-	//if( !data->flags.success )
-	//	DestroyHttpState( data );
 }
-static void CPROC HttpConnected( PCLIENT pc, int error ) {
+static void CPROC HttpConnected( uintptr_t psv, int error ) {
+//	struct HttpState *state = (struct HttpState*)psv;
+//	PCLIENT pc = state->requestSocket;
+#if 0
 	INDEX idx;
 	struct pendingConnect *connect;
 	//lprintf( "Connection for Http: %p", pc );
@@ -21225,21 +21974,26 @@ static void CPROC HttpConnected( PCLIENT pc, int error ) {
 	if( connect ) {
 		SetNetworkLong( pc, 0, (uintptr_t)connect->state );
 		Release( connect );
+	} else {
+		lprintf( "Pending connect didn't have a connection; so we didn't set a http State" );
 	}
+#endif
 	//lprintf( "Got connected... so connect gets released?");
 }
 HTTPState PostHttpQuery( PTEXT address, PTEXT url, PTEXT content )
 {
 	PCLIENT pc;
-	struct pendingConnect *connect = New( struct pendingConnect );
-	struct HttpState *state = CreateHttpState(&connect->pc);
-	connect->pc = NULL;
-	connect->state = state;
+	//struct pendingConnect *connect = New( struct pendingConnect );
+	struct HttpState *state = CreateHttpState(NULL);
+	//connect->pc = NULL;
+	//connect->state = state;
 	state->closed = FALSE;
 	//lprintf( "adding pending: %p", connect->pc );
-	AddLink( &l.pendingConnects, connect );
-	pc = OpenTCPClientExx( GetText( address ), 80, HttpReader, NULL, NULL, HttpConnected );
-	connect->pc = pc;
+	//AddLink( &l.pendingConnects, connect );
+	pc = CPPOpenTCPClientExx( GetText( address ), 80, HttpReader, (uintptr_t)state
+					, NULL, 0, NULL, 0, HttpConnected, (uintptr_t)state
+					, 0 );
+	//connect->pc = pc;
 	PVARTEXT pvtOut = VarTextCreate();
 	vtprintf( pvtOut, "POST %s HTTP/1.1\r\n", url );
 	vtprintf( pvtOut, "content-length:%d\r\n", GetTextSize( content ) );
@@ -21252,7 +22006,7 @@ HTTPState PostHttpQuery( PTEXT address, PTEXT url, PTEXT content )
 		state->pc = &state->request_socket;
 		state->waiter = MakeThread();
 		SetNetworkLong( pc, 0, (uintptr_t)state );
-		SetNetworkCloseCallback( pc, HttpReaderClose );
+		SetCPPNetworkCloseCallback( pc, HttpReaderClose, (uintptr_t)state );
 		if( l.flags.bLogReceived )
 		{
 			lprintf( "Sending POST..." );
@@ -21281,41 +22035,20 @@ PTEXT PostHttp( PTEXT address, PTEXT url, PTEXT content )
 	}
 	return NULL;
 }
-static void httpConnected( PCLIENT pc, int error ) {
-	struct HttpState *pHttpState = (struct HttpState *)GetNetworkLong( pc, 0 );
-	if( error ) {
-		pHttpState->options->connectError = error;
-		lprintf( "This is a request, and it failed with error %d", error );
-		RemoveClient( pc );
-	}
-	else {
-		pHttpState->options->connected = TRUE;
-	}
-	if(0)
-	{
-		INDEX idx;
-		struct pendingConnect *connect;
-		//lprintf( "Connection for http: %p", pc );
-		while( 1 ) {
-			LIST_FORALL( l.pendingConnects, idx, struct pendingConnect *, connect ) {
-				if( connect->pc == pc ) {
-					//lprintf( "Found pending connect(http): %p %d", connect, idx );
-					SetLink( &l.pendingConnects, idx, NULL );
-					break;
-				}
-			}
-			if( connect )
-				break;
-			else {
-				AddLink( &l.activeConnects, pc );
-				break;
-			}
-			Relinquish();
+static void httpConnected( uintptr_t psv, int error ) {
+//GetNetworkLong( pc, 0 );
+	struct HttpState *pHttpState = (struct HttpState *)psv;
+	if( pHttpState ) {
+		if( error ) {
+			pHttpState->options->connectError = error;
+			lprintf( "This is a request, and it failed with error %d", error );
+			RemoveClient( pHttpState->pc[0] );
 		}
-		if( connect ){
-			SetNetworkLong( pc, 0, (uintptr_t)connect->state );
-			Release( connect );
+		else {
+			pHttpState->options->connected = TRUE;
 		}
+	} else {
+		lprintf( "Client in connected should already have a state set too...." );
 	}
 }
 HTTPState GetHttpQuery( PTEXT address, PTEXT url )
@@ -21327,15 +22060,20 @@ HTTPState GetHttpQuery( PTEXT address, PTEXT url )
 	{
 		PCLIENT pc;
 		SOCKADDR *addr = CreateSockAddress( GetText( address ), 443 );
-		struct pendingConnect *connect = New( struct pendingConnect );
-		struct HttpState *state = CreateHttpState( &connect->pc );
-		connect->pc = NULL;
-		connect->state = state;
+		//struct pendingConnect *connect = New( struct pendingConnect );
+		struct HttpState *state = CreateHttpState( NULL);
+		//connect->pc = NULL;
+		//connect->state = state;
 		state->closed = FALSE;
 		//lprintf( "adding pending2: %p", connect->pc );
 		//AddLink( &l.pendingConnects, connect );
-		pc = OpenTCPClientAddrExxx( addr, HttpReader, HttpReaderClose, NULL, httpConnected, 0 DBG_SRC );
-		connect->pc = pc;
+		pc = CPPOpenTCPClientAddrExxx( addr, HttpReader, (uintptr_t)state
+					, HttpReaderClose, (uintptr_t)state
+					, NULL, 0
+					, httpConnected, (uintptr_t)state
+					, 0 DBG_SRC );
+		state->request_socket = pc;
+		//connect->pc = pc;
 		ReleaseAddress( addr );
 		if( pc ) {
 			PVARTEXT pvtOut = VarTextCreate();
@@ -21372,7 +22110,7 @@ HTTPState GetHttpQuery( PTEXT address, PTEXT url )
 	}
 	return NULL;
 }
-void httpSSLError( uintptr_t psv, PCLIENT pc, enum SackNetworkErrorIdentifier error, ... ) {
+void httpSSLError( uintptr_t psv, PCLIENT pc, SackNetworkError error, ... ) {
 	lprintf( "SSL Level Error: %d (unhandled)", error );
 }
 HTTPState GetHttpsQuery( PTEXT address, PTEXT url, const char* certChain )
@@ -21386,10 +22124,91 @@ HTTPState GetHttpsQuery( PTEXT address, PTEXT url, const char* certChain )
 	};
 	return GetHttpsQueryEx( address, url, certChain, &defaultOpts );
 }
-static void writeComplete( PCLIENT pc, CPOINTER buffer, size_t length ) {
-	struct HttpState* data = (struct HttpState*)GetNetworkLong( pc, 0 );
-	if( data && data->options && data->options->writeComplete )
-		data->options->writeComplete( data->options->userData );
+static void writeComplete( uintptr_t psv, CPOINTER buffer, size_t length ) {
+//GetNetworkLong( pc, 0 );
+	struct HttpState* data = (struct HttpState*)psv;
+	// on a streaming connection the content that just drained belongs to the
+	// request being written, not to the connection's own options.
+	struct HTTPRequestOptions *options = data ? ( data->requestOptions ? data->requestOptions : data->options ) : NULL;
+	if( options && options->writeComplete )
+		options->writeComplete( options->userData );
+}
+// Format one request into state->pvtOut: request line, Host, the caller's headers
+// (noting Connection/User-Agent/Content-Length as they go by so the defaults below
+// do not duplicate them), then the defaults and the terminating blank line.
+// This is the only part of issuing a request that is not connection state, which is
+// what makes it reusable for sending several requests on one connection.
+static void httpBuildRequest( struct HttpState *state, PTEXT address, PTEXT url
+                            , struct HTTPRequestOptions *options ) {
+	char* header;
+	LOGICAL skipLength = FALSE;
+	INDEX idx;
+	LOGICAL hadUserAgent = FALSE;
+	LOGICAL hadConnection = FALSE;
+	const char* resource = GetText( url );
+	// An origin-form request target has to start with '/' (RFC 9112 3.2.1), and a
+	// caller that passes a bare "download.html" would otherwise put
+	// `GET download.html HTTP/1.1` on the wire.  Servers do not merely refuse that:
+	// althttpd (which serves sqlite.org) counts a target that does not start with
+	// '/' as a hack attempt and shuns the source IP - 300 seconds per offense, and
+	// every retry of the request adds another one.  Prepend the slash instead.
+	// The two legal targets that do not begin with '/' are absolute-form
+	// ("http://host/path", used when talking to a proxy) and asterisk-form
+	// ("OPTIONS *"), so leave those alone.
+	const char* leadin = "";
+	if( !resource || !resource[0] )
+		resource = "/";
+	else if( resource[0] != '/' && resource[0] != '*'
+	      && StrCaseCmpEx( resource, "http://", 7 ) != 0
+	      && StrCaseCmpEx( resource, "https://", 8 ) != 0 )
+		leadin = "/";
+	if( !state->pvtOut ) state->pvtOut = VarTextCreate();
+	vtprintf( state->pvtOut, "%s %s%s HTTP/%s\r\n", options->method, leadin, resource, options->httpVersion?options->httpVersion:"1.1" );
+	// Host must carry a nonstandard port; the caller decides that by setting
+	// options->hostname (NULL falls back to the "host:port" address text).
+	// The space after the colon is optional per RFC 9110 (field-line is
+	// name ":" OWS value OWS) but not everyone parses that way: althttpd splits
+	// header lines on whitespace and compares the first token against "Host:",
+	// so "Host:example.com" is one token that matches nothing, the host is lost,
+	// and the request 404s with "Missing HOST: parameter".  Every other client
+	// sends the space; so do we.
+	{
+		const char* targetHost = options->hostname ? options->hostname : GetText( address );
+		vtprintf( state->pvtOut, "Host: %s\r\n", targetHost );
+	}
+	LIST_FORALL( options->headers, idx, char*, header ) {
+		if( !hadConnection && ( StrCaseCmpEx( header, "connection", 10 ) == 0 ) ) {
+			hadConnection = TRUE;
+			int spaces = 0;
+			while( header[11+spaces] == ' ' || header[11+spaces] == ':' ) spaces++;
+			if( StrCaseCmpEx( header+11+spaces, "keep-alive", 9 ) == 0 ) {
+				state->flags.keep_alive = 1;
+			} else if( StrCaseCmpEx( header+11+spaces, "close", 5 ) == 0 ) {
+				state->flags.close = 1;
+			}
+		}
+		if( !hadUserAgent && ( StrCaseCmpEx( header, "user-agent", 10 ) == 0 ) ) hadUserAgent = TRUE;
+		if( !skipLength   && ( StrCaseCmpEx( header, "Content-Length", 15 ) == 0 ) ) {
+			skipLength = TRUE;
+ // force content length to get hidden; should be ':' to be valid
+			if( header[15] == '~' )
+				continue;
+		}
+		vtprintf( state->pvtOut, "%s\r\n", header );
+	}
+	if( !hadConnection ) {
+		if( !options->httpVersion || strcmp( options->httpVersion, "1.1" ) == 0 || strcmp( options->httpVersion, "2.0" ) == 0) {
+			vtprintf( state->pvtOut, "Connection: Keep-Alive\r\n" );
+			state->flags.keep_alive = 1;
+		}
+	}
+	if( !skipLength ) {
+		vtprintf( state->pvtOut, "Content-Length: %d\r\n", options->contentLen);
+	}
+	if( !hadUserAgent )
+		vtprintf( state->pvtOut, "User-Agent: %s\r\n", options->agent?options->agent:"SACK/1.3" );
+ // send blank header
+	vtprintf( state->pvtOut, "\r\n" );
 }
 HTTPState GetHttpsQueryEx( PTEXT address, PTEXT url, const char* certChain, struct HTTPRequestOptions* options )
 {
@@ -21425,85 +22244,14 @@ HTTPState GetHttpsQueryEx( PTEXT address, PTEXT url, const char* certChain, stru
 	for( retries = 0; retries < options->retries; retries++ )
 	{
 		PCLIENT pc;
-		SOCKADDR *addr = CreateSockAddressV2( GetText( address ), options->ssl?443:80, options->addrFlags );
-		struct pendingConnect *connect = New( struct pendingConnect );
-		struct HttpState *state = CreateHttpState( &connect->pc );
+		struct HttpState *state = CreateHttpState(NULL);
 		state->options = options;
 		state->closed = FALSE;
-		connect->pc = NULL;
-		connect->state = state;
-		//lprintf( "adding pending3: %p", connect );
-		//AddLink( &l.pendingConnects, connect );
-		//lprintf( "added pending3" );
-		//DumpAddr( "Http Address:", addr );
- // clear any previous error.
-		options->connectError = 0;
-		pc = OpenTCPClientAddrExxx( addr, HttpReader, HttpReaderClose
-				, writeComplete, httpConnected, OPEN_TCP_FLAG_DELAY_CONNECT DBG_SRC );
-		connect->pc = pc;
-		//lprintf( "setting pending3: %p", connect->pc );
-		ReleaseAddress( addr );
+		pc = httpOpenSocket( address, state, options );
 		if( pc )
 		{
-			char* header;
-			LOGICAL skipLength = FALSE;
-			INDEX idx;
-			LOGICAL hadUserAgent = FALSE;
-			LOGICAL hadConnection = FALSE;
-			const char* resource = GetText( url );
-			if( !resource ) resource = "/";
-			state->last_read_tick = timeGetTime();
-			state->waiter = MakeThread();
-			state->request_socket = connect->pc;
-			state->pc = &state->request_socket;
-			SetNetworkLong( pc, 0, (uintptr_t)state );
-			//SetNetworkConn
-			state->ssl = options->ssl;
 			state->pvtOut = VarTextCreate();
-			// 1.0 expects close after request - this is a one shot synchronous process so...
-			vtprintf( state->pvtOut, "%s %s HTTP/%s\r\n", options->method, resource, options->httpVersion?options->httpVersion:"1.1" );
-			// 1.1 would need this sort of header....
-			//vtprintf( state->pvtOut, "connection: close\r\n" );
-			vtprintf( state->pvtOut, "Host:%s\r\n", options->hostname?options->hostname:GetText( address ) );
-			if( options->httpVersion && StrCaseCmpEx( options->httpVersion, "2.", 2 ) == 0 ) {
-				vtprintf( state->pvtOut, ":method:%s\r\n", options->method );
-				vtprintf( state->pvtOut, ":scheme:%s\r\n", options->ssl?"https":"http" );
-				vtprintf( state->pvtOut, ":authority:%s\r\n", GetText(address) );
-				vtprintf( state->pvtOut, ":path:%s\r\n", resource );
-				//vtprintf( state->pvtOut, ":status:\r\n" );
-			}
-			LIST_FORALL( options->headers, idx, char*, header ) {
-				if( !hadConnection && ( StrCaseCmpEx( header, "connection", 9 ) == 0 ) ) {
-					hadConnection = TRUE;
-					int spaces = 0; while( header[10+spaces] == ' ' ) spaces++;
-					if( StrCaseCmpEx( header+10+spaces, "keep-alive", 9 ) == 0 ) {
-						state->flags.keep_alive = 1;
-					} else if( StrCaseCmpEx( header+10+spaces, "close", 5 ) == 0 ) {
-						state->flags.close = 1;
-					}
-				}
-				if( !hadUserAgent && ( StrCaseCmpEx( header, "user-agent", 10 ) == 0 ) ) hadUserAgent = TRUE;
-				if( !skipLength   && ( StrCaseCmpEx( header, "Content-Length", 15 ) == 0 ) ) {
-					skipLength = TRUE;
- // force content length to get hidden; should be ':' to be valid
-					if( header[15] == '~' )
-						continue;
-				}
-				vtprintf( state->pvtOut, "%s\r\n", header );
-			}
-			if( !hadConnection ) {
-				if( !options->httpVersion || strcmp( options->httpVersion, "1.1" ) == 0 || strcmp( options->httpVersion, "2.0" ) == 0) {
-					vtprintf( state->pvtOut, "Connection: Keep-Alive\r\n" );
-					state->flags.keep_alive = 1;
-				}
-			}
-			if( !skipLength && options->content && options->contentLen ) {
-				vtprintf( state->pvtOut, "Content-Length:%d\r\n", options->contentLen);
-			}
-			if( !hadUserAgent )
-				vtprintf( state->pvtOut, "User-Agent:%s\r\n", options->agent?options->agent:"SACK/1.3" );
- // send blank header
-			vtprintf( state->pvtOut, "\r\n" );
+			httpBuildRequest( state, address, url, options );
 #ifndef NO_SSL
 			if( options->ssl ) {
 				if( ssl_BeginClientSession( pc, NULL, 0, NULL, 0, options->certChain?options->certChain:certChain, certChain
@@ -21522,30 +22270,40 @@ HTTPState GetHttpsQueryEx( PTEXT address, PTEXT url, const char* certChain, stru
 #endif
 			if( pc ) {
 				state->waiter = MakeThread();
-				PTEXT send = VarTextPeek( state->pvtOut );
 				if( NetworkConnectTCP( pc ) < 0 ) {
 					DestroyHttpState( state );
 					return NULL;
 				}
-				if( l.flags.bLogReceived )
-				{
-					lprintf( "Sending %s...", options->method );
-					LogBinary( (uint8_t*)GetText( send ), GetTextSize( send ) );
-				}
-				SendTCP( pc, GetText( send ), GetTextSize( send ) );
-				if( options->content && options->contentLen )
-					SendTCPLong( pc, options->content, options->contentLen );
-				// if it was SSL enabled, then SSL will do the destroy later, it
-            // still needs the vartext to send.
+				// Plain sockets can send as soon as connect returns.  The TLS branch
+				// above deliberately does not: pvtOut is left for HttpReader to send
+				// once the handshake completes.
+				httpSendRequest( state, options );
 				VarTextDestroy( &state->pvtOut );
 			}
+			// response timeout budget starts now; time spent connecting and
+			// sending (which stalls under TIME_WAIT port pressure) is not
+			// response-wait time.
+			state->last_read_tick = timeGetTime();
 			// wait for response.
-			while( state->request_socket && !state->closed && !state->returned_status
-				&& ( state->last_read_tick > ( timeGetTime() - options->timeout ) ) ) {
+			LOGICAL timeout = FALSE;
+			while ((timeout = FALSE), state->request_socket && !state->closed && !state->returned_status
+				&& ((timeout = TRUE), (state->last_read_tick > (timeGetTime() - options->timeout)))) {
 				//lprintf( "waiting for response 1000 second %d", options->timeout );
-				WakeableSleep( 1000 );
+				WakeableSleep(1000);
 			}
 			state->waiter = NULL;
+			if (!timeout && !state->returned_status) {
+				// this becomes the caller's generic 'Bad Parsing State'; say why,
+				// and say where the request bytes are being held if they never left.
+				lprintf( "HTTP request ended without a response: pc:%p closed:%d sinceRead:%" _32f " budget:%" _32f " pendingSend:%d deferred:%" _32f " flags:%08x evstate:%08x"
+				       , state->request_socket, state->closed
+				       , timeGetTime() - state->last_read_tick
+				       , options->timeout
+				       , state->request_socket ? NetworkClientHasPendingSend( state->request_socket ) : 0
+				       , state->request_socket ? NetworkClientWritesPended( state->request_socket ) : 0
+				       , state->request_socket ? NetworkClientFlags( state->request_socket ) : 0
+				       , state->request_socket ? NetworkClientEventState( state->request_socket ) : 0 );
+			}
 			//lprintf( "Request has completed.... %p %p %d", pc, state->content, state->closed );
 			if( state->request_socket && !state->closed ) {
 				//lprintf( "Closing in got response?" );
@@ -21565,6 +22323,92 @@ HTTPState GetHttpsQueryEx( PTEXT address, PTEXT url, const char* certChain, stru
 		}
 	}
 	return NULL;
+}
+//---------- streaming connection API ---------------------------
+// Same five phases GetHttpsQueryEx runs through, minus its wait loop, and with
+// the two per-request phases (format, write) moved out to
+// SendHttpConnectionRequest so they can happen more than once.
+HTTPState OpenHttpConnection( PTEXT address, const char *certChain
+                            , struct HTTPRequestOptions *options
+                            , httpConnectionOpened opened
+                            , httpConnectionResponse response
+                            , httpConnectionClosed closed
+                            , uintptr_t psv ) {
+	PCLIENT pc;
+	struct HttpState *state;
+	if( !address || !options ) return NULL;
+	state = CreateHttpState( NULL );
+	state->options = options;
+	state->closed = FALSE;
+	state->flags.connection_mode = 1;
+	state->pipelineDepth = 1;
+	state->connectionAddress = SegDuplicate( address );
+	state->connectionCertChain = options->certChain ? options->certChain : certChain;
+	state->openedCallback = opened;
+	state->responseCallback = response;
+	state->closedCallback = closed;
+	state->psvConnection = psv;
+	pc = httpOpenSocket( address, state, options );
+	if( !pc ) {
+		DestroyHttpState( state );
+		return NULL;
+	}
+	// no waiter thread: nothing about this API blocks.
+	state->waiter = NULL;
+#ifndef NO_SSL
+	if( options->ssl ) {
+		if( !ssl_BeginClientSession( pc, NULL, 0, NULL, 0, state->connectionCertChain, state->connectionCertChain
+		                           ? strlen( state->connectionCertChain ) : 0 ) ) {
+			RemoveClient( pc );
+			DestroyHttpState( state );
+			return NULL;
+		}
+		SetNetworkErrorCallback( pc, httpSSLError, (uintptr_t)state );
+		if( !options->rejectUnauthorized )
+			ssl_SetIgnoreVerification( pc );
+	}
+#endif
+	if( NetworkConnectTCP( pc ) < 0 ) {
+		DestroyHttpState( state );
+		return NULL;
+	}
+	state->last_read_tick = timeGetTime();
+	return state;
+}
+LOGICAL SendHttpConnectionRequest( HTTPState connection, PTEXT url, struct HTTPRequestOptions *options ) {
+	struct httpConnectionRequest *req;
+	if( !connection || !connection->flags.connection_mode ) return FALSE;
+	if( connection->closed || !connection->request_socket ) return FALSE;
+	req = New( struct httpConnectionRequest );
+	req->url = url ? SegDuplicate( url ) : NULL;
+	req->options = options;
+	lockHttp( connection );
+	EnqueLink( &connection->pending, req );
+	unlockHttp( connection );
+	// before the connection is up this just queues; httpConnectionReady flushes.
+	httpFlushRequests( connection );
+	return TRUE;
+}
+void SetHttpConnectionPipeline( HTTPState connection, int depth ) {
+	if( !connection ) return;
+	connection->pipelineDepth = depth > 0 ? depth : 1;
+	httpFlushRequests( connection );
+}
+int GetHttpConnectionPending( HTTPState connection ) {
+	if( !connection ) return 0;
+	return connection->inflightCount + (int)GetQueueLength( connection->pending );
+}
+void CloseHttpConnection( HTTPState connection ) {
+	if( !connection ) return;
+	connection->flags.connection_ready = 0;
+	if( connection->request_socket )
+		RemoveClient( connection->request_socket );
+	else if( connection->closedCallback && !connection->closed ) {
+		// never had a socket to close; still owes the owner a close.
+		connection->closed = TRUE;
+		httpFailOutstanding( connection );
+		connection->closedCallback( connection->psvConnection, connection );
+	}
 }
 PTEXT GetHttp( PTEXT address, PTEXT url, LOGICAL secure )
 {
@@ -21631,12 +22475,11 @@ static void CPROC HandleRequest( PCLIENT pc, POINTER buffer, size_t length )
 	if( !buffer )
 	{
 		struct HttpState *pHttpStateServer = (struct HttpState *)GetNetworkLong( pc, 0 );
-		struct HttpState *pHttpState = CreateHttpState( NULL );
+		struct HttpState *pHttpState = CreateHttpState(NULL);
 		pHttpState->ssl = pHttpStateServer->ssl;
 		buffer = pHttpState->buffer = Allocate( 4096 );
 		pHttpState->request_socket = pc;
 		//lprintf( "update pc here?" );
-		pHttpState->pc = &pHttpState->request_socket;
 		SetNetworkLong( pc, 1, (uintptr_t)pHttpState );
 	}
 	else
@@ -21695,6 +22538,7 @@ static void CPROC AcceptHttpClient( PCLIENT pc_server, PCLIENT pc_new )
 		Relinquish();
 	}
 	AddLink( &server->clients, pc_new );
+	SetTCPNoDelay( pc_new, TRUE );
 	SetNetworkLong( pc_new, 0, (uintptr_t)server );
 	SetNetworkReadComplete( pc_new, HandleRequest );
 	SetNetworkCloseCallback( pc_new, RequestorClosed );
@@ -21759,14 +22603,21 @@ PTEXT GetHTTPField( struct HttpState *pHttpState, CTEXTSTR name )
 {
 	INDEX idx;
 	struct HttpField *field;
+	PTEXT result = NULL;
+	// the field list is emptied by EndHttp on the JS end() thread; walking it
+	// unlocked can trip over LineRelease'd names/values mid-iteration.
+	lockHttp( pHttpState );
 	LIST_FORALL( pHttpState->fields, idx, struct HttpField *, field )
 	{
-		if( TextLike( field->name, name ) )
-			return field->value;
+		if( TextLike( field->name, name ) ) {
+			result = field->value;
+			break;
+		}
 	}
-	return NULL;
+	unlockHttp( pHttpState );
+	return result;
 }
-PLIST GetHttpHeaderFields( HTTPState pHttpState )
+PNVLIST GetHttpHeaderFields( HTTPState pHttpState )
 {
 	if( pHttpState )
 		return pHttpState->fields;
@@ -21903,7 +22754,7 @@ struct url_data * SACK_URLParse( const char *url )
 	_state = -1;
 	state = PARSE_STATE_COLLECT_PROTOCOL;
 	MemSet( data, 0, sizeof( struct url_data ) );
-	while( ch = GetUtfChar(&url) )
+	while( ( ch = GetUtfChar(&url) ) )
 	{
 		int use_char;
 		use_char = 0;
@@ -23943,7 +24794,11 @@ static struct global_memory_tag global_memory_data = { 0x10000 * 0x08
 																	  , 0
 																	  , NULL
 #ifdef _WIN32
-																	  , {{{0}}}
+#ifdef __cplusplus
+																	  , {{0}}
+#else
+																	  , {}
+#endif
 #endif
 																	  , 0
 																	  , 0
@@ -23968,7 +24823,11 @@ struct global_memory_tag global_memory_data = { 0x10000 * 0x08, 0, 0
 																	  , 0
 																	  , NULL
 #ifdef _WIN32
-																	  , {{{0}}}
+#ifdef __cplusplus
+																	  , {{0}}
+#else
+																	  , {}
+#endif
 #endif
 																	  , 0
 																	  , 0
@@ -23991,7 +24850,11 @@ struct global_memory_tag global_memory_data = { 0x10000 * 0x08, 1, 1
 																	  , 0
 																	  , NULL
 #ifdef _WIN32
-																	  , {{{0}}}
+#ifdef __cplusplus
+																	  , {{0}}
+#else
+																	  , {}
+#endif
 #endif
 																	  , 0
 																	  , 0
@@ -24016,6 +24879,8 @@ struct global_memory_tag global_memory_data = { 0x10000 * 0x08, 1, 1
 #ifndef __PRI64_PREFIX
 #  ifdef _MSC_VER
 #    define __PRI64_PREFIX "ll"
+#  else
+#    define __PRI64_PREFIX "ll"
 #  endif
 #endif
 #ifdef __64__
@@ -24033,6 +24898,57 @@ struct global_memory_tag global_memory_data = { 0x10000 * 0x08, 1, 1
 // block_tag is at the start of the padding...
 #define BLOCK_FILE(pc) (*(CTEXTSTR*)((pc)->byData + (pc)->dwSize - MAGIC_SIZE*2))
 #define BLOCK_LINE(pc) (*(int*)((pc)->byData + (pc)->dwSize - MAGIC_SIZE))
+/* --- release trace ring -------------------------------------------------------
+   When the allocator catches a double release it can say WHERE it was noticed
+   but not who released the block first; BLOCK_FILE/BLOCK_LINE only carry that in
+   _DEBUG builds, and turning on full allocator debug is so slow that it changes
+   the timing of the very race being hunted (it stops reproducing).  This keeps
+   the last MEM_TRACE_ENTRIES release events in a fixed ring instead: two stores
+   and one atomic increment, no I/O and no formatting, so it is cheap enough to
+   leave on while a race reproduces at full speed.  The ring is then read out of a
+   CORE DUMP - two entries for the same block are the double release, with both
+   call sites.  A ring that overwrites its oldest entry gives the same "last N
+   events" property as trimming a queue, without the bookkeeping.
+   From gdb on a core:
+     p memTrace.next
+     set $i=0
+     while $i < 50000
+       if memTrace.entries[$i].block == (POINTER)0xADDRESS
+         p memTrace.entries[$i]
+       end
+       set $i=$i+1
+     end
+   Costs ~1.2MB of static storage and one atomic increment plus three stores per
+   release; define NO_MEM_TRACE to compile it out entirely.
+requires DBG_AVIAILABLE (_DEBUG(Debug/RelWithDebInfo) or _DEBUG_INFO (RelWithDebInfo),
+otherwise no lines could be tracked.
+*/
+#if DBG_AVAILABLE && !defined( NO_MEM_TRACE )
+#  define MEM_TRACE_ENTRIES 50000
+enum { MEM_TRACE_RELEASE = 1, MEM_TRACE_DOUBLE = 2 };
+struct mem_trace_entry {
+	POINTER block;
+	CTEXTSTR file;
+	uint32_t line;
+	uint32_t op;
+};
+static struct {
+	struct mem_trace_entry entries[MEM_TRACE_ENTRIES];
+ // ever-increasing; newest slot is (next-1) % MEM_TRACE_ENTRIES
+	volatile uint32_t next;
+} memTrace;
+static void MemTrace( POINTER block DBG_PASS, uint32_t op ) {
+	uint32_t n = LockedIncrement( &memTrace.next ) - 1;
+	struct mem_trace_entry *e = memTrace.entries + ( n % MEM_TRACE_ENTRIES );
+	e->block = block;
+ // DBG_PASS names its parameters pFile/nLine
+	e->file = pFile;
+	e->line = nLine;
+	e->op = op;
+}
+#else
+#  define MemTrace(a,...)
+#endif
 #ifndef _WIN32
 #endif
 PRIORITY_PRELOAD( Deadstart_finished_enough, GLOBAL_INIT_PRELOAD_PRIORITY + 1 )
@@ -24130,6 +25046,25 @@ uint32_t LockedDecrement( volatile uint32_t* p ) {
 #endif
 #ifdef __LINUX__
 	return __atomic_sub_fetch( p, 1, __ATOMIC_RELAXED );
+#endif
+}
+// Both of these return the value PRIOR to the operation, which is what
+// InterlockedOr/InterlockedAnd and __atomic_fetch_or/and naturally give, so the
+// two platforms agree without extra work.
+uint32_t LockedOr( volatile uint32_t* p, uint32_t bits ) {
+#ifdef _WIN32
+	return (uint32_t)InterlockedOr( (volatile LONG *)p, (LONG)bits );
+#endif
+#ifdef __LINUX__
+	return __atomic_fetch_or( p, bits, __ATOMIC_RELAXED );
+#endif
+}
+uint32_t LockedAnd( volatile uint32_t* p, uint32_t mask ) {
+#ifdef _WIN32
+	return (uint32_t)InterlockedAnd( (volatile LONG *)p, (LONG)mask );
+#endif
+#ifdef __LINUX__
+	return __atomic_fetch_and( p, mask, __ATOMIC_RELAXED );
 #endif
 }
 uint64_t  LockedExchange64( volatile uint64_t* p, uint64_t val )
@@ -24275,7 +25210,7 @@ static void DumpSection( PCRITICALSECTION pcs )
 		pcs->dwThreadPrior[pcs->nPrior] = dwCurProc;
 		pcs->nPrior = (pcs->nPrior + 1) % MAX_SECTION_LOG_QUEUE;
 #endif
-				pcs->dwLocks++;
+				pcs->dwLocks=pcs->dwLocks+1;
 				pcs->dwUpdating = 0;
 				return 1;
 			}
@@ -24349,7 +25284,7 @@ static void DumpSection( PCRITICALSECTION pcs )
 		pcs->dwThreadPrior[pcs->nPrior] = dwCurProc;
 		pcs->nPrior = (pcs->nPrior + 1) % MAX_SECTION_LOG_QUEUE;
 #endif
-				pcs->dwLocks--;
+				pcs->dwLocks=pcs->dwLocks-1;
 				if( !pcs->dwLocks )
 				{
 					pcs->dwThreadID = 0;
@@ -25939,6 +26874,7 @@ POINTER ReleaseEx ( POINTER pData DBG_PASS )
 	}
 	if( pData )
 	{
+		MemTrace( pData DBG_RELAY, MEM_TRACE_RELEASE );
 #ifndef __NO_MMAP__
 		// how to figure if it's a CHUNK or a HEAP_CHUNK?
 		if( !( ((uintptr_t)pData) & 0x3FF ) )
@@ -26077,6 +27013,9 @@ POINTER ReleaseEx ( POINTER pData DBG_PASS )
 						// CRITICAL ERROR!
 						_xlprintf( 2 DBG_RELAY)( "Block is already Free! %p ", pc );
 #endif
+					// tag it in the ring as well, so a core shows this release next to
+					// the earlier release(s) of the same block
+					MemTrace( pData DBG_RELAY, MEM_TRACE_DOUBLE );
 					DebugBreak();
 					DropMem( pMem );
 					return pData;
@@ -26590,7 +27529,7 @@ void  DebugDumpHeapMemEx ( PMEM pHeap, LOGICAL bVerbose )
 					pNew->me[0] = pNew;
 					pNew->dwSize += next->dwSize + CHUNK_SIZE;
 					next = (PCHUNK)( pNew->byData + pNew->dwSize );
-					if( (uint32_t)(((char *)next) - ((char *)pMem)) < pMem->dwSize )
+					if( (uintptr_t)(((char *)next) - ((char *)pMem)) < pMem->dwSize )
 					{
 						next->pPrior = pNew;
 					}
@@ -26756,7 +27695,7 @@ void  DebugDumpHeapMemEx ( PMEM pHeap, LOGICAL bVerbose )
 	g.last_set_allocate = nLine;
 #endif
 	g.bDefaultLogAllocate = g.bLogAllocate = bTrueFalse;
-	_lprintf(DBG_RELAY)( "--------- USE CLEAR OR RESET LOGGING!" );
+	//_lprintf(DBG_RELAY)( "--------- USE CLEAR OR RESET LOGGING!" );
 	return prior;
 }
 //------------------------------------------------------------------------------------------------------
@@ -27325,7 +28264,7 @@ size_t StrBytesWu8( wchar_t const* s ) {
 	TEXTRUNE r;
 	if( !s )
 		return 0;
-	for( l = 0; r = GetUtfCharW( &s ); s++ ) {
+	for( l = 0; ( r = GetUtfCharW( &s ) ); s++ ) {
 		l += ConvertToUTF8( ch, r );
 	}
 	return l + 1;
@@ -27775,7 +28714,7 @@ typedef struct keyboard_tag KEYBOARD;
 typedef struct keyboard_tag *PKEYBOARD;
 struct keyboard_tag
 {
-#define NUM_KEYS 256
+#define NUM_KEYS 259
    /* one byte index... more than sufficient
       if character in array is '1' key is down, '2' key is up. */
    char keyupdown[NUM_KEYS];
@@ -28404,6 +29343,222 @@ Double quote	"""	222
 #    define KEY_X   AKEYCODE_X
 #    define KEY_Y   AKEYCODE_Y
 #    define KEY_Z   AKEYCODE_Z
+#  elif defined( __MAC__ )
+// macOS / Cocoa virtual key codes (the kVK_* values from Carbon HIToolbox
+// Events.h).  These are hardware-independent "virtual" codes as returned by
+// [NSEvent keyCode]; the cocoa vidlib backend passes them straight through to
+// DispatchKeyEvent, so the KEY_* names below must equal those codes.  They are
+// hard-coded (rather than including <Carbon/...>) because the values are ABI
+// stable and we don't want a framework dependency in this public header.  Keys
+// with no macOS equivalent get out-of-range (>=0x100) sentinels so they never
+// match a real event.
+// letters
+#    define KEY_A 0x00
+#    define KEY_B 0x0B
+#    define KEY_C 0x08
+#    define KEY_D 0x02
+#    define KEY_E 0x0E
+#    define KEY_F 0x03
+#    define KEY_G 0x05
+#    define KEY_H 0x04
+#    define KEY_I 0x22
+#    define KEY_J 0x26
+#    define KEY_K 0x28
+#    define KEY_L 0x25
+#    define KEY_M 0x2E
+#    define KEY_N 0x2D
+#    define KEY_O 0x1F
+#    define KEY_P 0x23
+#    define KEY_Q 0x0C
+#    define KEY_R 0x0F
+#    define KEY_S 0x01
+#    define KEY_T 0x11
+#    define KEY_U 0x20
+#    define KEY_V 0x09
+#    define KEY_W 0x0D
+#    define KEY_X 0x07
+#    define KEY_Y 0x10
+#    define KEY_Z 0x06
+// number row
+#    define KEY_0 0x1D
+#    define KEY_1 0x12
+#    define KEY_2 0x13
+#    define KEY_3 0x14
+#    define KEY_4 0x15
+#    define KEY_5 0x17
+#    define KEY_6 0x16
+#    define KEY_7 0x1A
+#    define KEY_8 0x1C
+#    define KEY_9 0x19
+// punctuation
+  // kVK_ANSI_Minus
+#    define KEY_MINUS         0x1B
+#    define KEY_DASH          KEY_MINUS
+  // kVK_ANSI_Equal
+#    define KEY_EQUAL         0x18
+#    define KEY_PLUS          KEY_EQUAL
+  // kVK_ANSI_LeftBracket
+#    define KEY_LEFT_BRACKET  0x21
+  // kVK_ANSI_RightBracket
+#    define KEY_RIGHT_BRACKET 0x1E
+  // kVK_ANSI_Backslash
+#    define KEY_BACKSLASH     0x2A
+  // kVK_ANSI_Semicolon
+#    define KEY_SEMICOLON     0x29
+  // kVK_ANSI_Quote
+#    define KEY_QUOTE         0x27
+  // kVK_ANSI_Comma
+#    define KEY_COMMA         0x2B
+  // kVK_ANSI_Period
+#    define KEY_PERIOD        0x2F
+#    define KEY_LESS          KEY_COMMA
+  // kVK_ANSI_Slash
+#    define KEY_SLASH         0x2C
+#    define KEY_DIV           KEY_SLASH
+#    define KEY_MULT          KEY_PAD_MULT
+  // kVK_ANSI_Grave
+#    define KEY_ACCENT        0x32
+// control / whitespace
+  // kVK_Tab
+#    define KEY_TAB           0x30
+  // kVK_Space
+#    define KEY_SPACE         0x31
+  // kVK_Return
+#    define KEY_ENTER         0x24
+#    define KEY_NORMAL_ENTER  KEY_ENTER
+  // kVK_Delete (the backspace key)
+#    define KEY_BACKSPACE     0x33
+#    define KEY_DEL           KEY_BACKSPACE
+  // kVK_Escape
+#    define KEY_ESCAPE        0x35
+#    define KEY_ESC           KEY_ESCAPE
+// modifiers
+  // kVK_Shift
+#    define KEY_SHIFT          0x38
+#    define KEY_LEFT_SHIFT     0x38
+  // kVK_RightShift
+#    define KEY_RIGHT_SHIFT    0x3C
+  // kVK_Control
+#    define KEY_CTRL           0x3B
+#    define KEY_CONTROL        0x3B
+#    define KEY_LEFT_CONTROL   0x3B
+  // kVK_RightControl
+#    define KEY_RIGHT_CONTROL  0x3E
+  // kVK_Option
+#    define KEY_ALT            0x3A
+#    define KEY_LEFT_ALT       0x3A
+  // kVK_RightOption
+#    define KEY_RIGHT_ALT      0x3D
+  // kVK_CapsLock
+#    define KEY_CAPS_LOCK      0x39
+// dedicated navigation cluster
+  // kVK_UpArrow
+#    define KEY_UP            0x7E
+  // kVK_DownArrow
+#    define KEY_DOWN          0x7D
+  // kVK_LeftArrow
+#    define KEY_LEFT          0x7B
+  // kVK_RightArrow
+#    define KEY_RIGHT         0x7C
+  // kVK_Home
+#    define KEY_HOME          0x73
+  // kVK_End
+#    define KEY_END           0x77
+  // kVK_PageUp
+#    define KEY_PGUP          0x74
+#    define KEY_PAGE_UP       KEY_PGUP
+  // kVK_PageDown
+#    define KEY_PGDN          0x79
+#    define KEY_PAGE_DOWN     KEY_PGDN
+  // kVK_Help (Insert position)
+#    define KEY_INSERT        0x72
+  // kVK_ForwardDelete
+#    define KEY_DELETE        0x75
+// "grey"/extended keys: the dedicated nav keys (macOS has a single set)
+#    define KEY_GREY_UP      KEY_UP
+#    define KEY_GREY_DOWN    KEY_DOWN
+#    define KEY_GREY_LEFT    KEY_LEFT
+#    define KEY_GREY_RIGHT   KEY_RIGHT
+#    define KEY_GREY_HOME    KEY_HOME
+#    define KEY_GREY_END     KEY_END
+#    define KEY_GREY_PGUP    KEY_PGUP
+#    define KEY_GREY_PGDN    KEY_PGDN
+#    define KEY_GREY_INSERT  KEY_INSERT
+#    define KEY_GREY_DELETE  KEY_DELETE
+// numeric keypad
+  // kVK_ANSI_Keypad0
+#    define KEY_PAD_0        0x52
+#    define KEY_PAD_1        0x53
+#    define KEY_PAD_2        0x54
+#    define KEY_PAD_3        0x55
+#    define KEY_PAD_4        0x56
+#    define KEY_PAD_5        0x57
+#    define KEY_PAD_6        0x58
+#    define KEY_PAD_7        0x59
+#    define KEY_PAD_8        0x5B
+#    define KEY_PAD_9        0x5C
+#    define KEY_KP9 KEY_PAD_9
+#    define KEY_KP8 KEY_PAD_8
+#    define KEY_KP7 KEY_PAD_7
+#    define KEY_KP6 KEY_PAD_6
+#    define KEY_KP5 KEY_PAD_5
+#    define KEY_KP4 KEY_PAD_4
+#    define KEY_KP3 KEY_PAD_3
+#    define KEY_KP2 KEY_PAD_2
+#    define KEY_KP1 KEY_PAD_1
+#    define KEY_KP0 KEY_PAD_0
+  // kVK_ANSI_KeypadDecimal
+#    define KEY_PAD_DOT      0x41
+#    define KEY_PAD_DELETE   KEY_PAD_DOT
+  // kVK_ANSI_KeypadPlus
+#    define KEY_PAD_PLUS     0x45
+  // kVK_ANSI_KeypadMinus
+#    define KEY_PAD_MINUS    0x4E
+  // kVK_ANSI_KeypadMultiply
+#    define KEY_PAD_MULT     0x43
+  // kVK_ANSI_KeypadDivide
+#    define KEY_PAD_DIV      0x4B
+  // kVK_ANSI_KeypadEnter
+#    define KEY_PAD_ENTER    0x4C
+// the macOS keypad has no distinct numlock-off nav function, so the on-pad
+// navigation aliases map to the corresponding keypad digit keys.
+#    define KEY_PAD_HOME     KEY_PAD_7
+#    define KEY_PAD_END      KEY_PAD_1
+#    define KEY_PAD_UP       KEY_PAD_8
+#    define KEY_PAD_DOWN     KEY_PAD_2
+#    define KEY_PAD_LEFT     KEY_PAD_4
+#    define KEY_PAD_RIGHT    KEY_PAD_6
+#    define KEY_PAD_PGUP     KEY_PAD_9
+#    define KEY_PAD_PGDN     KEY_PAD_3
+#    define KEY_PAD_INSERT   KEY_PAD_0
+#    define KEY_PAD_CENTER   KEY_PAD_5
+// "grey" numpad operators alias the keypad operators
+#    define KEY_GREY_DIV     KEY_PAD_DIV
+#    define KEY_GREY_MULT    KEY_PAD_MULT
+#    define KEY_GREY_MINUS   KEY_PAD_MINUS
+#    define KEY_GREY_PLUS    KEY_PAD_PLUS
+#    define KEY_GREY_CENTER  KEY_PAD_CENTER
+// function keys
+#    define KEY_F1  0x7A
+#    define KEY_F2  0x78
+#    define KEY_F3  0x63
+#    define KEY_F4  0x76
+#    define KEY_F5  0x60
+#    define KEY_F6  0x61
+#    define KEY_F7  0x62
+#    define KEY_F8  0x64
+#    define KEY_F9  0x65
+#    define KEY_F10 0x6D
+#    define KEY_F11 0x67
+#    define KEY_F12 0x6F
+// keys with no macOS equivalent - out-of-range sentinels (never match)
+  // kVK_ANSI_KeypadClear (closest analogue)
+#    define KEY_NUM_LOCK     0x47
+#    define KEY_SCROLL_LOCK  0x100
+#    define KEY_STOP         0x101
+#    define KEY_CENTER       0x102
+#    define KEY_WINDOW_1     0x103
+#    define KEY_WINDOW_2     0x104
 #  elif defined( __LINUX__ ) && !defined( __MAC__ ) && !defined( __ANDROID__ ) && !defined( USE_WIN32_KEY_DEFINES )
 /* THis is a literal copy of bba013e1ca5e7150b42a1a1a1e852010d772edad / include/uapi/linux/input-event-codes.h
   from github.  Other than this leading comment it is the original copy; this is included as a fallback for linux
@@ -29970,6 +31125,7 @@ namespace sack {
 #if ( !defined( IMAGE_LIBRARY_SOURCE_MAIN ) && ( !defined( FORCE_NO_INTERFACE ) || defined( ALLOW_IMAGE_INTERFACE ) ) )      && !defined( FORCE_COLOR_MACROS )
 #define Color( r,g,b ) MakeColor(r,g,b)
 #define AColor( r,g,b,a ) MakeAlphaColor(r,g,b,a)
+#define GLColor( c )      (c)
 #define SetAlpha( rgb, a ) SetAlphaValue( rgb, a )
 #define SetGreen( rgb, g ) SetGreeValue(rgb,g )
 #define AlphaVal(color) GetAlphaValue( color )
@@ -30405,26 +31561,26 @@ IMAGE_NAMESPACE_END
    #define vRight   0
    #define _1D(exp)  exp
    #if( DIMENSIONS > 1 )
-      #define vUp      1
-      #define _2D(exp)  exp
-      #if( DIMENSIONS > 2 )
-         #define vForward 2
-         #define _3D(exp)  exp
-         #if( DIMENSIONS > 3 )
+	  #define vUp      1
+	  #define _2D(exp)  exp
+	  #if( DIMENSIONS > 2 )
+		 #define vForward 2
+		 #define _3D(exp)  exp
+		 #if( DIMENSIONS > 3 )
   // 4th dimension 'IN'/'OUT' since projection is scaled 3d...
-            #define vIn      3
-            #define _4D(exp)  exp
-         #else
-            #define _4D(exp)
-         #endif
-      #else
-         #define _3D(exp)
-         #define _4D(exp)
-      #endif
+			#define vIn      3
+			#define _4D(exp)  exp
+		 #else
+			#define _4D(exp)
+		 #endif
+	  #else
+		 #define _3D(exp)
+		 #define _4D(exp)
+	  #endif
    #else
-      #define _2D(exp)
-      #define _3D(exp)
-      #define _4D(exp)
+	  #define _2D(exp)
+	  #define _3D(exp)
+	  #define _4D(exp)
    #endif
 #else
    // print out a compiler message can't perform zero-D transformations...
@@ -30649,25 +31805,53 @@ VECTOR_NAMESPACE_END
 // Add logging
 //
 SACK_NAMESPACE
-	_MATH_NAMESPACE
-	/* Vector namespace contains methods for operating on vectors. Vectors
-	   are multi-dimensional scalar quantities, often used to
-	   represent coordinates and directions in space.                      */
-   _VECTOR_NAMESPACE
-//#include "../src/vectlib/vecstruc.h"
+_MATH_NAMESPACE
+/* Vector namespace contains methods for operating on vectors. Vectors
+   are multi-dimensional scalar quantities, often used to
+   represent coordinates and directions in space.
+	PTRANSFORM can also be a MATRIX, however, instances of transforms should be
+	created with CreateTransform and deleted with DeleteTransform.
+	PTRANSFORM is an opaque type representing a transformation matrix. It has scaling
+	internally separate from the orientation and position matrix.
+   */
+#ifdef __cplusplus
+	namespace vector {
+#  ifndef MAKE_RCOORD_SINGLE
+		namespace Double {
+#  else
+		namespace Float {
+#  endif
+#endif
+/* A 4 dimensional point type. Contains 4 values.
+*  Rotation Vectors are saved as normalized axis-angle, with the angle as the 4th element.
+*/
 typedef RCOORD _POINT4[4];
+/* A point type. Contains 3 values by default, library can
+   handle 4 dimensional transformations(?)                  */
 typedef RCOORD _POINT[DIMENSIONS];
-/* pointer to a point. */
+/* pointer to a (DIMENSIONS) point. */
 typedef RCOORD *P_POINT;
+/* for consistency, a 4 dimensional point pointer. */
+typedef RCOORD* P_POINT4;
 /* pointer to a constant point. */
 typedef const RCOORD *PC_POINT;
+/* for consistency a pointer that should have 4 elements, pointer to a constant point. */
+typedef const RCOORD* PC_POINT4;
 /* A vector type. Contains 3 values by default, library can
    handle 4 dimensional transformations(?)                  */
 typedef _POINT VECTOR;
+/* A 4 dimensional vector type. Contains 4 values.
+* Rotation Vectors are saved as normalized axis-angle, with the angle as the 4th element.
+*/
+typedef _POINT4 VECTOR4;
 /* pointer to a vector. */
 typedef P_POINT PVECTOR;
+/* pointer to a 4 dimensional vector. */
+typedef P_POINT4 PVECTOR4;
 /* pointer to a constant vector. */
 typedef PC_POINT PCVECTOR;
+/* pointer to a constant 4 dimensional vector. */
+typedef PC_POINT4 PCVECTOR4;
 /* <combine sack::math::vector::RAY@1>
    \ \                                 */
 typedef struct vectlib_ray_type *PRAY;
@@ -30707,12 +31891,12 @@ typedef struct orthoarea_tag ORTHOAREA;
 typedef struct orthoarea_tag *PORTHOAREA;
 /* A representation of a rectangular 2 dimensional area. */
 struct orthoarea_tag {
-    /* x coorindate of a rectangular area. */
-    /* y coordinate of a rectangular area. */
-    RCOORD x, y;
-    /* height (y + h = area end). height may be negative. */
-    /* with (x + w = area end). with may be negative. */
-    RCOORD w, h;
+	/* x coorindate of a rectangular area. */
+	/* y coordinate of a rectangular area. */
+	RCOORD x, y;
+	/* height (y + h = area end). height may be negative. */
+	/* with (x + w = area end). with may be negative. */
+	RCOORD w, h;
 } ;
 // relics from fixed point math dayz....
 #define ZERO (0.0f)
@@ -30743,7 +31927,7 @@ struct orthoarea_tag {
 #define SetPoint4( d, s ) ( (d)[0] = (s)[0], (d)[1]=(s)[1], (d)[2]=(s)[2], (d)[3]=(s)[3] )
 /* Inverts a vector. that is vector * -1. (a,b,c) = (-a,-b,-c)
    <b>Parameters</b>
-                                                               */
+															   */
 VECTOR_METHOD( P_POINT, Invert, ( P_POINT a ) );
 /* Macro which can be used to make a vector's direction be
    exactly opposite of what it is now.                     */
@@ -30868,7 +32052,7 @@ VECTOR_METHOD( P_POINT, scale, ( P_POINT pr, PC_POINT pv1, RCOORD k ) );
    pv1 :  pointer to vector 1
    pv2 :  pointer to vector 2
    k :    scalar quantity to apply to vector 2 when adding to
-          vector 1.
+		  vector 1.
    Remarks
    The pointer to the result vector may be the same vector as
    vector 1 or vector 2.
@@ -30884,8 +32068,9 @@ VECTOR_METHOD( P_POINT, scale, ( P_POINT pr, PC_POINT pv1, RCOORD k ) );
 VECTOR_METHOD( P_POINT, addscaled, ( P_POINT pr, PC_POINT pv1, PC_POINT pv2, RCOORD k ) );
 /* Normalizes a non-zero vector. That is the resulting length of
    the vector is 1.0. Modifies the vector in place.              */
-VECTOR_METHOD( void, normalize, ( P_POINT pv ) );
-VECTOR_METHOD( void, crossproduct, ( P_POINT pr, PC_POINT pv1, PC_POINT pv2 ) );
+VECTOR_METHOD( P_POINT, normalize, ( P_POINT pv ) );
+VECTOR_METHOD( P_POINT4, normalize4, ( P_POINT4 pv ) );
+VECTOR_METHOD( P_POINT, crossproduct, ( P_POINT pr, PC_POINT pv1, PC_POINT pv2 ) );
 /* \Returns the sin of the angle between two vectors.
    Parameters
    pv1 :  one vector
@@ -30932,10 +32117,10 @@ VECTOR_METHOD( RCOORD, DirectedDistance, ( PC_POINT pvOn, PC_POINT pvOf ) );
    // set ray to ray2
    SetRay( ray, ray2 );
    </code>                                    */
-#define SetRay( pr1, pr2 ) { SetPoint( (pr1)->o, (pr2)->o ),                               SetPoint( (pr1)->n, (pr2)->n ); }
+#define SetRay( pr1, pr2 ) { SetPoint( (pr1)->o, (pr2)->o ),							   SetPoint( (pr1)->n, (pr2)->n ); }
 		/* Allocates and initializes a new transform for the user.
 		 if name is NULL, allocates an unnamed transform; otherwise
-       the transform is created in a known namespace that can be browsed.
+	   the transform is created in a known namespace that can be browsed.
 		 */
 VECTOR_METHOD( PTRANSFORM, CreateNamedTransform, ( CTEXTSTR name ) );
 #define CreateTransform() CreateNamedTransform( NULL )
@@ -30949,17 +32134,17 @@ VECTOR_METHOD( void, ClearTransform       , ( PTRANSFORM pt ) );
    axis-normal transforms and turns them for sending to other
    graphic systems.
    <code lang="c++">
-     \+-         -+
-     | 0   1   2 |
-     | 3   4   5 |
-     | 6   7   8 |
-     \+-         -+
+	 \+-         -+
+	 | 0   1   2 |
+	 | 3   4   5 |
+	 | 6   7   8 |
+	 \+-         -+
    becomes
-     \+-         -+
-     | 0   3   6 |
-     | 1   4   7 |
-     | 2   5   8 |
-     \+-         -+
+	 \+-         -+
+	 | 0   3   6 |
+	 | 1   4   7 |
+	 | 2   5   8 |
+	 \+-         -+
    Not entirely useful at all :)
    </code>                                                    */
 VECTOR_METHOD( void, InvertTransform        , ( PTRANSFORM pt ) );
@@ -30976,12 +32161,12 @@ VECTOR_METHOD( void, RotateAbsV, ( PTRANSFORM pt, PC_POINT ) );
    Parameters
    pt :  transform to rotate
    rx :  amount around the x axis to rotate (pitch)(positive is
-         clockwise looking at the object from the right, axis up is
-         moved towards forward )
+		 clockwise looking at the object from the right, axis up is
+		 moved towards forward )
    ry :  amount around the y axis to rotate (yaw) (positive is
-         counter clockwise, moves right to forward)
+		 counter clockwise, moves right to forward)
    rz :  amount around the z axis to rotate (roll) (positive is
-         clockwise, moves up towards right )
+		 clockwise, moves up towards right )
    See Also
    RotateRelV                                                       */
 VECTOR_METHOD( void, RotateRel, ( PTRANSFORM pt, RCOORD rx, RCOORD ry, RCOORD rz ) );
@@ -30996,8 +32181,8 @@ VECTOR_METHOD( void, RotateRelV, ( PTRANSFORM pt, PC_POINT ) );
    Parameters
    pt :      transform to update
    p :       P defines an axis around which the rotation portion
-             of the matrix is rotated by an amount. Can be any
-             arbitrary axis.
+			 of the matrix is rotated by an amount. Can be any
+			 arbitrary axis.
    amount :  an amount to rotate by.
    Note
    coded from
@@ -31005,7 +32190,7 @@ VECTOR_METHOD( void, RotateRelV, ( PTRANSFORM pt, PC_POINT ) );
    and
    http://www.siggraph.org/education/materials/HyperGraph/modeling/mod_tran/3drota.htm
    and http://astronomy.swin.edu.au/~pbourke/geometry/rotate/.
-                                                                                       */
+																					   */
 VECTOR_METHOD( void, RotateAround, ( PTRANSFORM pt, PC_POINT p, RCOORD amount ) );
 /* Sets the current 'up' axis of a transformation. The forward
    axis is adjusted so that it remains perpendicular to the mast
@@ -31028,7 +32213,7 @@ VECTOR_METHOD( void, RotateMast, ( PTRANSFORM pt, PCVECTOR vup ) );
    Parameters
    pt :     transformation to rotate
    angle :  angle to rotate \- positive should be clockwise,
-            looking from top down.                              */
+			looking from top down.                              */
 VECTOR_METHOD( void, RotateAroundMast, ( PTRANSFORM pt, RCOORD angle ) );
 /* Recovers a transformation state from a file.
    Parameters
@@ -31045,6 +32230,20 @@ VECTOR_METHOD( void, RotateRight, ( PTRANSFORM pt, int A1, int A2 ) );
 VECTOR_METHOD( void, Apply           , ( PCTRANSFORM pt, P_POINT dest, PC_POINT src ) );
 VECTOR_METHOD( void, ApplyR          , ( PCTRANSFORM pt, PRAY dest, PRAY src ) );
 VECTOR_METHOD( void, ApplyT          , ( PCTRANSFORM pt, PTRANSFORM dest, PCTRANSFORM src ) );
+/* row major multiplication
+ ptd is destination
+ pts is matrix to transform
+ pt is matrix to transform pts with
+ rows of pt apply to columns of pts
+ */
+VECTOR_METHOD( void, ApplyM          , ( PMatrix pt, PMatrix ptd, PMatrix pts ) );
+/* column major multiplication
+ ptd is destination
+ pts is matrix to transform
+ pt is matrix to transform pts with
+ rows of pt apply to columns of pts
+ */
+VECTOR_METHOD( void, ApplyMcm        , ( PMatrix pt, PMatrix ptd, PMatrix pts ) );
 // I know this was a result - unsure how it was implented...
 //void ApplyT              (PTRANFORM pt, PTRANSFORM pt1, PTRANSFORM pt2 );
 VECTOR_METHOD( void, ApplyInverse    , ( PCTRANSFORM pt, P_POINT dest, PC_POINT src ) );
@@ -31067,7 +32266,7 @@ typedef void (*MotionCallback)( uintptr_t, PTRANSFORM );
    pt :        PTRANSFORM transform matrix to hook to
    callback :  user callback routine
    psv :       pointer size value data to be passed to user
-               callback routine.                             */
+			   callback routine.                             */
 VECTOR_METHOD( void, AddTransformCallback, ( PTRANSFORM pt, MotionCallback callback, uintptr_t psv ) );
 /* Set the speed vector used when Move is applied to a
    PTRANSFORM.
@@ -31111,9 +32310,9 @@ VECTOR_METHOD( PC_POINT, SetRotationAccel, ( PTRANSFORM pt, PC_POINT r ) );
    Parameters
    pt :                 transform to set the time interval on.
    speed_interval :     what the time interval should be for
-                        speed.
+						speed.
    rotation_interval :  what the time interval should be for
-                        rotation.
+						rotation.
    Remarks
    A default interval of 1000 is used. So it will take 1000
    milliseconds to move one unit of speed. This could be set to
@@ -31122,7 +32321,7 @@ VECTOR_METHOD( PC_POINT, SetRotationAccel, ( PTRANSFORM pt, PC_POINT r ) );
    Rotation has its own interval that affects rotation the same
    way; If your rotation was set to roll 2*pi radians, then it
    would revolve one full rotation in the said time.
-                                                                 */
+																 */
 VECTOR_METHOD( void, SetTimeInterval, ( PTRANSFORM pt, RCOORD speed_interval, RCOORD rotation_interval ) );
 /* Updates a transform by it's current speed and rotation
    assuming speed and rotation are specified in x per 1 second.
@@ -31163,6 +32362,82 @@ VECTOR_METHOD( RCOORD, IntersectLineWithPlane, (PCVECTOR Slope, PCVECTOR Origin,
 	PCVECTOR n, PCVECTOR o,
 	RCOORD *time) );
 VECTOR_METHOD( RCOORD, PointToPlaneT, (PCVECTOR n, PCVECTOR o, PCVECTOR p) );
+/* convert basis matrix to rotation vector v */
+VECTOR_METHOD( void, basis_lq, (PVECTOR4 v4, PMatrix basis) );
+/* convert rotation vector v to quaternion q */
+VECTOR_METHOD( void, lq_exp, (PVECTOR4 q, PCVECTOR4 v) );
+/* convert rotation vector v to basismatrix  */
+VECTOR_METHOD( PMatrix, lq_basis, ( PMatrix matrix, PCVECTOR4 v ) );
+/* convert rotation vector v to basismatrix
+   sets the origin, so the resulting matrix is a valid view matrix for Vulkan
+ */
+VECTOR_METHOD( PMatrix, lq_matrix, ( PMatrix matrix, PCVECTOR4 v, PCVECTOR position ) );
+/* use a mouse sort of left-right/updown (yaw/pitch) input to update the orientation.
+ This has no restrictions on the resulting output, and the rotation is already relative to the
+ current viewpoint.
+ put the output in out, and return out.
+ */
+VECTOR_METHOD( PVECTOR4, lq_free_look, ( PVECTOR4 out, PCVECTOR4 orientation, RCOORD pitch, RCOORD yaw, RCOORD roll ) );
+/* use a mouse sort of left-right/updown (yaw/pitch) input to update the orientation.
+ This restricts the roll, expecting you're on a level ground; whereas the free-look is more suited to space.
+ put the output in out, and return out.
+ k is the factor to adjust the roll by; 1.0 is immediate fix...
+ */
+VECTOR_METHOD( PVECTOR4, lq_level_look, ( PVECTOR4 out, PCVECTOR4 orientation, RCOORD pitch, RCOORD yaw, RCOORD k ) );
+/* convert rotation vector v to colmajor (opengl) basismatrix
+ this is probably redundant - native matrix is the correct direction already...
+ */
+VECTOR_METHOD( PMatrix, lq_gl_basis, ( PMatrix matrix, PCVECTOR4 v ) );
+/* get a vector representing the up (y) direction from a rotation vector */
+VECTOR_METHOD( PVECTOR, lq_up, ( PVECTOR out, PCVECTOR4 r ) );
+/* get a vector representing the right (x) direction from a rotation vector */
+VECTOR_METHOD( PVECTOR, lq_right, ( PVECTOR out, PCVECTOR4 r ) );
+/* get a vector representing the forward (z) direction from a rotation vector */
+VECTOR_METHOD( PVECTOR, lq_forward, ( PVECTOR out, PCVECTOR4 r ) );
+/* get how much roll there is from the identity matrix orientation
+ * The raw rotation angles of the axis-angle vector has a complex interaction over
+ * 1 tick that results in an orientation, and it is that resulting orientation that
+ * determines the roll, yaw, and pitch. So the values returned here are not
+ * just the components of the axis-angle vector.
+ */
+VECTOR_METHOD( RCOORD, lq_roll, ( PCVECTOR4 r ) );
+/* get how much yaw there is from the identity matrix orientation
+ * The raw rotation angles of the axis-angle vector has a complex interaction over
+ * 1 tick that results in an orientation, and it is that resulting orientation that
+ * determines the roll, yaw, and pitch. So the values returned here are not
+ * just the components of the axis-angle vector.
+ *
+ * this function does attempt to return +/- 360 degrees, which is closer to the spin angles.
+ */
+VECTOR_METHOD( RCOORD, lq_yaw, ( PCVECTOR4 r ) );
+/* get how much pitch there is from the identity matrix orientation
+ * The raw rotation angles of the axis-angle vector has a complex interaction over
+ * 1 tick that results in an orientation, and it is that resulting orientation that
+ * determines the roll, yaw, and pitch. So the values returned here are not
+ * just the components of the axis-angle vector.
+ */
+VECTOR_METHOD( RCOORD, lq_pitch, ( PCVECTOR4 r ) );
+// apply the rotation A to R and store in OUT
+VECTOR_METHOD( PVECTOR4, lq_applyRotation, ( PVECTOR4 out, PCVECTOR4 r, PCVECTOR4 a ) );
+// rotate vector V around R and store in out  (out and V could be the same?)
+VECTOR_METHOD( void, lq_apply, ( PVECTOR out, PCVECTOR4 r, PCVECTOR v ) );
+VECTOR_METHOD( PVECTOR4, lq_normalize, ( PVECTOR4 out ) );
+// cross product between two vectors; result as a rotation vector
+// this is the rotation that rotates one to the other.
+VECTOR_METHOD( PVECTOR4, lq_cross, ( PVECTOR4 out, PCVECTOR a, PCVECTOR b ) );
+VECTOR_METHOD( PVECTOR4, lq_set, ( PVECTOR4 out, RCOORD x, RCOORD y, RCOORD z, RCOORD angle ) );
+/* sets rotation vector from pitch and roll (?) */
+VECTOR_METHOD( PVECTOR4, lq_set_xy, ( PVECTOR4 out, RCOORD x, RCOORD z ) );
+/* sets the rotataion vector, and normalizes it into axis&angle internal format */
+VECTOR_METHOD( PVECTOR4, lq_set3, ( PVECTOR4 out, RCOORD x, RCOORD y, RCOORD z ) );
+/* normalizes x,y,z axis part, and uses the specified angle */
+VECTOR_METHOD( PVECTOR4, lq_set4, ( PVECTOR4 out, RCOORD x, RCOORD y, RCOORD z, RCOORD angle ) );
+/* treats input as latitude and longitude on a sphere.
+ Lat +/- 90  (+/-360)
+ lng +/- 180 (+/-360)
+ This will result in rotation coordinates that are unique for the specified over-latitude range.
+ */
+VECTOR_METHOD( PVECTOR4, lq_set_latlong, ( PVECTOR4 out, RCOORD lat, RCOORD lng ) );
 #if ( !defined( VECTOR_LIBRARY_SOURCE ) && !defined( NO_AUTO_VECTLIB_NAMES ) ) || defined( NEED_VECTLIB_ALIASES )
 #define add EXTERNAL_NAME(add)
 #define sub EXTERNAL_NAME(sub)
@@ -31187,13 +32462,16 @@ VECTOR_METHOD( RCOORD, PointToPlaneT, (PCVECTOR n, PCVECTOR o, PCVECTOR p) );
 #define ShowTransformEx EXTERNAL_NAME(ShowTransformEx)
 #define addscaled EXTERNAL_NAME(addscaled)
 #define Length EXTERNAL_NAME(Length)
+#define Distance EXTERNAL_NAME(Distance)
 #define PointToPlaneT EXTERNAL_NAME(PointToPlaneT)
 #define normalize EXTERNAL_NAME(normalize)
+#define normalize4 EXTERNAL_NAME(normalize4)
 #define Translate EXTERNAL_NAME(Translate)
 #define TranslateV EXTERNAL_NAME(TranslateV)
 #define Apply EXTERNAL_NAME(Apply)
 #define ApplyR EXTERNAL_NAME(ApplyR)
 #define ApplyT EXTERNAL_NAME(ApplyT)
+#define ApplyM EXTERNAL_NAME(ApplyM)
 #define ApplyTranslation EXTERNAL_NAME(ApplyTranslation)
 #define ApplyTranslationR EXTERNAL_NAME(ApplyTranslationR)
 #define ApplyTranslationT EXTERNAL_NAME(ApplyTranslationT)
@@ -31225,6 +32503,29 @@ VECTOR_METHOD( RCOORD, PointToPlaneT, (PCVECTOR n, PCVECTOR o, PCVECTOR p) );
 #define RotateAbsV EXTERNAL_NAME(RotateAbsV)
 #define GetRotationMatrix EXTERNAL_NAME(GetRotationMatrix)
 #define SetRotationMatrix EXTERNAL_NAME(SetRotationMatrix)
+#define basis_lq EXTERNAL_NAME(basis_lq)
+#define lq_exp EXTERNAL_NAME(lq_exp)
+#define lq_basis EXTERNAL_NAME(lq_basis)
+#define lq_gl_basis EXTERNAL_NAME(lq_gl_basis)
+#define lq_up EXTERNAL_NAME(lq_up)
+#define lq_right EXTERNAL_NAME(lq_right)
+#define lq_forward EXTERNAL_NAME(lq_forward)
+#define lq_roll EXTERNAL_NAME(lq_roll)
+#define lq_yaw EXTERNAL_NAME(lq_yaw)
+#define lq_pitch EXTERNAL_NAME(lq_pitch)
+#define lq_normalize EXTERNAL_NAME(lq_normalize)
+#define lq_cross EXTERNAL_NAME(lq_cross)
+#define lq_set EXTERNAL_NAME(lq_set)
+#define lq_set3 EXTERNAL_NAME(lq_set3)
+#define lq_set4 EXTERNAL_NAME(lq_set4)
+#define lq_set_xy EXTERNAL_NAME(lq_set_xy)
+#define lq_set_latlong EXTERNAL_NAME(lq_set_latlong)
+#define lq_applyRotation EXTERNAL_NAME(lq_applyRotation)
+#define lq_apply EXTERNAL_NAME(lq_apply)
+#define lq_matrix EXTERNAL_NAME(lq_matrix)
+#define lq_free_look EXTERNAL_NAME(lq_free_look)
+#define lq_level_look EXTERNAL_NAME(lq_level_look)
+//#define lq_ EXTERNAL_NAME(lq_apply)
 #endif
 #ifdef __cplusplus
 VECTOR_NAMESPACE_END
@@ -31438,6 +32739,13 @@ struct ImageFile_tag
 	VECTOR coords[4];
 	VkCommandBuffer* commandBuffers;
 #endif
+/* NOTE: imglib-webgpu deliberately does NOT extend this struct.  It would
+   require coordinated -D_WEBGPU_DRIVER on every TU that ever allocates an
+   ImageFile_tag (including the sack core build feeding the CPU sack.image
+   fallback the driver delegates to). The driver keeps its per-image state
+   in a side-table keyed by Image* â€” see sack-gui/src/gui/imglib-webgpu/
+   driver.cc. The long-standing 2d/3d driver struct-extension cross-talk
+   problem is sidestepped rather than solved here.                        */
 #ifdef __cplusplus
  // watcom limits protections in structs to protected and public
 #ifndef __WATCOMC__
@@ -32670,6 +33978,22 @@ IMAGE_PROC void IMAGE_API IMGVER(SetImageRotation)( Image pImage, int edge_flag,
    \See Also <link sack::image::image_rotation_flags, image_rotation_flags Enumeration> */
 IMAGE_PROC void IMAGE_API IMGVER(RotateImageAbout)( Image pImage, int edge_flag, RCOORD offset_x, RCOORD offset_y, PVECTOR vAxis, RCOORD angle );
 IMAGE_PROC void IMAGE_API IMGVER(MarkImageDirty)( Image pImage );
+/* This function flips an image top to bottom. This if for
+   building windows compatible images. Internally images are
+   kept in platform-native direction. If an image is created
+   from another source, this might be a method to flip the image
+   top-to-bottom if required.
+   Parameters
+   pImage :                           Image to flip.
+   <link sack::DBG_PASS, DBG_PASS> :  _nt_
+   Note
+   There has been a warning around flip image for a while, it
+   does its job right now (reversing jpeg images on windows),
+   but not necessarily suited for the masses.                    */
+IMAGE_PROC  void IMAGE_API IMGVER(FlipImageEx )( Image pif DBG_PASS );
+/* <combine sack::image::FlipImageEx@Image pif>
+   \ \                                          */
+#define FlipImage(pif) FlipImageEx( pif DBG_SRC )
 /* Defines the function interface for an image module. */
 _INTERFACE_NAMESPACE
 /* Defines a pointer member of the interface structure. */
@@ -33032,6 +34356,7 @@ IMAGE_PROC_PTR( void, ResetImageBuffers )( Image image, LOGICAL image_only );
 	IMAGE_PROC_PTR( void, UnmakeSlicedImage )( SlicedImage image );
 	IMAGE_PROC_PTR( void, BlotSlicedImageEx )( Image dest, SlicedImage source, int32_t x, int32_t y, uint32_t width, uint32_t height, int alpha, enum BlotOperation op, ... );
 	IMAGE_PROC_PTR( void, SetSavePortion )( void (CPROC*_SavePortion )( PSPRITE_METHOD psm, uint32_t x, uint32_t y, uint32_t w, uint32_t h ) );
+   IMAGE_PROC_PTR( void, FlipImageEx )( Image pif DBG_PASS );
 } IMAGE_INTERFACE, *PIMAGE_INTERFACE;
 /* Method to define automatic name translation from standard
    names Like BlatColorAlphaEx to the interface the user has
@@ -33171,6 +34496,7 @@ IMAGE_PROC_PTR( void, ResetImageBuffers )( Image image, LOGICAL image_only );
 #define DumpFontFile                   PROC_ALIAS( DumpFontFile )
 #define IsImageTargetFinal                   PROC_ALIAS( IsImageTargetFinal )
 #define ReuseImage                      if((USE_IMAGE_INTERFACE)->_ReuseImage) PROC_ALIAS( ReuseImage )
+#define FlipImageEx                        (((USE_IMAGE_INTERFACE)->_FlipImageEx )?PROC_ALIAS(FlipImageEx ):0)
 #define ResetImageBuffers                      if((USE_IMAGE_INTERFACE)->_ResetImageBuffers) PROC_ALIAS( ResetImageBuffers )
 #define PngImageFile                    PROC_ALIAS( PngImageFile )
 #define JpgImageFile                    PROC_ALIAS( JpgImageFile )
@@ -33363,22 +34689,6 @@ _INTERFACE_NAMESPACE_END
 /* <combine sack::image::MakeSpriteImageFileEx@CTEXTSTR fname>
    \ \                                                         */
 #define MakeSpriteImageFile(file) MakeSpriteImageFileEx( image DBG_SRC )
-/* This function flips an image top to bottom. This if for
-   building windows compatible images. Internally images are
-   kept in platform-native direction. If an image is created
-   from another source, this might be a method to flip the image
-   top-to-bottom if required.
-   Parameters
-   pImage :                           Image to flip.
-   <link sack::DBG_PASS, DBG_PASS> :  _nt_
-   Note
-   There has been a warning around flip image for a while, it
-   does its job right now (reversing jpeg images on windows),
-   but not necessarily suited for the masses.                    */
-IMAGE_PROC  void IMAGE_API IMGVER(FlipImageEx )( Image pif DBG_PASS );
-/* <combine sack::image::FlipImageEx@Image pif>
-   \ \                                          */
-#define FlipImage(pif) FlipImageEx( pif DBG_SRC )
 /* <combine sack::image::LoadImageFileEx@CTEXTSTR name>
    \ \                                                  */
 #define LoadImageFile(file) LoadImageFileEx( file DBG_SRC )
@@ -33669,7 +34979,6 @@ namespace sack {
 // library's interface structure name (the tag of the structure)
 #define MSG_ID(method)  BASE_MESSAGE_ID,( ( offsetof( struct MyInterface, _##method ) / sizeof( void(*)(void) ) ) +  MSG_EventUser )
 #define MSG_OFFSET(method)  ( ( offsetof( struct MyInterface, _##method ) / sizeof( void(*)(void) ) ) + MSG_EventUser )
-#define INTERFACE_METHOD(type,name) type (CPROC*_##name)
 // this is the techincal type of SYSV IPC MSGQueues
 #define MSGIDTYPE long
 #ifdef __64__
@@ -34228,6 +35537,11 @@ enum DisplayAttributes {
   DISPLAY_ATTRIBUTE_NO_AUTO_FOCUS = 0x0800,
   // when created, set topmost as soon as possible
   DISPLAY_ATTRIBUTE_TOPMOST = 0x1000,
+  // do not redirect this display to an offscreen surface, draw directly to the screen.
+  // This is a performance optimization for displays that are not expected to be composited with other displays,
+  // and are expected to be fully opaque.  This is not compatible with DISPLAY_ATTRIBUTE_LAYERED (??PANEL_ATTRIBUTE_ALPHA??) or
+  // (??PANEL_ATTRIBUTE_HOLEY??), and may cause visual artifacts if used with those attributes.
+  DISPLAY_ATTRIBUTE_NO_REDIRECT = 0x2000,
 };
  // does not HAVE to be called but may
     RENDER_PROC( int , InitDisplay) (void);
@@ -35806,6 +37120,9 @@ PRIORITY_PRELOAD( LowLevelInit, TIMER_MODULE_PRELOAD_PRIORITY )
 	// there is a small chance the local is already initialized.
 #  ifndef __STATIC_GLOBALS__
 	if( !global_timer_structure ) {
+ // init thread local variable with thread id and self thread.
+		MyThreadInfo.pThread = MakeThread();
+		MyThreadInfo.nThread = MyThreadInfo.pThread->thread_ident;
 		SimpleRegisterAndCreateGlobal( global_timer_structure );
 		OnThreadCreate( (void(*)(void))MakeThread );
  // init thread local variable with thread id and self thread.
@@ -36027,7 +37344,7 @@ static PTHREAD FindWakeup( CTEXTSTR name )
 	{
 		uint64_t oldval;
 		// don't need locks if init didn't finish, there's now way to have threads in loader lock.
-		while( oldval = LockedExchange64( &globalTimerData.lock_thread_create, 1 ) ) {
+		while( ( oldval = LockedExchange64( &globalTimerData.lock_thread_create, 1 ) ) ) {
 			//globalTimerData.lock_thread_create = oldval;
 			Relinquish();
 		}
@@ -36079,7 +37396,7 @@ static PTHREAD FindThreadWakeup( CTEXTSTR name, THREAD_ID thread )
 	{
 		uint64_t oldval;
 		// don't need locks if init didn't finish, there's now way to have threads in loader lock.
-		while( oldval = LockedExchange64( &globalTimerData.lock_thread_create, 1 ) ) {
+		while( ( oldval = LockedExchange64( &globalTimerData.lock_thread_create, 1 ) ) ) {
 			//globalTimerData.lock_thread_create = oldval;
 			Relinquish();
 		}
@@ -36124,7 +37441,7 @@ static PTHREAD FindThread( THREAD_ID thread )
 	{
 		uint64_t oldval;
 		// don't need locks if init didn't finish, there's now way to have threads in loader lock.
-		while( oldval = LockedExchange64( &globalTimerData.lock_thread_create, 1 ) ) {
+		while( ( oldval = LockedExchange64( &globalTimerData.lock_thread_create, 1 ) ) ) {
 			//globalTimerData.lock_thread_create = oldval;
 			Relinquish();
 		}
@@ -36221,7 +37538,7 @@ void  WakeThreadEx( PTHREAD thread DBG_PASS )
 	}
 #else
 #  ifdef USE_PIPE_SEMS
-	if( thread->semaphore != -1 )
+	//if( thread->semaphore != -1 )
 	{
 #    ifdef DEBUG_PIPE_USAGE
 		_lprintf(DBG_RELAY)( "(wakethread)wil write pipe... %p", thread );
@@ -36571,7 +37888,7 @@ static void  UnmakeThread( void )
 #endif
 	uint64_t oldval;
  //-V595
-	while( oldval = LockedExchange64( &globalTimerData.lock_thread_create, MyThreadInfo.nThread ) ) {
+	while( ( oldval = LockedExchange64( &globalTimerData.lock_thread_create, MyThreadInfo.nThread ) ) ) {
 		//globalTimerData.lock_thread_create = oldval;
 		Relinquish();
 	}
@@ -36644,15 +37961,16 @@ static uintptr_t CPROC ThreadWrapper( PTHREAD pThread )
 	//DeAttachThreadToLibraries( TRUE );
 	while( !pThread->flags.bReady )
 		Relinquish();
+	THREAD_ID const thread_ident = _GetMyThreadID();
 #ifdef HAS_TLS
 #  ifdef LOG_THREAD
 	lprintf( "thread will be %p %p", MyThreadInfo.pThread, &MyThreadInfo );
 	lprintf( "thread will be %p %p", pThread, &MyThreadInfo.pThread );
 #  endif
 	MyThreadInfo.pThread = pThread;
-	MyThreadInfo.nThread =
+	MyThreadInfo.nThread = thread_ident;
 #endif
-		pThread->thread_ident = _GetMyThreadID();
+	pThread->thread_ident = thread_ident;
 	//DebugBreak();
 	InitWakeup( pThread, NULL );
 	{
@@ -36713,7 +38031,9 @@ static uintptr_t CPROC SimpleThreadWrapper( PTHREAD pThread )
 	while( !pThread->flags.bReady )
 		Relinquish();
 	MyThreadInfo.pThread = pThread;
-	MyThreadInfo.nThread = pThread->thread_ident = GetMyThreadID();
+	THREAD_ID const thread_ident = GetMyThreadID();
+	MyThreadInfo.nThread = thread_ident;
+	pThread->thread_ident = thread_ident;
 	InitWakeup( pThread, NULL );
 #ifdef LOG_THREAD
 	Log1( "Set thread ident: %016" _64fx, pThread->thread_ident );
@@ -36884,7 +38204,7 @@ PTHREAD  ThreadToEx( uintptr_t (CPROC*proc)(PTHREAD), uintptr_t param DBG_PASS )
 	{
 		uint64_t oldval;
 		// unlink from globalTimerData.threads list.
-		while( oldval = LockedExchange64( &globalTimerData.lock_thread_create, 1 ) ) {
+		while( ( oldval = LockedExchange64( &globalTimerData.lock_thread_create, 1 ) ) ) {
 			//globalTimerData.lock_thread_create = oldval;
 			Relinquish();
 		}
@@ -36962,7 +38282,7 @@ PTHREAD  ThreadToSimpleEx( uintptr_t (CPROC*proc)(POINTER), POINTER param DBG_PA
 	{
 		uint64_t oldval;
 		// unlink from globalTimerData.threads list.
-		while( oldval = LockedExchange64( &globalTimerData.lock_thread_create, 1 ) ) {
+		while( ( oldval = LockedExchange64( &globalTimerData.lock_thread_create, 1 ) ) ) {
 			//globalTimerData.lock_thread_create = oldval;
 			Relinquish();
 		}
@@ -37892,7 +39212,7 @@ LOGICAL  LeaveCriticalSecEx( PCRITICALSECTION pcs DBG_PASS )
 		pcs->dwThreadPrior[pcs->nPrior] = dwCurProc;
 		pcs->nPrior = (pcs->nPrior + 1) % MAX_SECTION_LOG_QUEUE;
 #endif
-		pcs->dwLocks--;
+		pcs->dwLocks = pcs->dwLocks - 1;
 #ifdef ENABLE_CRITICALSEC_LOGGING
 		if( global_timer_structure && globalTimerData.flags.bLogCriticalSections )
 			lprintf( "Remaining locks... %08" _32fx, pcs->dwLocks );
@@ -38222,6 +39542,27 @@ IDLE_PROC( int, IdleFor )( uint32_t dwMilliseconds )
 #ifdef _WIN32
 #include <wincrypt.h>
 #endif
+// DEBUG PROBE (temporary, not for shipping): per-client ring of every csLockRead /
+// csLockWrite acquire and release, with the caller's file:line and the resulting
+// lock count.  Stores only, no I/O, so the race is left intact; the ring lives past
+// the lock words in the struct so ClearClient scrubs it and each ring covers exactly
+// ONE client lifetime - which is the window the leaked +1 was narrowed to.
+// Per-client ring of lock + lifecycle events.  Stores only, no I/O and no
+// allocation, so it does not perturb the timing the way lprintf probes did (which
+// demonstrably masked this class of bug).  Read it out of a core dump.
+//#define DEBUG_CLIENT_LOCK_TRACE
+// SEPARATE, and normally OFF: the spin-giveup probe abandons the event when a
+// lock can't be taken.  That is a real behaviour change - it distorts hang rates
+// and must never be on while measuring a fix.  The ring above is passive; this is
+// not.  Enable only to catch a live lock convoy.
+//#define DEBUG_LOCK_SPIN_GIVEUP
+// Which peer thread did each accepted socket land on, and is that peer still
+// delivering events?  Writes one buffered line per accept to
+// SACK_PEERMAP (default /tmp/chunk-lock-smoke/peermap.log), plus a snapshot of
+// every peer's wait/event counters every DBG_PEERMAP_SNAP accepts.  Correlate
+// the client ports against tcpdump's hang list (hangfilter.awk) to test whether
+// the periodic hangs all belong to one peer.
+//#define DEBUG_PEER_ASSIGN
 #ifndef OPENSSL_API_COMPAT
 #  define OPENSSL_API_COMPAT 10101
 #endif
@@ -38282,6 +39623,12 @@ SACK_NETWORK_NAMESPACE
 // not sure if this is used anywhere....
       // maximum length of a host's text name...
 #define HOSTNAME_LEN 50
+// epoll/kqueue carry this as their data.ptr to get back to the client; it lives
+// in the PCLIENT so it costs no allocation and stays valid for the client's life.
+struct event_data {
+	PCLIENT pc;
+	int broadcast;
+};
 typedef struct PendingWrite {
 	PCLIENT pc;
 	POINTER buffer;
@@ -38311,6 +39658,11 @@ typedef struct PendingBuffer
  // Next Pending Message to be handled
    struct PendingBuffer *lpNext;
 }PendingBuffer;
+// dwFlags is written by the JS thread and by every network thread, so a plain
+// `dwFlags |= X` / `&= ~X` is a read-modify-write that can silently drop another
+// thread's concurrent bit change.  Always go through these.
+#define SetClientFlags(pc,bits)   LockedOr( (volatile uint32_t*)&(pc)->dwFlags, (uint32_t)(bits) )
+#define ClearClientFlags(pc,bits) LockedAnd( (volatile uint32_t*)&(pc)->dwFlags, (uint32_t)~(uint32_t)(bits) )
 enum NetworkConnectionFlags {
 	CF_UDP               = 0x00000001
 	// no flag... is NOT UDP....
@@ -38421,6 +39773,16 @@ struct peer_thread_info
 		BIT_FIELD bProcessing : 1;
 		BIT_FIELD bBuildingList : 1;
 	} flags;
+#ifdef DEBUG_PEER_ASSIGN
+	// written only by the peer's own thread, read by the snapshot; a torn read
+	// costs one misprinted sample and nothing else.
+   // epoll_wait returns with cnt > 0
+	volatile uint32_t dbgWaits;
+  // events delivered to this peer
+	volatile uint32_t dbgEvents;
+    // sockets assigned to this peer
+	volatile uint32_t dbgAdds;
+#endif
 };
 typedef struct {
   int verbose_mode;
@@ -38437,6 +39799,10 @@ struct ssl_session {
 	LOGICAL firstPacket;
 	LOGICAL noHost;
 	LOGICAL closed;
+	// Graceful-close intent carried across a deferred close.  ssl_CloseSession can
+	// be asked to close while the session is inUse; it defers via deleteInUse and
+	// the read path replays it later, by which time the caller's bLinger is gone.
+	LOGICAL closeLinger;
 	BIO *rbio;
 	BIO *wbio;
 	//EVP_PKEY *privkey;
@@ -38479,10 +39845,91 @@ struct ssl_session {
 	//CRITICALSECTION csWrite;
 };
 #endif
+#ifdef DEBUG_CLIENT_LOCK_TRACE
+#define CLIENT_LOCK_TRACE_DEPTH 32
+// event kinds recorded in the per-client ring
+#define CLTRACE_UNLOCK    0
+#define CLTRACE_LOCK      1
+   // AddNetWork   - request handed toward JS, bInUse=1
+#define CLTRACE_ADDNET    2
+   // ClearNetWork - JS released it
+#define CLTRACE_CLEARNET  3
+// The discriminator for the remaining lost-dispatch hang: EVIN is recorded for
+// EVERY epoll delivery, before any handler decision; EVSKIP when the handler
+// declines a delivered event.  A hung socket whose ring has no EVIN at all means
+// the kernel never reported the edge; EVIN followed by EVSKIP means the event was
+// delivered and dropped - and being edge-triggered, it never comes back.
+   // a = events[n].events mask
+#define CLTRACE_EVIN      4
+   // a = dwFlags at the moment it was declined
+#define CLTRACE_EVSKIP    5
+struct client_lock_trace {
+	CTEXTSTR  file;
+	uint32_t  line;
+	THREAD_ID thread;
+           // LOCK/UNLOCK: resulting dwLocks.  ADDNET/CLEARNET: psvInUse count
+	uint32_t  a;
+          // CLTRACE_*
+	uint8_t   ev;
+     // LOCK/UNLOCK only: 0 = csLockWrite, 1 = csLockRead
+	uint8_t   channel;
+};
+#endif
+// Cache-line separation for the per-client locks.  csLockRead and csLockWrite are
+// 24-byte CRITICALSECTIONs and were adjacent, so both locks AND saClient/saSource
+// shared one 64-byte line - every atomic RMW on either channel invalidated the
+// line for any core merely READING the address pointers on the data path.
+// PMU counters on the http-ws server (xperf -Pmc, see test-harness/hotpath) put
+// the peer threads at IPC ~0.39 with ~18 L3 references per 1000 instructions and
+// a 94% L3 hit rate: heavy coherence traffic, almost no DRAM traffic, which is
+// the false-sharing signature rather than a memory-bound one.
+//
+// Aligning the MEMBERS does three jobs at once: each lock lands on its own line,
+// the struct's own alignment becomes 64, and sizeof(CLIENT) is rounded to a
+// multiple of 64 so the slab's array stride keeps every client aligned.  The one
+// thing the compiler cannot do is make the heap block itself aligned - AddClients
+// must use HeapAllocateAligned or the declared alignment is a lie the optimizer
+// is entitled to believe.
+#define SACK_CACHE_LINE 64
+#ifdef __cplusplus
+#  define SACK_ALIGN(n) alignas(n)
+#  define SACK_STATIC_ASSERT(c,m) static_assert(c,m)
+#else
+#  define SACK_ALIGN(n) _Alignas(n)
+#  define SACK_STATIC_ASSERT(c,m) _Static_assert(c,m)
+#endif
 struct NetworkClient
 {
+#ifdef DEBUG_CLIENT_LOCK_TRACE
+	// Deliberately placed BEFORE the lock words, i.e. inside the region ClearClient
+	// preserves, so the ring survives recycling and spans lifetimes.  The leaked +1
+	// is carried IN to GetFreeNetworkClient (seen as ch1 ->2 on the very first op of
+	// a fresh lifetime), so the unbalanced acquire is in the PREVIOUS life.
+	struct client_lock_trace lockTrace[CLIENT_LOCK_TRACE_DEPTH];
+	volatile uint32_t lockTraceIdx;
+#endif
+	// These MUST stay the first members.  ClearClient() scrubs a recycled client
+	// with a single MemSet that starts *after* them, so the lock words are never
+	// written by anything except Enter/LeaveCriticalSec.  Previously ClearClient
+	// snapshotted these, memset the whole struct, and restored the snapshot - but
+	// NetworkLockEx takes the client lock with no global lock held (see
+	// LOCK_GLOBAL_WHEN_LOCKING_CLIENT, commented out in network.c), so other event
+	// threads are concurrently updating dwUpdating/dwThreadWaiting/dwLocks the
+	// whole time.  The memset let a spinner acquire a zeroed section, and the
+	// restore then resurrected the previous owner and count on top of it - leaving
+	// clients permanently read-locked by a thread that had long since moved on.
+	// Nothing depends on member order here; the struct is module-local and opaque.
+	// One cache line each; see the SACK_CACHE_LINE note above.  With
+	// DEBUG_CLIENT_LOCK_TRACE on, the ring ahead of these still leaves them line
+	// aligned - alignas pads to reach it - so the probe and the fix coexist.
+    // per client lock.
+	SACK_ALIGN( SACK_CACHE_LINE ) CRITICALSECTION csLockRead;
+   // per client lock.
+	SACK_ALIGN( SACK_CACHE_LINE ) CRITICALSECTION csLockWrite;
+	// Also aligned, so csLockWrite owns its line outright instead of sharing the
+	// back half of it with two pointers that every network operation reads.
   //Dest Address
-	SOCKADDR *saClient;
+	SACK_ALIGN( SACK_CACHE_LINE ) SOCKADDR *saClient;
   //Local Address of this port ...
 	SOCKADDR *saSource;
  // use this for UDP recvfrom
@@ -38546,10 +39993,7 @@ struct NetworkClient
 #if defined( USE_WSA_EVENTS )
 	WSAEVENT event;
 #endif
-    // per client lock.
-	CRITICALSECTION csLockRead;
-   // per client lock.
-	CRITICALSECTION csLockWrite;
+	// csLockRead/csLockWrite moved to the head of the struct - see the note there.
  // Thread which is waiting for a result...
 	PTHREAD pWaiting;
  // current incoming buffer
@@ -38565,26 +40009,62 @@ struct NetworkClient
 	PCLIENT pcServer;
  // listeners opened(was deprecated since most connections to v4 can be seen on v6) with port only have two connections, one IPV4 one IPV6
 	PCLIENT pcOther;
+	// These were `BIT_FIELD x : 1` - and BIT_FIELD is `unsigned int`, so all eight
+	// shared ONE 32-bit storage unit and setting any single bit was a
+	// read-modify-write of the whole word.  These are written from different
+	// threads, so two threads touching different bits could drop one of the writes
+	// outright.  bWriteOnUnlock is the sharp case: it exists precisely so a writer
+	// that could NOT get the lock can ask the lock holder to do the write, so it is
+	// set by one thread while NetworkUnlockEx clears it on another - and a lost set
+	// means a write that simply never happens.
+	// One byte each: independently addressable, so a store to one cannot disturb its
+	// neighbours.  Costs 4 bytes per client.  (Byte granularity is enough here; for
+	// anything needing true atomicity use the Locked* primitives.)
 	volatile struct network_client_flags {
-		BIT_FIELD bAddedToEvents : 1;
-		BIT_FIELD bRemoveFromEvents : 1;
-		BIT_FIELD bSecure : 1;
-		BIT_FIELD bAllowDowngrade : 1;
+		uint8_t bAddedToEvents;
+		uint8_t bRemoveFromEvents;
+		uint8_t bSecure;
+		uint8_t bAllowDowngrade;
  // waiting is a accept() flag to prevent accepting sockets before really setup.
-		BIT_FIELD bWaiting : 1;
+		uint8_t bWaiting;
  // write event failed to get lock, so if the locked holder would please write...
-		BIT_FIELD bWriteOnUnlock : 1;
+		uint8_t bWriteOnUnlock;
  // has work outstanding; wait for close until release
-		BIT_FIELD bInUse : 1;
-		BIT_FIELD bAggregateOutput : 1;
+		uint8_t bInUse;
+		uint8_t bAggregateOutput;
 	} flags;
 	PTHREAD wakeOnUnlock;
+	// count of writes for this client held in the deferred write queue/stall list
+	// (tcpnetwork.c); while nonzero, new writes must also be deferred so writes
+	// stay in the order they were issued.  Cleared with the rest of the client
+	// state when the client is recycled.
+	// Set when a close wanted to recycle this client but a channel was still
+	// locked; the final NetworkUnlockEx completes the recycle.  A plain word, not a
+	// bit in `flags`, so setting it cannot lose a concurrent read-modify-write of
+	// the neighbouring bits.  Cleared by ClearClient as part of the recycle.
+	volatile uint32_t recyclePending;
+	volatile uint32_t nWritesPended;
+	// connection generation; bumps when the client closes, and survives the
+	// client being cleared for reuse.  Application code that holds a PCLIENT
+	// across deferred work captures NetworkClientSerial() while the connection
+	// is alive and passes it to NetworkClientValid() at time of use - a
+	// recycled client fails the check where the flags alone cannot tell it
+	// from the connection the holder meant.
+	volatile uint32_t serial;
 	volatile uint32_t writeTimer;
  // we have the ability to save outstatnding UID locks...
 	PLIST psvInUse;
 	// this is set to what the thread that's waiting for this event is.
 	struct peer_thread_info * volatile this_thread;
 	//int tcp_delay_count;
+#ifdef __LINUX__
+	// epoll_ctl(ADD) needs a stable data.ptr carrying (pc,broadcast).  It used to
+	// be allocated fresh on every add and never released - EPOLL_CTL_DEL cannot
+	// hand the pointer back - so every accepted connection leaked one.  Carried
+	// inline with the client instead: no allocation at all, valid for the
+	// client's life.  [0] is the direct socket, [1] the broadcast socket.
+	struct event_data epoll_event_data[2];
+#endif
 #ifndef NO_SSL
 	struct ssl_session *ssl_session;
 #endif
@@ -38620,6 +40100,10 @@ struct network_global_data{
 	PCLIENT ActiveClients;
 	PCLIENT ClosedClients;
 	CRITICALSECTION csNetwork;
+	// Serializes the peer_thread_info chain (root_thread/parent_peer/child_peer) in
+	// AddThreadEvent.  Separate from csNetwork so it cannot interact with the close
+	// paths' lock order; nothing taken while holding this needs csNetwork.
+	CRITICALSECTION csPeerChain;
 	volatile uint32_t uNetworkPauseTimer;
 	uint32_t uPendingTimer;
 #ifndef __LINUX__
@@ -38683,6 +40167,10 @@ LOCATION struct network_global_data *global_network_data
 // routines exported from the core for use in external modules
 PCLIENT GetFreeNetworkClientEx( DBG_VOIDPASS );
 #define GetFreeNetworkClient() GetFreeNetworkClientEx( DBG_VOIDSRC )
+// serializes psvInUse/bInUse against the deferred-close decision (network.c);
+// event threads take this while deciding whether a close defers to ClearNetWork.
+void lockNetWorkList( void );
+void unlockNetWorkList( void );
 _UDP_NAMESPACE
 int FinishUDPRead( PCLIENT pc, int broadcastEvent );
 _UDP_NAMESPACE_END
@@ -38704,6 +40192,12 @@ struct peer_thread_info *IsNetworkThread( void );
 PCLIENT AddActive( PCLIENT pClient );
 void RemoveThreadEvent( PCLIENT pc );
 void AddThreadEvent( PCLIENT pc, int broadcast );
+#ifdef DEBUG_CLIENT_LOCK_TRACE
+void sack_dbg_traceClient( PCLIENT pc, int ev, int channel, uint32_t a, CTEXTSTR file, uint32_t line );
+void sack_dbg_dumpClientLockTrace( PCLIENT pc, const char *why );
+#endif
+#ifdef __LINUX__
+#endif
 LOGICAL TryNetworkGlobalLock( DBG_VOIDPASS );
 //-------------
 // TCP Interface
@@ -38726,7 +40220,11 @@ int CPROC IdleProcessNetworkMessages( uintptr_t quick_check );
 char *NetworkExpandFlags( PCLIENT pc );
 //----------------------------
 // ssl_close - redirected removeClient from network..
-void ssl_CloseSession( PCLIENT pc );
+// bLinger is the caller's graceful-close intent, forwarded from RemoveClientExx.
+// Dropping it here is what left TLS responses truncated: the terminal RemoveClient
+// below re-enters RemoveClientExx with bLinger FALSE, which short-circuits the
+// pending-write test and shutdown()s on top of queued ciphertext.
+void ssl_CloseSession( PCLIENT pc, LOGICAL bLinger );
 LOGICAL ssl_IsClosed( PCLIENT pc );
 //---------------------------
 // some utility macros
@@ -38846,8 +40344,10 @@ static void LowLevelNetworkInit( void )
 	if( !global_network_data ) {
 		SimpleRegisterAndCreateGlobal( global_network_data );
 	}
-	if( !globalNetworkData.ClientSlabs )
+	if( !globalNetworkData.ClientSlabs ) {
 		InitializeCriticalSec( &globalNetworkData.csNetwork );
+		InitializeCriticalSec( &globalNetworkData.csPeerChain );
+	}
 }
 PRIORITY_PRELOAD( InitNetworkGlobal, CONFIG_SCRIPT_PRELOAD_PRIORITY - 1 )
 {
@@ -38900,7 +40400,7 @@ PCLIENT GrabClientEx( PCLIENT pClient DBG_PASS )
 {
 	if( pClient )
 	{
-		pClient->dwFlags &= ~CF_STATEFLAGS;
+		ClearClientFlags( pClient, CF_STATEFLAGS );
 		if( pClient->dwFlags & CF_AVAILABLE )
 			lprintf( "Grabbed. %p  %08x", pClient, pClient->dwFlags );
 		pClient->LastEvent = timeGetTime();
@@ -38910,12 +40410,60 @@ PCLIENT GrabClientEx( PCLIENT pClient DBG_PASS )
 	return pClient;
 }
 //----------------------------------------------------------------------------
+#ifdef DEBUG_CLIENT_LOCK_TRACE
+// One atomic increment plus a few stores - cheap enough to leave the race intact.
+void sack_dbg_traceClient( PCLIENT pc, int ev, int channel, uint32_t a, CTEXTSTR file, uint32_t line ) {
+	struct client_lock_trace *t;
+	uint32_t i;
+	if( !pc ) return;
+	i = (uint32_t)LockedIncrement( &pc->lockTraceIdx ) - 1;
+	t = pc->lockTrace + ( i % CLIENT_LOCK_TRACE_DEPTH );
+	t->file    = file;
+	t->line    = line;
+	t->thread  = GetThisThreadID();
+	t->a       = a;
+	t->ev      = (uint8_t)ev;
+	t->channel = (uint8_t)( channel ? 1 : 0 );
+}
+// Dump one client's whole lock history, oldest first.  Capped globally so a storm
+// of stuck clients cannot flood the log.
+static uint32_t sack_dbg_dumps;
+void sack_dbg_dumpClientLockTrace( PCLIENT pc, const char *why ) {
+	uint32_t n, total, first;
+	if( !pc ) return;
+	if( sack_dbg_dumps++ > 12 ) return;
+	total = pc->lockTraceIdx;
+	first = ( total > CLIENT_LOCK_TRACE_DEPTH ) ? ( total - CLIENT_LOCK_TRACE_DEPTH ) : 0;
+	fprintf( stderr, "LOCKTRACE %s pc=%p sock=%d flags=%08x ops=%u rd=%u(owner %llx) wr=%u(owner %llx)\n"
+	       , why, (void*)pc, pc->Socket, pc->dwFlags, total
+	       , pc->csLockRead.dwLocks, (unsigned long long)pc->csLockRead.dwThreadID
+	       , pc->csLockWrite.dwLocks, (unsigned long long)pc->csLockWrite.dwThreadID );
+	for( n = first; n < total; n++ ) {
+		struct client_lock_trace *t = pc->lockTrace + ( n % CLIENT_LOCK_TRACE_DEPTH );
+		static const char *evname[] = { "UNLOCK", "LOCK", "ADDNET", "CLEARNET", "EVIN", "EVSKIP" };
+		const char *nm = ( t->ev < 6 ) ? evname[t->ev] : "?";
+		if( t->ev <= CLTRACE_LOCK )
+			fprintf( stderr, "   [%3u] %-8s ch%d ->%u  thr=%llx  %s(%u)\n"
+			       , n, nm, t->channel, t->a, (unsigned long long)t->thread
+			       , t->file ? t->file : "?", t->line );
+		else
+			fprintf( stderr, "   [%3u] %-8s inUseCount=%u  thr=%llx  %s(%u)\n"
+			       , n, nm, t->a, (unsigned long long)t->thread
+			       , t->file ? t->file : "?", t->line );
+	}
+}
+#endif
 static PCLIENT AddAvailable( PCLIENT pClient )
 {
 	if( pClient )
 	{
-		pClient->dwFlags |= CF_AVAILABLE;
+		SetClientFlags( pClient, CF_AVAILABLE );
 		pClient->LastEvent = timeGetTime();
+		// Head insert, same as AddActive.  This used to walk to the tail so the pool
+		// behaved LRU - that was a probe to expose ClearClient leakage by preventing
+		// immediate reuse, not intended behaviour, and it is O(available) on every
+		// recycle while holding csNetwork.  Worse at the slab pre-fill (AddClients
+		// calls this 256 times in a row), which made pool growth O(n^2).
 		pClient->me = &globalNetworkData.AvailableClients;
 		if( ( pClient->next = globalNetworkData.AvailableClients ) )
 			globalNetworkData.AvailableClients->me = &pClient->next;
@@ -38929,7 +40477,7 @@ PCLIENT AddActive( PCLIENT pClient )
 {
 	if( pClient )
 	{
-		pClient->dwFlags |= CF_ACTIVE;
+		SetClientFlags( pClient, CF_ACTIVE );
 		pClient->LastEvent = timeGetTime();
 		pClient->me = &globalNetworkData.ActiveClients;
 		if( ( pClient->next = globalNetworkData.ActiveClients ) )
@@ -38942,12 +40490,64 @@ LOGICAL sack_network_is_active( PCLIENT pc ) {
 	if( pc && ( pc->dwFlags & ( CF_ACTIVE )) && !( pc->dwFlags & (CF_CLOSED)) ) return TRUE;
 	return FALSE;
 }
+uint32_t NetworkClientSerial( PCLIENT pc ) {
+	if( pc ) return pc->serial;
+	return 0;
+}
+// diagnostic accessors - where is outbound data being held?
+LOGICAL NetworkClientHasPendingSend( PCLIENT pc ) {
+	return pc && ( pc->lpFirstPending != NULL );
+}
+uint32_t NetworkClientFlags( PCLIENT pc ) {
+	return pc ? (uint32_t)pc->dwFlags : 0;
+}
+// diagnostic: is the client's network event object signaled right now, and is
+// the client attached to an event thread?  A signaled event on an attached,
+// live client means the event thread is failing to dispatch it.
+int NetworkClientEventState( PCLIENT pc ) {
+	int state = 0;
+#ifdef _WIN32
+	if( !pc ) return 0;
+	if( pc->this_thread ) state |= 1;
+	if( pc->event && WaitForSingleObject( pc->event, 0 ) == WAIT_OBJECT_0 )
+		state |= 2;
+	if( pc->this_thread && pc->this_thread->flags.bProcessing ) state |= 4;
+	if( pc->this_thread ) state |= ( (uint32_t)pc->this_thread->nWaitEvents << 8 ) | ( (uint32_t)pc->this_thread->nEvents << 16 );
+#endif
+	return state;
+}
+uint32_t NetworkClientWritesPended( PCLIENT pc ) {
+	return pc ? pc->nWritesPended : 0;
+}
+LOGICAL NetworkClientValid( PCLIENT pc, uint32_t serial ) {
+	// TRUE only if this is still the same connection the serial was captured
+	// from; a closed or recycled client fails even though a new connection on
+	// the same PCLIENT would pass the active-flags test.
+	return sack_network_is_active( pc ) && pc->serial == serial;
+}
+//----------------------------------------------------------------------------
+// guards the psvInUse lists (AddNetWork/ClearNetWork run on application
+// threads while the client closes/recycles on the network thread), and
+// serializes the deferred-close decision: an event thread deciding whether to
+// defer a close because work is outstanding (bInUse) must not race the
+// ClearNetWork that releases the work, or both sides conclude the other will
+// perform the close and the socket strands in CLOSE_WAIT.
+static volatile uint32_t netWorkListLock;
+void lockNetWorkList( void ) {
+	while( LockedExchange( &netWorkListLock, 1 ) )
+		Relinquish();
+}
+void unlockNetWorkList( void ) {
+	netWorkListLock = 0;
+}
 //----------------------------------------------------------------------------
 static PCLIENT AddClosed( PCLIENT pClient )
 {
 	if( pClient )
 	{
-		pClient->dwFlags |= CF_CLOSED;
+		// leaving active life; invalidate handles captured against this connection.
+		LockedIncrement( &pClient->serial );
+		SetClientFlags( pClient, CF_CLOSED );
 		pClient->LastEvent = timeGetTime();
 		pClient->me = &globalNetworkData.ClosedClients;
 		if( ( pClient->next = globalNetworkData.ClosedClients ) )
@@ -38962,8 +40562,12 @@ static void ClearClient( PCLIENT pc DBG_PASS )
 	uintptr_t* pbtemp;
 	PCLIENT next;
 	PCLIENT *me;
-	CRITICALSECTION csr;
-	CRITICALSECTION csw;
+	SOCKADDR *sa_rel;
+	uint32_t serial;
+	// Everything from here to the end of the struct is scrubbed; the two
+	// CRITICALSECTIONs deliberately sit in front of it and are never touched.
+	static const size_t clear_offset = offsetof( struct NetworkClient, csLockWrite )
+	                                 + sizeof( ( (PCLIENT)0 )->csLockWrite );
 	// keep the closing flag until it's really been closed. (getfreeclient will try to nab it)
  /*enum NetworkConnectionFlags*/
 	int  dwFlags = pc->dwFlags & (CF_STATEFLAGS | CF_CLOSING | CF_CONNECT_WAITING | CF_CONNECT_CLOSED);
@@ -38974,12 +40578,18 @@ static void ClearClient( PCLIENT pc DBG_PASS )
 	next = pc->next;
 	// these states are saved to be restored.
 	pbtemp = pc->lpUserData;
-	csr = pc->csLockRead;
-	csw = pc->csLockWrite;
+ // generation continues across reuse; only close bumps it
+	serial = pc->serial;
+	lockNetWorkList();
 	DeleteListEx( &pc->psvInUse DBG_SRC );
+	unlockNetWorkList();
 	// these are memset to 0 afterward...
-	ReleaseAddress( pc->saClient );
-	ReleaseAddress( pc->saSource );
+	sa_rel = pc->saClient;
+	pc->saClient = NULL;
+	ReleaseAddress( sa_rel );
+	sa_rel = pc->saSource;
+	pc->saSource = NULL;
+	ReleaseAddress( sa_rel );
 #if _WIN32
 	if( pc->event ) {
 		if( globalNetworkData.flags.bLogNotices )
@@ -38987,11 +40597,13 @@ static void ClearClient( PCLIENT pc DBG_PASS )
 		WSACloseEvent( pc->event );
 	}
 #endif
- // clear all information...
-	MemSet( pc, 0, sizeof( CLIENT ) );
+	// clear all information... but start after the two CRITICALSECTIONs at the head
+	// of the struct.  They must never be written here: other threads spin on them in
+	// EnterCriticalSecNoWaitEx with no global lock held, so zeroing and restoring
+	// them resurrects stale owners/counts (clients left permanently read-locked).
+	MemSet( (uint8_t*)pc + clear_offset, 0, sizeof( CLIENT ) - clear_offset );
 	pc->Socket = INVALID_SOCKET;
-	pc->csLockRead = csr;
-	pc->csLockWrite = csw;
+	pc->serial = serial;
 	pc->lpUserData = pbtemp;
 	if( pc->lpUserData )
 		MemSet( pc->lpUserData, 0, globalNetworkData.nUserData * sizeof( uintptr_t ) );
@@ -39081,11 +40693,24 @@ void TerminateClosedClientEx( PCLIENT pc DBG_PASS )
 				pc->lpFirstPending = lpNext;
 			}
 		}
+		// DEFERRED RECYCLE.  Never hand a client back to the free pool while either
+		// channel is still locked.  The EPOLLIN handler locks channel 1 for the whole
+		// event and then closes from *inside* the read (a Connection: close response
+		// sets CF_TOCLOSE during FinishPendingRead, which then returns -1 and takes
+		// the "reset connection" branch straight to here) - so recycling here put a
+		// still-locked client into AvailableClients, and GetFreeNetworkClient handed
+		// it straight back out already locked.  That is the leaked +1 on csLockRead.
+		// The final NetworkUnlockEx finishes the recycle once nothing holds it.
+		if( pc->csLockRead.dwLocks || pc->csLockWrite.dwLocks ) {
+			pc->recyclePending = 1;
+			LeaveCriticalSec( &globalNetworkData.csNetwork );
+			return;
+		}
 		ClearClient( pc DBG_RELAY );
 		// this should move from globalNetworkData.close to globalNetworkData.available.
 		AddAvailable( GrabClient( pc ) );
  // it's no longer closing.  (was set during the course of closure)
-		pc->dwFlags &= ~CF_CLOSING;
+		ClearClientFlags( pc, CF_CLOSING );
 		LeaveCriticalSec( &globalNetworkData.csNetwork );
 		//NetworkUnlock( pc );
 	}
@@ -39101,7 +40726,7 @@ void SetNetworkWriteComplete( PCLIENT pClient
 	if( pClient && IsValid( pClient->Socket ) )
 	{
 		pClient->write.WriteComplete = WriteComplete;
-		pClient->dwFlags &= ~CF_CPPWRITE;
+		ClearClientFlags( pClient, CF_CPPWRITE );
 	}
 }
 //----------------------------------------------------------------------------
@@ -39113,7 +40738,7 @@ void SetCPPNetworkWriteComplete( PCLIENT pClient
 	{
 		pClient->write.CPPWriteComplete = WriteComplete;
 		pClient->psvWrite = psv;
-		pClient->dwFlags |= CF_CPPWRITE;
+		SetClientFlags( pClient, CF_CPPWRITE );
 	}
 }
 //----------------------------------------------------------------------------
@@ -39149,7 +40774,7 @@ void SetCPPNetworkCloseCallback( PCLIENT pClient
 	{
 		pClient->close.CPPCloseCallback = CloseCallback;
 		pClient->psvClose = psv;
-		pClient->dwFlags |= CF_CPPCLOSE;
+		SetClientFlags( pClient, CF_CPPCLOSE );
 	}
 }
 //----------------------------------------------------------------------------
@@ -39169,7 +40794,7 @@ void SetNetworkReadComplete( PCLIENT pClient
 	}
 	if( !( pClient->RecvPending.buffer.p ) ) {
  // may be... at least we can fail sooner...
-		pClient->dwFlags |= CF_READREADY;
+		SetClientFlags( pClient, CF_READREADY );
 		if( pClient->read.ReadComplete )
 			pClient->read.ReadComplete( pClient, NULL, 0 );
 	}
@@ -39195,11 +40820,11 @@ void SetCPPNetworkReadComplete( PCLIENT pClient
 	{
 		pClient->read.CPPReadComplete = pReadComplete;
 		pClient->psvRead = psv;
-		pClient->dwFlags |= CF_CPPREAD;
+		SetClientFlags( pClient, CF_CPPREAD );
 	}
 	if( !( pClient->RecvPending.buffer.p ) ) {
  // may be... at least we can fail sooner...
-		pClient->dwFlags |= CF_READREADY;
+		SetClientFlags( pClient, CF_READREADY );
 		if( pClient->read.ReadComplete )
 			pClient->read.CPPReadComplete( pClient->psvRead, NULL, 0 );
 	}
@@ -39216,6 +40841,16 @@ void TriggerNetworkErrorCallback( PCLIENT pc, enum SackNetworkErrorIdentifier er
 		pc->errorCallback( pc->psvErrorCallback, pc, error );
 }
 //----------------------------------------------------------------------------
+/* checkStuckConnects used to live here: a 1s timer that re-selected any socket
+   sitting CF_CONNECTING without events.  It was a safety net for a winsock case
+   where FD_CONNECT was never delivered even though the connection had been
+   established - but that is handled properly at the source now, in the
+   network_win32.c FD_WRITE handler, which completes the connect when the socket
+   turns out to be writable while still CF_CONNECTING.  Re-selecting adds nothing
+   on top of that: if the socket really is connected, FD_WRITE already heals it;
+   if it is not (no service on the port, or the traffic is being dropped) there is
+   no event to recover and the re-select just logged once a second forever.  That
+   false positive is all it produced in practice, so it is gone. */
 uintptr_t CPROC NetworkThreadProc( PTHREAD thread )
 {
 	struct peer_thread_info *peer_thread = (struct peer_thread_info*)GetThreadParam( thread );
@@ -39267,7 +40902,7 @@ uintptr_t CPROC NetworkThreadProc( PTHREAD thread )
 		struct kevent64_s ev;
 		this_thread.kevents = CreateDataList( sizeof( ev ) );
 #        ifdef USE_PIPE_SEMS
-		EV_SET64( &ev, GetThreadSleeper( thread ), EVFILT_READ, EV_ADD, 0, 0, (uint64_t)1, NULL, NULL );
+		EV_SET64( &ev, GetThreadSleeper( thread ), EVFILT_READ, EV_ADD, 0, 0, (uint64_t)1, 0, 0 );
 #        endif
 		kevent64( this_thread.kqueue, &ev, 1, 0, 0, 0, 0 );
 #      else
@@ -39320,7 +40955,8 @@ uintptr_t CPROC NetworkThreadProc( PTHREAD thread )
 	}
 	else
 	{
-		if( ( this_thread.parent_peer->child_peer = this_thread.child_peer ) )
+		this_thread.parent_peer->child_peer = this_thread.child_peer;
+		if( this_thread.child_peer )
 			this_thread.child_peer->parent_peer = this_thread.parent_peer;
 	}
 	// this used to be done in the WM_DESTROY
@@ -39373,17 +41009,16 @@ int NetworkQuit(void)
 		PTHREAD thread;
 		INDEX idx;
 #ifdef USE_WSA_EVENTS
-		PLIST wakeEvents = NULL;
 		struct peer_thread_info *peer_thread;
-		WSAEVENT hThread;
 		peer_thread = globalNetworkData.root_thread;
 		globalNetworkData.root_thread = NULL;
-      MakeThread();
+		MakeThread();
+		// set the events directly - this runs from atexit/process detach where a
+		// terminated thread may hold the heap lock; allocating (AddLink) here
+		// spins forever on that orphaned lock.
 		for( ; peer_thread; peer_thread = peer_thread->child_peer ) {
-			AddLink( &wakeEvents, peer_thread->hThread );
+			WSASetEvent( peer_thread->hThread );
 		}
-		LIST_FORALL( wakeEvents, idx, WSAEVENT, hThread )
-			WSASetEvent( hThread );
 #endif
 		LIST_FORALL( globalNetworkData.pThreads, idx, PTHREAD, thread ) {
 			WakeThread( thread );
@@ -39443,6 +41078,13 @@ LOGICAL NetworkAlive( void )
 	return !globalNetworkData.flags.bThreadExit;
 }
 //----------------------------------------------------------------------------
+// The slab packs clients back to back at sizeof(CLIENT) stride, so aligning
+// client[0] only helps if the stride is a whole number of cache lines - otherwise
+// every client after the first drifts and its lock words share a line with the
+// previous client's tail.  The alignas in netstruc.h guarantees this; assert it
+// so a later struct edit cannot silently undo the fix.
+SACK_STATIC_ASSERT( ( sizeof( CLIENT ) % SACK_CACHE_LINE ) == 0
+                  , "sizeof(CLIENT) must be a multiple of SACK_CACHE_LINE or the slab stride breaks lock alignment" );
 static void AddClients( void ) {
 	PCLIENT_SLAB pClientSlab;
 	// protect all structures.
@@ -39450,7 +41092,20 @@ static void AddClients( void ) {
 	{
 		size_t n;
 		//Log1( "Creating %d Client Resources", MAX_NETCLIENTS );
-		pClientSlab = NewPlus( CLIENT_SLAB, (MAX_NETCLIENTS - 1 )* sizeof( CLIENT ) );
+		// Must be HeapAllocateAligned, not NewPlus: struct NetworkClient declares
+		// SACK_CACHE_LINE alignment for its lock words, and only the allocator can
+		// honour that for a heap block.  The compiler's part (client[] at a 64
+		// multiple, sizeof(CLIENT) a 64 multiple so the stride holds) comes from the
+		// alignas in netstruc.h.  NewPlus is HeapAllocate(0,...) and does not zero,
+		// and every CLIENT_SLAB field is initialised below, so this is a like-for-like
+		// swap apart from the alignment.
+		pClientSlab = (PCLIENT_SLAB)HeapAllocateAligned( 0
+		                                               , sizeof( CLIENT_SLAB ) + (MAX_NETCLIENTS - 1 ) * sizeof( CLIENT )
+		                                               , SACK_CACHE_LINE );
+		if( ( (uintptr_t)pClientSlab->client ) & ( SACK_CACHE_LINE - 1 ) )
+			lprintf( "WARNING: client slab is not cache-line aligned (%p); the false-sharing"
+			         " separation of csLockRead/csLockWrite is NOT in effect."
+			       , pClientSlab->client );
 		pClientSlab->pUserData = NewArray( uintptr_t, MAX_NETCLIENTS * globalNetworkData.nUserData );
  // can't clear the lpUserData Address!!!
 		MemSet( pClientSlab->client, 0, (MAX_NETCLIENTS) * sizeof( CLIENT ) );
@@ -39610,6 +41265,13 @@ get_client:
 			DebugBreak();
  // clear client is redundant here... but saves the critical section now
 		ClearClient( pClient DBG_SRC );
+#ifdef DEBUG_CLIENT_LOCK_TRACE
+		// Both channels were taken directly above, before ClearClient scrubbed the
+		// ring - so seed the fresh ring with them or the lifetime starts unbalanced
+		// on paper.  Order matches the acquisition order (read then write).
+		sack_dbg_traceClient( pClient, CLTRACE_LOCK, 1, pClient->csLockRead.dwLocks, pFile, nLine );
+		sack_dbg_traceClient( pClient, CLTRACE_LOCK, 0, pClient->csLockWrite.dwLocks, pFile, nLine );
+#endif
 		//Log1( "New network client %p", client );
 	}
 	else
@@ -39682,9 +41344,15 @@ NETWORK_PROC( uintptr_t, GetNetworkLong )(PCLIENT lpClient,int nLong)
 			//TODO if less than zero return a (high/low)portion of the  hardware address (MAC).
 		}
 	}
-	else if( nLong < globalNetworkData.nUserData )
-		return lpClient->lpUserData[nLong];
-   //spv:980303
+	else if( nLong < globalNetworkData.nUserData ) {
+		if( lpClient->lpUserData )
+			return lpClient->lpUserData[nLong];
+		else {
+			lprintf( "User data wasn't set on socket... %d", nLong );
+			// content is expected to be NULL, even though this is sort of an error
+			return 0;
+		}
+	}
 	return (uintptr_t)-1;
 }
 //----------------------------------------------------------------------------
@@ -39769,6 +41437,9 @@ NETWORK_PROC( PCLIENT, NetworkLockEx)( PCLIENT lpClient, int readWrite DBG_PASS 
 #else
 			LeaveCriticalSecEx( readWrite?&lpClient->csLockRead:&lpClient->csLockWrite DBG_RELAY );
 #endif
+#ifdef DEBUG_CLIENT_LOCK_TRACE
+		sack_dbg_traceClient( lpClient, CLTRACE_UNLOCK, readWrite, readWrite ? lpClient->csLockRead.dwLocks : lpClient->csLockWrite.dwLocks, pFile, nLine );
+#endif
 //#ifdef LOG_NETWORK_LOCKING
 			_lprintf( DBG_RELAY )( "Failed lock: %p  %08x %08x inactive, cannot lock.", lpClient, lpClient->dwFlags, CF_ACTIVE );
 //#endif
@@ -39778,6 +41449,9 @@ NETWORK_PROC( PCLIENT, NetworkLockEx)( PCLIENT lpClient, int readWrite DBG_PASS 
 	}
 #ifdef LOG_NETWORK_LOCKING
 	_lprintf( DBG_RELAY )( "Got private lock %p %d", lpClient, readWrite );
+#endif
+#ifdef DEBUG_CLIENT_LOCK_TRACE
+	sack_dbg_traceClient( lpClient, CLTRACE_LOCK, readWrite, readWrite ? lpClient->csLockRead.dwLocks : lpClient->csLockWrite.dwLocks, pFile, nLine );
 #endif
 	return lpClient;
 }
@@ -39809,11 +41483,33 @@ NETWORK_PROC( void, NetworkUnlockEx)( PCLIENT lpClient, int readWrite DBG_PASS )
 #else
 		LeaveCriticalSecEx( readWrite?&lpClient->csLockRead:&lpClient->csLockWrite DBG_RELAY );
 #endif
+#ifdef DEBUG_CLIENT_LOCK_TRACE
+		sack_dbg_traceClient( lpClient, CLTRACE_UNLOCK, readWrite, readWrite ? lpClient->csLockRead.dwLocks : lpClient->csLockWrite.dwLocks, pFile, nLine );
+#endif
+		// Deferred recycle: a close that ran while this client was locked left the
+		// job to whoever drops the last lock.  Doing it here, after the leave, is
+		// what guarantees a client is never sitting in AvailableClients with a
+		// channel still held.  No client lock is held at this point, so taking
+		// csNetwork here cannot invert the established clientLock -> csNetwork order.
+		if( lpClient->recyclePending
+		 && !lpClient->csLockRead.dwLocks && !lpClient->csLockWrite.dwLocks ) {
+			EnterCriticalSec( &globalNetworkData.csNetwork );
+			if( lpClient->recyclePending
+			 && !lpClient->csLockRead.dwLocks && !lpClient->csLockWrite.dwLocks ) {
+				lpClient->recyclePending = 0;
+				ClearClient( lpClient DBG_RELAY );
+				AddAvailable( GrabClient( lpClient ) );
+				ClearClientFlags( lpClient, CF_CLOSING );
+			}
+			LeaveCriticalSec( &globalNetworkData.csNetwork );
+ // back in the pool - nothing below may touch it any more
+			return;
+		}
  // is write and not read
 		if( !readWrite && !inWakeOnUnlock )
 		{
 			PTHREAD wakeOnUnlock;
-			if( wakeOnUnlock = lpClient->wakeOnUnlock ){
+			if( ( wakeOnUnlock = lpClient->wakeOnUnlock ) ){
 #ifdef LOG_PENDING_WRITES
 				_lprintf(DBG_RELAY)( "Wake on Unlock was set");
 #endif
@@ -39909,11 +41605,16 @@ void InternalRemoveClientExx(PCLIENT lpClient, LOGICAL bBlockNotify, LOGICAL bLi
 #endif
 			return;
 		}
-		if( bLinger && ( lpClient->lpFirstPending || ( lpClient->dwFlags & CF_WRITEPENDING ) ) ) {
+		// nWritesPended counts writes parked on the global pdqPendingWrites queue
+		// (and the stall list).  Those set neither lpFirstPending nor
+		// CF_WRITEPENDING, so without it a graceful close reads "nothing pending"
+		// and tears down a socket whose response has not been written yet.
+		if( bLinger && ( lpClient->lpFirstPending || ( lpClient->dwFlags & CF_WRITEPENDING )
+		               || lpClient->nWritesPended ) ) {
 #ifdef LOG_DEBUG_CLOSING
 			lprintf( "GRACEFUL CLOSE WHILE WAITING FOR WRITE TO FINISH... %p", lpClient );
 #endif
-			lpClient->dwFlags |= CF_TOCLOSE;
+			SetClientFlags( lpClient, CF_TOCLOSE );
 			return;
 			// continue on; otherwise the close event gets lost...
 		}
@@ -39950,21 +41651,25 @@ void InternalRemoveClientExx(PCLIENT lpClient, LOGICAL bBlockNotify, LOGICAL bLi
 		// to this structure before closing and cleaning it.
 		if( !bBlockNotify )
 		{
-			lpClient->dwFlags |= CF_CONNECT_CLOSED;
+			SetClientFlags( lpClient, CF_CONNECT_CLOSED );
 			if( lpClient->pWaiting )
 			{
 				WakeThread( lpClient->pWaiting );
 				while( lpClient->dwFlags & CF_CONNECT_WAITING )
 					Relinquish();
 			}
-			lpClient->dwFlags &= ~CF_CONNECT_CLOSED;
+			ClearClientFlags( lpClient, CF_CONNECT_CLOSED );
  // prevent multiple notifications...
 			if( !(lpClient->dwFlags & CF_CLOSING) )
 			{
 #ifdef LOG_DEBUG_CLOSING
 				lprintf( "Marked closing first, and dispatching callback? %p", lpClient );
 #endif
-				lpClient->dwFlags |= CF_CLOSING;
+				SetClientFlags( lpClient, CF_CLOSING );
+				// invalidate deferred handles BEFORE the close callback tears down
+				// application state; NetworkClientValid() fails from here on, so a
+				// deferred event validated after this cannot find half-torn state.
+				LockedIncrement( &lpClient->serial );
 				LeaveCriticalSec( &globalNetworkData.csNetwork );
 				if( lpClient->close.CloseCallback )
 				{
@@ -40023,7 +41728,7 @@ void RemoveClientExx(PCLIENT lpClient, LOGICAL bBlockNotify, LOGICAL bLinger DBG
 #endif
 	if( !lpClient ) return;
 	//_lprintf(DBG_RELAY)( "RemoveClient: %p %d %d", lpClient, bBlockNotify, bLinger );
-	if( !( lpClient->dwFlags & CF_UDP )
+	if( !( lpClient->dwFlags & ( CF_UDP | CF_CLOSING ) )
 		&& ( lpClient->dwFlags & ( CF_CONNECTED ) )
 		&& !( lpClient->dwFlags & CF_CONNECTERROR ) ) {
 		// not linger
@@ -40033,20 +41738,30 @@ void RemoveClientExx(PCLIENT lpClient, LOGICAL bBlockNotify, LOGICAL bLinger DBG
 			if( !ssl_IsClosed( lpClient ) ) {
 				// let client notify_close actually close this...
 				//lprintf( "secure client, not closed, just close session... (no shutdown?)");
-				ssl_CloseSession( lpClient );
+				// bLinger MUST go with it: this returns before the pending-write
+				// test below, and ssl_CloseSession's terminal RemoveClient comes
+				// back through here to make that decision.
+				ssl_CloseSession( lpClient, bLinger );
 				return;
 			}
 		}
 #endif
-		if( !bLinger || !(lpClient->lpFirstPending || ( lpClient->dwFlags & CF_WRITEPENDING ) ) ) {
+		// see InternalRemoveClientExx: a write deferred to pdqPendingWrites shows up
+		// only in nWritesPended, and shutting down here discards it (send() then
+		// fails EPIPE and the peer gets a clean FIN with no response).
+		if( !bLinger || !(lpClient->lpFirstPending || ( lpClient->dwFlags & CF_WRITEPENDING )
+		               || lpClient->nWritesPended ) ) {
 			shutdown( lpClient->Socket, SHUT_WR );
 		} else {
-			lprintf( "linger and still pending write data..." );
-			lpClient->dwFlags |= CF_TOCLOSE;
+			//lprintf( "linger and still pending write data..." ); // normal path; noisy under load
+			SetClientFlags( lpClient, CF_TOCLOSE );
 		}
-		lpClient->dwFlags |= CF_WANTCLOSE;
+		SetClientFlags( lpClient, CF_WANTCLOSE );
 	} else {
 		int n = 0;
+		if( !(lpClient->dwFlags & CF_ACTIVE )
+			|| lpClient->dwFlags & ( CF_CLOSED | CF_CLOSING ) )
+			return;
 		// UDP still needs to be done this way...
 		// socket not connected; shutdown will not work.
 		//lprintf( "This will end up resetting the socket?" );
@@ -40059,26 +41774,53 @@ void RemoveClientExx(PCLIENT lpClient, LOGICAL bBlockNotify, LOGICAL bLinger DBG
 		}
 		else if( n ) {
 			NetworkUnlock( lpClient, 0 );
-			lpClient->dwFlags |= CF_TOCLOSE;
+			SetClientFlags( lpClient, CF_TOCLOSE );
 		}
 		LeaveCriticalSec( &globalNetworkData.csNetwork );
 	}
 }
+PLIST* GetNetWork( PCLIENT lpClient ) {
+	lockNetWorkList();
+	return &lpClient->psvInUse;
+}
+// should we validate that the psv is in the list?  or just clear it?
+void DropNetWork( PCLIENT lpClient ) {
+	unlockNetWorkList();
+}
 void AddNetWork( PCLIENT lpClient, uintptr_t psv ) {
+	lockNetWorkList();
 	AddLink( &lpClient->psvInUse, (POINTER)psv );
-	if( lpClient->flags.bInUse ) {
-		return;
-	}
 	lpClient->flags.bInUse = 1;
+#ifdef DEBUG_CLIENT_LOCK_TRACE
+	// This is the marker that a request was handed toward JS: on the request path
+	// the only caller is webSockHttpRequest (sack.vfs), which then queues a
+	// WS_EVENT_REQUEST and uv_async_send()s it.  A client found hung with bInUse=1
+	// and no matching CLEARNET got that far and the JS callback never ran.
+	sack_dbg_traceClient( lpClient, CLTRACE_ADDNET, 0
+	                    , (uint32_t)GetLinkCount( lpClient->psvInUse ) DBG_SRC );
+#endif
+	unlockNetWorkList();
 }
 void ClearNetWork( PCLIENT lpClient, uintptr_t psv ) {
-	INDEX id = FindLink( &lpClient->psvInUse, (POINTER)psv );
-	if( id != INVALID_INDEX ) {
-		SetLink( &lpClient->psvInUse, id, NULL );
+	LOGICAL emptied = FALSE;
+	lockNetWorkList();
+	{
+		INDEX id = FindLink( &lpClient->psvInUse, (POINTER)psv );
+		if( id != INVALID_INDEX ) {
+			SetLink( &lpClient->psvInUse, id, NULL );
+		}
+		if( !GetLinkCount( lpClient->psvInUse ) ) {
+			lpClient->flags.bInUse = 0;
+			emptied = TRUE;
+		}
+#ifdef DEBUG_CLIENT_LOCK_TRACE
+		sack_dbg_traceClient( lpClient, CLTRACE_CLEARNET, 0
+		                    , (uint32_t)GetLinkCount( lpClient->psvInUse ) DBG_SRC );
+#endif
 	}
-	if( GetLinkCount( lpClient->psvInUse ) )
+	unlockNetWorkList();
+	if( !emptied )
 		return;
-	lpClient->flags.bInUse = 0;
 	if( lpClient->dwFlags & CF_TOCLOSE && (!lpClient->lpFirstPending || !lpClient->lpFirstPending->dwAvail) ) {
 		RemoveClient( lpClient );
 	}
@@ -40158,16 +41900,16 @@ void RemoveThreadEvent( PCLIENT pc ) {
 #      ifdef __64__
 		struct kevent64_s ev;
 		if( pc->dwFlags & CF_LISTEN ) {
-			EV_SET64( &ev, pc->Socket, EVFILT_READ, EV_DELETE, 0, 0, (uint64_t)pc, NULL, NULL );
+			EV_SET64( &ev, pc->Socket, EVFILT_READ, EV_DELETE, 0, 0, (uint64_t)pc, 0, 0 );
 			kevent64( thread->kqueue, &ev, 1, 0, 0, 0, 0 );
 		} else {
-			EV_SET64( &ev, pc->Socket, EVFILT_READ, EV_DELETE, 0, 0, (uintptr_t)pc, NULL, NULL );
+			EV_SET64( &ev, pc->Socket, EVFILT_READ, EV_DELETE, 0, 0, (uintptr_t)pc, 0, 0 );
 			kevent64( thread->kqueue, &ev, 1, 0, 0, 0, 0 );
-			EV_SET64( &ev, pc->Socket, EVFILT_WRITE, EV_DELETE, 0, 0, (uintptr_t)pc, NULL, NULL );
+			EV_SET64( &ev, pc->Socket, EVFILT_WRITE, EV_DELETE, 0, 0, (uintptr_t)pc, 0, 0 );
 			kevent64( thread->kqueue, &ev, 1, 0, 0, 0, 0 );
 		}
 		if( pc->SocketBroadcast ) {
-			EV_SET64( &ev, pc->SocketBroadcast, EVFILT_READ, EV_DELETE, 0, 0, (uint64_t)pc, NULL, NULL );
+			EV_SET64( &ev, pc->SocketBroadcast, EVFILT_READ, EV_DELETE, 0, 0, (uint64_t)pc, 0, 0 );
 			kevent64( thread->kqueue, &ev, 1, 0, 0, 0, 0 );
 		}
 #      else
@@ -40302,13 +42044,13 @@ void AddThreadEvent( PCLIENT pc, int broadcast )
 #    ifdef __64__
 		struct kevent64_s ev;
 		if( pc->dwFlags & CF_LISTEN ) {
-			EV_SET64( &ev, broadcast?pc->SocketBroadcast:pc->Socket, EVFILT_READ, EV_ADD, 0, 0, (uintptr_t)data, NULL, NULL );
+			EV_SET64( &ev, broadcast?pc->SocketBroadcast:pc->Socket, EVFILT_READ, EV_ADD, 0, 0, (uintptr_t)data, 0, 0 );
 			kevent64( peer->kqueue, &ev, 1, 0, 0, 0, 0 );
 		}
 		else {
-			EV_SET64( &ev, broadcast?pc->SocketBroadcast:pc->Socket, EVFILT_READ, EV_ADD, 0, 0, (uintptr_t)data, NULL, NULL );
+			EV_SET64( &ev, broadcast?pc->SocketBroadcast:pc->Socket, EVFILT_READ, EV_ADD, 0, 0, (uintptr_t)data, 0, 0 );
 			kevent64( peer->kqueue, &ev, 1, 0, 0, 0, 0 );
-			EV_SET64( &ev, broadcast?pc->SocketBroadcast:pc->Socket, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, (uintptr_t)data, NULL, NULL );
+			EV_SET64( &ev, broadcast?pc->SocketBroadcast:pc->Socket, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, (uintptr_t)data, 0, 0 );
 			kevent64( peer->kqueue, &ev, 1, 0, 0, 0, 0 );
 		}
 #    else
@@ -40463,7 +42205,7 @@ int CPROC ProcessNetworkMessages( struct peer_thread_info *thread, uintptr_t unu
 						}
 						// section will be blank after termination...(correction, we keep the section state now)
  // it's no longer closing.  (was set during the course of closure)
-						pClient->dwFlags &= ~CF_CLOSING;
+						ClearClientFlags( pClient, CF_CLOSING );
 					} else if( !(event_data->pc->dwFlags & (CF_ACTIVE) ) ) {
 						lprintf( "Event on socket no longer active..." );
 						// change to inactive status by the time we got here...
@@ -40505,7 +42247,9 @@ int CPROC ProcessNetworkMessages( struct peer_thread_info *thread, uintptr_t unu
 						// partial messages at a time...
 						read = FinishPendingRead( event_data->pc DBG_SRC );
 						//lprintf( "Read %d", read );
-						if( ( read == -1 ) && ( event_data->pc->dwFlags & CF_TOCLOSE ) )
+						if( ( read == -1 )
+						   && ( event_data->pc->dwFlags & CF_TOCLOSE )
+						   && !event_data->pc->flags.bInUse )
 						{
 #ifdef LOG_NOTICES
 							//if( globalNetworkData.flags.bLogNotices )
@@ -40518,7 +42262,7 @@ int CPROC ProcessNetworkMessages( struct peer_thread_info *thread, uintptr_t unu
 							closed = 1;
 						}
 						else if( !event_data->pc->RecvPending.s.bStream )
-							event_data->pc->dwFlags |= CF_READREADY;
+							SetClientFlags( event_data->pc, CF_READREADY );
 					}
 					else
 					{
@@ -40526,7 +42270,7 @@ int CPROC ProcessNetworkMessages( struct peer_thread_info *thread, uintptr_t unu
 						if( globalNetworkData.flags.bLogNotices )
 							lprintf( "TCP Set read ready..." );
 #endif
-						event_data->pc->dwFlags |= CF_READREADY;
+						SetClientFlags( event_data->pc, CF_READREADY );
 					}
 					if( locked )
 						LeaveCriticalSec( &event_data->pc->csLockRead );
@@ -40564,8 +42308,8 @@ int CPROC ProcessNetworkMessages( struct peer_thread_info *thread, uintptr_t unu
 							if( globalNetworkData.flags.bLogNotices )
 								lprintf( "Connected!" );
 #endif
-							event_data->pc->dwFlags |= CF_CONNECTED;
-							event_data->pc->dwFlags &= ~CF_CONNECTING;
+							SetClientFlags( event_data->pc, CF_CONNECTED );
+							ClearClientFlags( event_data->pc, CF_CONNECTING );
 							{
 								PCLIENT pc = event_data->pc;
 #ifdef __LINUX__
@@ -40600,7 +42344,7 @@ int CPROC ProcessNetworkMessages( struct peer_thread_info *thread, uintptr_t unu
 #endif
 									WakeThread( event_data->pc->pWaiting );
 								}
-								event_data->pc->dwFlags |= CF_CONNECT_ISSUED;
+								SetClientFlags( event_data->pc, CF_CONNECT_ISSUED );
 								if( event_data->pc->dwFlags & CF_CPPCONNECT ) {
 									if( event_data->pc->connect.CPPThisConnected )
 										event_data->pc->connect.CPPThisConnected( event_data->pc->psvConnect, error );
@@ -40628,7 +42372,7 @@ int CPROC ProcessNetworkMessages( struct peer_thread_info *thread, uintptr_t unu
 										TCPWrite( event_data->pc );
 									}
 								} else {
-									event_data->pc->dwFlags |= CF_CONNECTERROR;
+									SetClientFlags( event_data->pc, CF_CONNECTERROR );
 								}
 							}
 						} else if( event_data->pc->dwFlags & CF_UDP ) {
@@ -40826,7 +42570,7 @@ static void HandleEvent( PCLIENT pClient )
 		lprintf( "How did a NULL client get here?!" );
 		return;
 	}
-	pClient->dwFlags |= CF_PROCESSING;
+	SetClientFlags( pClient, CF_PROCESSING );
 #ifdef LOG_NETWORK_EVENT_THREAD
 	//if( globalNetworkData.flags.bLogNotices )
 	//	lprintf( "Client event on %p", pClient );
@@ -40872,14 +42616,14 @@ static void HandleEvent( PCLIENT pClient )
 							lprintf( "FD_CONNECT on %p", pClient );
 #endif
 						if( !wError )
-							pClient->dwFlags |= CF_CONNECTED;
+							SetClientFlags( pClient, CF_CONNECTED );
 						else
 						{
 #if defined( LOG_NOTICES ) || defined( LOG_WRITE_NOTICES )
 							if( globalNetworkData.flags.bLogNotices )
 								lprintf( "Connect error: %d", wError );
 #endif
-							pClient->dwFlags |= CF_CONNECTERROR;
+							SetClientFlags( pClient, CF_CONNECTERROR );
 						}
 						if( !( pClient->dwFlags & CF_CONNECTERROR ) )
 						{
@@ -40890,7 +42634,7 @@ static void HandleEvent( PCLIENT pClient )
 							// with events, we get a FD_WRITE also... which calls tcpwrite.
 							//TCPWrite( pClient );
 						}
-						pClient->dwFlags &= ~CF_CONNECTING;
+						ClearClientFlags( pClient, CF_CONNECTING );
 						if( pClient->connect.ThisConnected )
 						{
 							if( !wError && !pClient->saSource ) {
@@ -40916,7 +42660,7 @@ static void HandleEvent( PCLIENT pClient )
 								lprintf( "Post connect to application %p  error:%d", pClient, wError );
 #endif
 							// have to allow SSL to clear this... so set it before calling the connect callback.
-							pClient->dwFlags |= CF_CONNECT_ISSUED;
+							SetClientFlags( pClient, CF_CONNECT_ISSUED );
 							if( pClient->dwFlags & CF_CPPCONNECT )
 								pClient->connect.CPPThisConnected( pClient->psvConnect, wError );
 							else
@@ -40928,11 +42672,12 @@ static void HandleEvent( PCLIENT pClient )
 						if( (pClient->dwFlags & ( CF_ACTIVE | CF_CONNECTED )) ==
 							( CF_ACTIVE | CF_CONNECTED ) )
 						{
-							if( pClient->read.ReadComplete )
+							if( pClient->read.ReadComplete ) {
 								if( pClient->dwFlags & CF_CPPREAD )
 									pClient->read.CPPReadComplete( pClient->psvRead, NULL, 0 );
 								else
 									pClient->read.ReadComplete( pClient, NULL, 0 );
+							}
 						}
 						if( pClient->pWaiting )
 							WakeThread( pClient->pWaiting );
@@ -40972,7 +42717,7 @@ static void HandleEvent( PCLIENT pClient )
 							//lprintf( "FD_READ on %p (finishpendingread)", pClient );
 							if( FinishPendingRead( pClient DBG_SRC ) == 0 )
 							{
-								pClient->dwFlags |= CF_READREADY;
+								SetClientFlags( pClient, CF_READREADY );
 							}
 							if( pClient->dwFlags & CF_TOCLOSE )
 							{
@@ -40999,6 +42744,47 @@ static void HandleEvent( PCLIENT pClient )
 						if( globalNetworkData.flags.bLogNotices )
 							lprintf( "FD_Write %p", pClient );
 #endif
+						if( ( pClient->dwFlags & CF_CONNECTING ) && !( pClient->dwFlags & ( CF_CONNECTED | CF_CONNECTERROR ) ) )
+						{
+							// FD_WRITE on a connecting socket means the connect
+							// completed; rarely (heavy socket churn) FD_CONNECT is
+							// never signaled - complete the connect from here so the
+							// socket doesn't sit CF_CONNECTING forever.
+							lprintf( "FD_WRITE is completing a connect that never received FD_CONNECT %p", pClient );
+							SetClientFlags( pClient, CF_CONNECTED );
+							ClearClientFlags( pClient, CF_CONNECTING );
+							if( !pClient->saSource ) {
+								int nLen = MAGIC_SOCKADDR_LENGTH;
+								pClient->saSource = AllocAddr();
+								if( getsockname( pClient->Socket, pClient->saSource, &nLen ) )
+									lprintf( "getsockname errno = %d", errno );
+								else
+									SET_SOCKADDR_LENGTH( pClient->saSource
+										, pClient->saSource->sa_family == AF_INET
+										? IN_SOCKADDR_LENGTH
+										: IN6_SOCKADDR_LENGTH );
+							}
+							if( pClient->connect.ThisConnected )
+							{
+								SetClientFlags( pClient, CF_CONNECT_ISSUED );
+								if( pClient->dwFlags & CF_CPPCONNECT )
+									pClient->connect.CPPThisConnected( pClient->psvConnect, 0 );
+								else
+									pClient->connect.ThisConnected( pClient, 0 );
+							}
+							// initial read kick, as the FD_CONNECT path would have done
+							if( ( pClient->dwFlags & ( CF_ACTIVE | CF_CONNECTED ) ) == ( CF_ACTIVE | CF_CONNECTED ) )
+							{
+								if( pClient->read.ReadComplete ) {
+									if( pClient->dwFlags & CF_CPPREAD )
+										pClient->read.CPPReadComplete( pClient->psvRead, NULL, 0 );
+									else
+										pClient->read.ReadComplete( pClient, NULL, 0 );
+								}
+							}
+							if( pClient->pWaiting )
+								WakeThread( pClient->pWaiting );
+						}
 						// returns true while it wrote or there is data to write
 						if( pClient->lpFirstPending && !pClient->flags.bAggregateOutput && !pClient->writeTimer ) {
 #if defined( LOG_NOTICES ) || defined( LOG_WRITE_NOTICES )
@@ -41006,12 +42792,12 @@ static void HandleEvent( PCLIENT pClient )
 #endif
 							TCPWrite(pClient);
 						} else {
-							pClient->dwFlags |= CF_WRITEREADY;
+							SetClientFlags( pClient, CF_WRITEREADY );
 						}
 						if( !pClient->lpFirstPending ) {
-							if( pClient->dwFlags & CF_TOCLOSE )
+							if( ( pClient->dwFlags & CF_TOCLOSE ) && !pClient->flags.bInUse )
 							{
-								pClient->dwFlags &= ~CF_TOCLOSE;
+								ClearClientFlags( pClient, CF_TOCLOSE );
 								//lprintf( "Pending read failed - and wants to close." );
 								EnterCriticalSec( &globalNetworkData.csNetwork );
 								// remote shutdown triggered this... and somehow this shouldn't be the same as a graceful close.
@@ -41019,6 +42805,9 @@ static void HandleEvent( PCLIENT pClient )
 								TerminateClosedClient( pClient );
 								LeaveCriticalSec( &globalNetworkData.csNetwork );
 							}
+							// else bInUse: the application holds work on this socket
+							// (AddNetWork); CF_TOCLOSE stays set and ClearNetWork
+							// performs the close when the work releases.
 						}
 						NetworkUnlock( pClient, 0 );
 #if defined( LOG_NOTICES ) || defined( LOG_WRITE_NOTICES )
@@ -41052,15 +42841,30 @@ static void HandleEvent( PCLIENT pClient )
 					if( globalNetworkData.flags.bLogNotices )
 						lprintf("FD_CLOSE... %p  %08x", pClient, pClient->dwFlags );
 #endif
-					if( pClient->dwFlags & CF_ACTIVE && !pClient->flags.bInUse )
 					{
-						// might already be cleared and gone..
-						EnterCriticalSec( &globalNetworkData.csNetwork );
-						InternalRemoveClientEx( pClient, FALSE, TRUE );
-						TerminateClosedClient( pClient );
-						LeaveCriticalSec( &globalNetworkData.csNetwork );
+						// the defer decision must not race ClearNetWork releasing the
+						// work, or both sides believe the other performs the close and
+						// the socket strands in CLOSE_WAIT.
+						LOGICAL deferred = FALSE;
+						lockNetWorkList();
+						if( ( pClient->dwFlags & CF_ACTIVE ) && pClient->flags.bInUse )
+						{
+							// application holds work on this socket; mark the close so
+							// ClearNetWork completes it when the work releases.
+							SetClientFlags( pClient, CF_TOCLOSE );
+							deferred = TRUE;
+						}
+						unlockNetWorkList();
+						if( !deferred && ( pClient->dwFlags & CF_ACTIVE ) )
+						{
+							// might already be cleared and gone..
+							EnterCriticalSec( &globalNetworkData.csNetwork );
+							InternalRemoveClientEx( pClient, FALSE, TRUE );
+							TerminateClosedClient( pClient );
+							LeaveCriticalSec( &globalNetworkData.csNetwork );
  // it's no longer closing.  (was set during the course of closure)
-						pClient->dwFlags &= ~CF_CLOSING;
+							ClearClientFlags( pClient, CF_CLOSING );
+						}
 					}
 					// section will be blank after termination...(correction, we keep the section state now)
 				}
@@ -41088,7 +42892,7 @@ static void HandleEvent( PCLIENT pClient )
 		else
 			lprintf( "Event enum failed... do what? close socket? %p %" _32f, pClient, dwError );
 	}
-	pClient->dwFlags &= ~CF_PROCESSING;
+	ClearClientFlags( pClient, CF_PROCESSING );
 }
 //----------------------------------------------------------------------------
 void RemoveThreadEvent( PCLIENT pc ) {
@@ -41150,6 +42954,15 @@ void RemoveThreadEvent( PCLIENT pc ) {
 		lprintf( "peer %p now has %d events", thread, thread->nEvents );
 #endif
 	}
+	// Same as the linux build: this bubble-sort mutates the peer chain that
+	// AddThreadEvent serializes with csPeerChain, and doing it unlocked lets a
+	// concurrent add corrupt the parent_peer links - a cycle makes this `while`
+	// never terminate, and RemoveThreadEvent runs from TerminateClosedClientEx with
+	// globalNetworkData.csNetwork HELD, so the whole process wedges behind it (on
+	// linux: one thread spinning here, 321 request threads stuck in
+	// GetFreeNetworkClientEx waiting for csNetwork).  Order is csNetwork ->
+	// csPeerChain; AddThreadEvent never takes csNetwork inside its region.
+	EnterCriticalSec( &globalNetworkData.csPeerChain );
   // don't bubble sort root thread
 	if( thread->parent_peer )
 		while( ( thread->nEvents < thread->parent_peer->nEvents ) && thread->parent_peer->parent_peer ) {
@@ -41165,6 +42978,7 @@ void RemoveThreadEvent( PCLIENT pc ) {
 			tmp->parent_peer = thread;
 			thread->child_peer = tmp;
 		}
+	LeaveCriticalSec( &globalNetworkData.csPeerChain );
 }
 // unused parameter broadcsat on windows; not needed.
 void AddThreadEvent( PCLIENT pc, int broadcsat )
@@ -41175,6 +42989,14 @@ void AddThreadEvent( PCLIENT pc, int broadcsat )
 	if( globalNetworkData.flags.bLogNotices )
 		lprintf( "Add thread event %p %p %08x", pc, pc->event, pc->dwFlags );
 #endif
+	// Same serialization as the linux build: the select-a-peer / create-a-peer
+	// sequence has to be atomic, not just the relink.  Two threads that both pick
+	// the same parent each call ThreadTo, and then BOTH new threads assign
+	// peer_thread->child_peer, corrupting the chain before the relink runs; and one
+	// thread's `peer->child_peer = NULL` below lands while the other sits between
+	// its spin and its own store.  NetworkThreadProc sets child_peer without taking
+	// any lock, so holding this across the spin cannot deadlock against it.
+	EnterCriticalSec( &globalNetworkData.csPeerChain );
 	for( ; peer; peer = peer->child_peer ) {
 		if( !peer->child_peer ) {
 #ifdef LOG_NOTICES
@@ -41236,13 +43058,14 @@ void AddThreadEvent( PCLIENT pc, int broadcsat )
 		else
 			peer = peer->child_peer;
 	}
+	LeaveCriticalSec( &globalNetworkData.csPeerChain );
 	// make sure to only add this handle when the first peer will also be added.
 	// this means the list can be 61 and at this time no more.
 	AddLink( &peer->monitor_list, pc );
 	AddDataItem( &peer->event_list, &pc->event );
 	pc->this_thread = peer;
 	pc->flags.bAddedToEvents = 1;
-	peer->nEvents++;
+	peer->nEvents = peer->nEvents + 1;
 #ifdef LOG_NETWORK_EVENT_THREAD
 	lprintf( "peer %p now has %d events", peer, peer->nEvents );
 #endif
@@ -41281,7 +43104,7 @@ int CPROC ProcessNetworkMessages( struct peer_thread_info *thread, uintptr_t qui
 		}
 		{
 			PCLIENT pc;
-			while( pc = (PCLIENT)DequeLink( &globalNetworkData.client_schedule ) )
+			while( ( pc = (PCLIENT)DequeLink( &globalNetworkData.client_schedule ) ) )
 			{
 				// use this for "added to schedule".  Closing removes from schedule.
 				if( !pc->flags.bAddedToEvents )
@@ -41450,6 +43273,32 @@ SACK_NETWORK_NAMESPACE_END
 //*******************8
 #endif
 SACK_NETWORK_NAMESPACE
+#ifdef DEBUG_PEER_ASSIGN
+// ---- peer-assignment map (temporary probe) --------------------------------
+// One buffered line per accepted socket saying which peer thread owns it, plus
+// a periodic snapshot of every peer's epoll counters.  Buffered to a plain file
+// (not stderr, which is unbuffered and would put a write() on the accept path);
+// flushed every DBG_PEERMAP_SNAP records so a kill -9 loses at most that many.
+// also the flush interval - a kill -9 loses at most this many ADD records
+#  define DBG_PEERMAP_SNAP 128
+static FILE *dbg_peermap;
+static volatile uint32_t dbg_peermapOrder;
+static void dbg_peermapOpen( void ) {
+	const char *fn = getenv( "SACK_PEERMAP" );
+	if( !fn ) fn = "/tmp/chunk-lock-smoke/peermap.log";
+	dbg_peermap = fopen( fn, "w" );
+	if( dbg_peermap ) setvbuf( dbg_peermap, NULL, _IOFBF, 1 << 20 );
+}
+// snapshot the whole peer chain; caller must hold csPeerChain.
+static void dbg_peermapSnapshot( uint32_t order ) {
+	struct peer_thread_info *p;
+	int idx = 0;
+	for( p = globalNetworkData.root_thread; p; p = p->child_peer, idx++ )
+		fprintf( dbg_peermap, "PEER at=%u idx=%d peer=%p epfd=%d nEvents=%u adds=%u waits=%u events=%u\n"
+		       , order, idx, (void*)p, p->epoll_fd, p->nEvents, p->dbgAdds, p->dbgWaits, p->dbgEvents );
+	fflush( dbg_peermap );
+}
+#endif
 void RemoveThreadEvent( PCLIENT pc ) {
 	struct peer_thread_info *thread = pc->this_thread;
 	// could be closed (accept, initial read, protocol causes close before ever completing getting scheduled)
@@ -41481,6 +43330,16 @@ void RemoveThreadEvent( PCLIENT pc ) {
 #    ifdef LOG_NETWORK_EVENT_THREAD
 	lprintf( "peer %p now has %d events", thread, thread->nEvents );
 #    endif
+	// This bubble-sort mutates the SAME peer chain that AddThreadEvent serializes
+	// with csPeerChain, and used to do it unlocked - so a concurrent add could
+	// corrupt the parent_peer links and leave a cycle, and then this `while` never
+	// terminates.  That wedges the whole process, because RemoveThreadEvent is
+	// called from TerminateClosedClientEx with globalNetworkData.csNetwork HELD:
+	// observed as one thread spinning here while 321 request threads sat in
+	// GetFreeNetworkClientEx waiting for csNetwork.
+	// Lock order is csNetwork -> csPeerChain; AddThreadEvent never takes csNetwork
+	// inside its csPeerChain region, so there is no inversion.
+	EnterCriticalSec( &globalNetworkData.csPeerChain );
 	// don't bubble sort root thread
 	if( thread->parent_peer )
 		while( (thread->nEvents < thread->parent_peer->nEvents) && thread->parent_peer->parent_peer ) {
@@ -41496,11 +43355,9 @@ void RemoveThreadEvent( PCLIENT pc ) {
 			tmp->parent_peer = thread;
 			thread->child_peer = tmp;
 		}
+	LeaveCriticalSec( &globalNetworkData.csPeerChain );
 }
-struct event_data {
-	PCLIENT pc;
-	int broadcast;
-};
+// struct event_data now lives in netstruc.h, carried inline by the PCLIENT.
 void AddThreadEvent( PCLIENT pc, int broadcast )
 {
 	struct peer_thread_info *peer = globalNetworkData.root_thread;
@@ -41514,12 +43371,26 @@ void AddThreadEvent( PCLIENT pc, int broadcast )
 		lprintf( "Add thread event %p %d %08x  %s", pc, broadcast?pc->SocketBroadcast:pc->Socket, pc->dwFlags, broadcast?"broadcast":"direct" );
 #endif
 	if( !broadcast ) {
+		// The whole select-a-peer / create-a-peer sequence has to be serialized, not
+		// just the relink at the end.  Two threads that both decide to add a peer to
+		// the same parent each call ThreadTo, and then BOTH new threads assign
+		// peer_thread->child_peer, so the chain is already corrupt before the relink
+		// runs - and one thread's `peer->child_peer = NULL` below lands while the
+		// other is between its spin and its own store, which is the observed NULL
+		// dereference.  The new NetworkThreadProc sets child_peer without taking any
+		// lock (network.c, and it only touches csNetwork on exit), so holding this
+		// across the spin cannot deadlock against the thread being waited for.
+		EnterCriticalSec( &globalNetworkData.csPeerChain );
 		for( ; peer; peer = peer->child_peer ) {
 			if( !peer->child_peer ) {
 #ifdef LOG_NOTICES
 				if( globalNetworkData.flags.bLogNotices )
 					lprintf( "On last peer..." );
 #endif
+				// NOTE (debugging aid): temporarily changing this to `peer->nEvents > 0`
+				// spreads one socket per peer thread, which makes the close-path races
+				// reproduce roughly 3 runs in 4 instead of 1 in 26.  Useful for verifying
+				// a fix; not a behaviour change to ship.
 				if( peer->nEvents > globalNetworkData.nPeers ) {
 #ifdef LOG_NOTICES
 					if( globalNetworkData.flags.bLogNotices )
@@ -41575,6 +43446,12 @@ void AddThreadEvent( PCLIENT pc, int broadcast )
 			else
 				peer = peer->child_peer;
 		}
+#ifdef DEBUG_PEER_ASSIGN
+		if( !dbg_peermap ) dbg_peermapOpen();
+		if( dbg_peermap && !( dbg_peermapOrder % DBG_PEERMAP_SNAP ) )
+			dbg_peermapSnapshot( dbg_peermapOrder );
+#endif
+		LeaveCriticalSec( &globalNetworkData.csPeerChain );
 	} else {
  // add broadcast to the same event as the original.
 		peer = pc->this_thread;
@@ -41586,7 +43463,8 @@ void AddThreadEvent( PCLIENT pc, int broadcast )
 	{
 		int r;
 		struct epoll_event ev;
-		ev.data.ptr = New( struct event_data );
+		// the client carries its own event_data; nothing to allocate or release.
+		ev.data.ptr = &pc->epoll_event_data[broadcast?1:0];
 		((struct event_data*)ev.data.ptr)->pc = pc;
 		((struct event_data*)ev.data.ptr)->broadcast = broadcast;
 		if( pc->dwFlags & CF_LISTEN )
@@ -41610,6 +43488,17 @@ void AddThreadEvent( PCLIENT pc, int broadcast )
 		pc->this_thread = peer;
 		pc->flags.bAddedToEvents = 1;
 	}
+#ifdef DEBUG_PEER_ASSIGN
+	if( dbg_peermap && !broadcast && !( pc->dwFlags & CF_LISTEN ) ) {
+		// sin_port sits at the same offset in sockaddr_in and sockaddr_in6.
+		uint16_t port = pc->saClient ? ntohs( ((struct sockaddr_in*)pc->saClient)->sin_port ) : 0;
+		uint32_t order = LockedIncrement( &dbg_peermapOrder );
+		LockedIncrement( &peer->dbgAdds );
+		fprintf( dbg_peermap, "ADD n=%u port=%u sock=%d pc=%p peer=%p epfd=%d nEvents=%u\n"
+		       , order, port, pc->Socket, (void*)pc, (void*)pc->this_thread
+		       , pc->this_thread->epoll_fd, pc->this_thread->nEvents );
+	}
+#endif
 #ifdef LOG_NETWORK_EVENT_THREAD
 	lprintf( "peer %p now has %d events", peer, peer->nEvents );
 #endif
@@ -41649,6 +43538,12 @@ int CPROC ProcessNetworkMessages( struct peer_thread_info *thread, uintptr_t non
 		{
 			int closed;
 			int n;
+#ifdef DEBUG_PEER_ASSIGN
+			// only this peer's own thread writes these; read-then-store keeps
+			// C++20 from warning about a compound assignment on a volatile.
+			thread->dbgWaits = thread->dbgWaits + 1;
+			thread->dbgEvents = thread->dbgEvents + cnt;
+#endif
 			struct event_data *event_data;
 			THREAD_ID prior = 0;
 			PCLIENT next;
@@ -41673,9 +43568,17 @@ int CPROC ProcessNetworkMessages( struct peer_thread_info *thread, uintptr_t non
 					//lprintf( "This should sleep forever..." );
 					return 1;
 				}
+#  ifdef DEBUG_CLIENT_LOCK_TRACE
+				// Every delivery for this client, before any handler decision.
+				sack_dbg_traceClient( event_data->pc, CLTRACE_EVIN, 0
+				                    , (uint32_t)events[n].events DBG_SRC );
+#  endif
 				if( events[n].events & EPOLLIN )
 				{
 					int locked;
+#  ifdef DEBUG_LOCK_SPIN_GIVEUP
+					int spins = 0;
+#  endif
 					locked = 1;
 					// ------- Large complicated lock ---------------
 					while( !NetworkLock( event_data->pc, 1 ) ) {
@@ -41684,12 +43587,33 @@ int CPROC ProcessNetworkMessages( struct peer_thread_info *thread, uintptr_t non
 							lprintf( "failed lock dwFlags : %8x", event_data->pc->dwFlags );
 #  endif
 							locked = 0;
+#  ifdef DEBUG_CLIENT_LOCK_TRACE
+							// These two bails record nothing otherwise, so a declined
+							// event is indistinguishable from one that never arrived.
+							sack_dbg_traceClient( event_data->pc, CLTRACE_EVSKIP, 0
+							                    , (uint32_t)event_data->pc->dwFlags DBG_SRC );
+#  endif
 							break;
 						}
 						if( event_data->pc->dwFlags & CF_AVAILABLE ) {
 							locked = 0;
+#  ifdef DEBUG_CLIENT_LOCK_TRACE
+							sack_dbg_traceClient( event_data->pc, CLTRACE_EVSKIP, 0
+							                    , (uint32_t)event_data->pc->dwFlags DBG_SRC );
+#  endif
 							break;
 						}
+#  ifdef DEBUG_LOCK_SPIN_GIVEUP
+						// DEBUG PROBE: this spin IS the hang.  Give up rather than
+						// yielding forever (which pegs every core and hides the state)
+						// and dump the client's whole lock history - the unbalanced
+						// acquire for this lifetime is somewhere in it.
+						if( ++spins > 3 ) {
+							sack_dbg_dumpClientLockTrace( event_data->pc, "spin-giveup" );
+							locked = 0;
+							break;
+						}
+#  endif
 						Relinquish();
 					}
 					// ------- End Large complicated lock ---------------
@@ -41726,7 +43650,7 @@ int CPROC ProcessNetworkMessages( struct peer_thread_info *thread, uintptr_t non
 						LeaveCriticalSec( &globalNetworkData.csNetwork );
 						// section will be blank after termination...(correction, we keep the section state now)
  // it's no longer closing.  (was set during the course of closure)
-						pClient->dwFlags &= ~CF_CLOSING;
+						ClearClientFlags( pClient, CF_CLOSING );
 					} else if( !(event_data->pc->dwFlags & (CF_ACTIVE) ) ) {
 						lprintf( "Event on socket no longer active..." );
 						// change to inactive status by the time we got here...
@@ -41747,27 +43671,26 @@ int CPROC ProcessNetworkMessages( struct peer_thread_info *thread, uintptr_t non
 						//lprintf( "UDP READ" );
 						FinishUDPRead( event_data->pc, event_data->broadcast );
 					}
-#if 0 && !DrainSupportDeprecated
-					else if( event_data->pc->bDraining )
-					{
-#ifdef LOG_NOTICES
-						if( globalNetworkData.flags.bLogNotices )
-							lprintf( "TCP Drain Event..." );
-#endif
-						TCPDrainRead( event_data->pc );
-					}
-#endif
-					else if( event_data->pc->dwFlags & CF_READPENDING )
+					else if( ( event_data->pc->dwFlags & CF_READPENDING )
+					       || ( events[n].events & ( EPOLLRDHUP | EPOLLHUP ) ) )
 					{
 						size_t read;
 #ifdef LOG_NOTICES
 						if( globalNetworkData.flags.bLogNotices )
 							lprintf( "TCP Read Event... %p", event_data->pc );
 #endif
-						// packet oriented things may probably be reading only
-						// partial messages at a time...
-						read = FinishPendingRead( event_data->pc DBG_SRC );
-						//lprintf( "FinishPendingRead return %d", read );
+						if( event_data->pc->dwFlags & CF_READPENDING ) {
+							// packet oriented things may probably be reading only
+							// partial messages at a time...
+							read = FinishPendingRead( event_data->pc DBG_SRC );
+							//lprintf( "FinishPendingRead return %d", read );
+						} else {
+							// EPOLLET delivered the peer hangup (EPOLLRDHUP/EPOLLHUP) but no read
+							// was queued to consume it; the edge is never re-signaled, so the FIN
+							// is lost and the socket strands in CLOSE_WAIT.  Drive the close here.
+							SetClientFlags( event_data->pc, CF_TOCLOSE );
+							read = ( !event_data->pc->lpFirstPending ) ? (size_t)-1 : 0;
+						}
 						if( ( read == -1 ) && ( event_data->pc->dwFlags & CF_TOCLOSE ) && !event_data->pc->flags.bInUse )
 						{
 							int locked;
@@ -41875,7 +43798,7 @@ int CPROC ProcessNetworkMessages( struct peer_thread_info *thread, uintptr_t non
 							}
 						}
 						else if( !event_data->pc->RecvPending.s.bStream )
-							event_data->pc->dwFlags |= CF_READREADY;
+							SetClientFlags( event_data->pc, CF_READREADY );
 					}
 					else
 					{
@@ -41883,7 +43806,7 @@ int CPROC ProcessNetworkMessages( struct peer_thread_info *thread, uintptr_t non
 						if( globalNetworkData.flags.bLogNotices )
 							lprintf( "TCP Set read ready..." );
 #endif
-						event_data->pc->dwFlags |= CF_READREADY;
+						SetClientFlags( event_data->pc, CF_READREADY );
 					}
 					if( locked )
 						NetworkUnlock( event_data->pc, 1 );
@@ -41923,8 +43846,8 @@ int CPROC ProcessNetworkMessages( struct peer_thread_info *thread, uintptr_t non
 							//if( globalNetworkData.flags.bLogNotices )
 								lprintf( "Connected!" );
 #endif
-							event_data->pc->dwFlags |= CF_CONNECTED;
-							event_data->pc->dwFlags &= ~CF_CONNECTING;
+							SetClientFlags( event_data->pc, CF_CONNECTED );
+							ClearClientFlags( event_data->pc, CF_CONNECTING );
 							{
 #ifdef __LINUX__
 								socklen_t
@@ -41965,10 +43888,10 @@ int CPROC ProcessNetworkMessages( struct peer_thread_info *thread, uintptr_t non
 									WakeThread( event_data->pc->pWaiting );
 								}
 								if( error ) {
-									event_data->pc->dwFlags |= CF_CONNECTERROR;
+									SetClientFlags( event_data->pc, CF_CONNECTERROR );
 								}
 								// have to allow SSL to clear this... so set it before calling the connect callback.
-								event_data->pc->dwFlags |= CF_CONNECT_ISSUED;
+								SetClientFlags( event_data->pc, CF_CONNECT_ISSUED );
 								if( event_data->pc->dwFlags & CF_CPPCONNECT ) {
 									if( event_data->pc->connect.CPPThisConnected )
 										event_data->pc->connect.CPPThisConnected( event_data->pc->psvConnect, error );
@@ -41999,21 +43922,25 @@ int CPROC ProcessNetworkMessages( struct peer_thread_info *thread, uintptr_t non
 											&&( !pc->flags.bAggregateOutput
 											|| !pc->writeTimer ) ) {
 										//lprintf( "Data was pending on a connecting socket, try sending it now" );
+										NetworkLock( event_data->pc, 1 );
 										TCPWrite( pc );
+										NetworkUnlock( event_data->pc, 1 );
 									} else {
 										//lprintf( "No data pending on a connecting socket; setting write ready" );
-										pc->dwFlags |= CF_WRITEREADY;
+										SetClientFlags( pc, CF_WRITEREADY );
 									}
 									if( !pc->lpFirstPending ) {
-										if( pc->dwFlags & CF_TOCLOSE )
+										if( ( pc->dwFlags & CF_TOCLOSE ) && !pc->flags.bInUse )
 										{
-											pc->dwFlags &= ~CF_TOCLOSE;
+											ClearClientFlags( pc, CF_TOCLOSE );
 											lprintf( "Pending write completed - and wants to close. %s", NetworkExpandFlags( pc ) );
 											EnterCriticalSec( &globalNetworkData.csNetwork );
 											InternalRemoveClientEx( pc, FALSE, TRUE );
 											TerminateClosedClient( pc );
 											LeaveCriticalSec( &globalNetworkData.csNetwork );
 										}
+										// else bInUse: application work outstanding; CF_TOCLOSE
+										// stays set and ClearNetWork closes when released.
 									}
 								}
 							}
@@ -42037,7 +43964,26 @@ int CPROC ProcessNetworkMessages( struct peer_thread_info *thread, uintptr_t non
 									// this is the normal large packet auto write....
 									TCPWrite( pc );
 								}else {
-									pc->dwFlags |= CF_WRITEREADY;
+									SetClientFlags( pc, CF_WRITEREADY );
+								}
+								// the response that deferred a close (peer already sent
+								// FIN, so we owe the close) may have just drained here;
+								// ClearNetWork could not close it while data was still
+								// pending.  Complete the close now, or the socket sits
+								// in CLOSE_WAIT forever.  (The connecting branch above
+								// has the same check; the normal write path was missing
+								// it - only Windows FD_WRITE had it.)  Falls through to
+								// the shared channel-0 unlock below, as that branch does.
+								if( !pc->lpFirstPending
+										&& ( pc->dwFlags & CF_TOCLOSE )
+										&& !pc->flags.bInUse )
+								{
+									ClearClientFlags( pc, CF_TOCLOSE );
+									//lprintf( "Pending write completed - and wants to close. %s", NetworkExpandFlags( pc ) );
+									EnterCriticalSec( &globalNetworkData.csNetwork );
+									InternalRemoveClientEx( pc, FALSE, TRUE );
+									TerminateClosedClient( pc );
+									LeaveCriticalSec( &globalNetworkData.csNetwork );
 								}
 							} else {
 								//lprintf( "Write but lock wasn't enabled? (set WOU)" );
@@ -42106,14 +44052,18 @@ SACK_NETWORK_NAMESPACE_END
 //#define DO_LOGGING // override no _DEBUG def to do loggings...
 //#define NO_LOGGING // force neverlog....
 #ifdef __LINUX__
+#  ifndef __MAC__
 #include <asm/types.h>
-#  ifdef __cplusplus
+#    ifdef __cplusplus
 extern "C" {
-#  endif
+#    endif
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
-#  ifdef __cplusplus
+// keep the extern "C" close inside __ifndef __MAC__ - the netlink headers it
+// wraps are not included on macOS, so the matching brace must be skipped too.
+#    ifdef __cplusplus
 }
+#    endif
 #  endif
 #endif
 //for GetMacAddress
@@ -42126,6 +44076,13 @@ extern "C" {
 #define EPOLL_CLOEXEC 0
 #endif
 #ifdef __MAC__
+// BSD routing-socket interfaces used to read the ARP/NDP neighbour cache
+// (the macOS equivalent of linux netlink RTM_GETNEIGH).
+#include <sys/sysctl.h>
+#include <net/route.h>
+#include <net/if_dl.h>
+#include <net/if_types.h>
+#include <netinet/if_ether.h>
 #else
 #endif
 //*******************8
@@ -42165,10 +44122,32 @@ static struct mac_data {
 	PTREEROOT pbtAddresses;
 	PMACADDRESSNODESET addressNodePool;
 } mac_data;
+// guards pbtAddresses, the MACADDRESSNODE pool, and cached node hw fields
+// against concurrent access from MacThread (netlink) and lookup callers.
+// Never held across a sleep; nesting would be safe (sack critical sections
+// are owner-reentrant) but none of the call paths nest it.
+static CRITICALSECTION macLock;
+// serializes networkAddressBufferSet; see the note at its declaration below
+static CRITICALSECTION csAddressPool;
+PRELOAD( InitMacAddressLock ) {
+	// windows requires explicit initialization; linux/mac accept the zeroed static
+	InitializeCriticalSec( &macLock );
+	InitializeCriticalSec( &csAddressPool );
+}
 typedef uint8_t NETWORK_ADDRESS_BUFFER[MAGIC_SOCKADDR_LENGTH + 2 * sizeof( uintptr_t )];
 #define MAXNETWORK_ADDRESS_BUFFERSPERSET 256
 DeclareSet( NETWORK_ADDRESS_BUFFER );
 static PNETWORK_ADDRESS_BUFFERSET networkAddressBufferSet;
+/* SETs are not thread safe - sets.c contains no locking at all, yet it walks and
+   mutates a shared chain of set blocks (next/nBias/used bitmask) and allocates new
+   ones.  This pool is hit by AllocAddr on every address created and ReleaseAddress
+   on every address freed, concurrently from every network thread AND every request
+   thread, so the free list gets corrupted: blocks handed out twice, or a release
+   walking into a neighbouring block.  Observed as ClearClient -> ReleaseAddress
+   freeing a block that was actually an HTTP PTEXT segment (proved with the release
+   trace ring), i.e. the pointers were fine and the pool was not.  Serialize just
+   this pool; nothing is called while holding it, so it cannot invert with the
+   network locks (csAddressPool, declared above with macLock). */
 //----------------------------------------------------------------------------
 #if !defined( __MAC__ ) && !defined( __EMSCRIPTEN__ )
 #  define INCLUDE_MAC_SUPPORT
@@ -42176,8 +44155,10 @@ static PNETWORK_ADDRESS_BUFFERSET networkAddressBufferSet;
 static void deleteAddress( CPOINTER node, uintptr_t a )
 {
 	struct addressNode *an = (struct addressNode*)node;
+	// ReleaseAddress already returns the buffer to networkAddressBufferSet;
+	// the node itself goes back to the address node pool.
 	ReleaseAddress( an->remote );
-	DeleteFromSet( NETWORK_ADDRESS_BUFFER, networkAddressBufferSet, (uintptr_t)an->remote );
+	DeleteFromSet( MACADDRESSNODE, mac_data.addressNodePool, an );
 }
 static int compareAddress( uintptr_t a, uintptr_t b )
 {
@@ -42209,8 +44190,9 @@ static int compareAddress( uintptr_t a, uintptr_t b )
 static void setupInterfaces( void ) {
 	PMIB_IF_TABLE2 if_table;
 	MIB_IPNET_ROW2 row;
+	EnterCriticalSec( &macLock );
  // already did this work.
-	if( mac_data.addresses ) return;
+	if( mac_data.addresses ) { LeaveCriticalSec( &macLock ); return; }
 	MemSet( &row.InterfaceLuid, 0, sizeof( row.InterfaceLuid ) );
 	GetIfTable2( &if_table );
 	int ifCount = 0;
@@ -42303,6 +44285,7 @@ static void setupInterfaces( void ) {
 	}
 	FreeMibTable( if_table );
 	FreeMibTable( uip_table );
+	LeaveCriticalSec( &macLock );
 }
 #endif
 #ifdef __LINUX__
@@ -42317,8 +44300,46 @@ static void LogMacAddress( struct addressNode *newAddress ){
 #endif
 static void setupInterfaces() {
 	struct ifconf ifc;
+	EnterCriticalSec( &macLock );
  // already did this work.
-	if( mac_data.ifbuf[0] ) return;
+	if( mac_data.ifbuf[0] ) { LeaveCriticalSec( &macLock ); return; }
+#ifdef __MAC__
+		// BSD SIOCGIFCONF returns variable-length records and provides neither
+		// SIOCGIFINDEX nor SIOCGIFHWADDR, so build the interface name/index/
+		// hardware-address table from getifaddrs() AF_LINK entries instead -
+		// sockaddr_dl carries both the interface index and the link address.
+		{
+			struct ifaddrs *link_ifa;
+			struct ifaddrs *cur;
+			const int maxif = (int)( sizeof( mac_data.ifbuf ) / sizeof( struct ifreq ) );
+			struct ifreq *IFR = (struct ifreq*)mac_data.ifbuf;
+			int count = 0;
+			getifaddrs( &link_ifa );
+			for( cur = link_ifa; cur && count < maxif; cur = cur->ifa_next )
+				if( cur->ifa_addr && cur->ifa_addr->sa_family == AF_LINK )
+					count++;
+			mac_data.interfaceCount = count;
+			mac_data.ifIndexes = NewArray( int, count );
+			mac_data.hwaddrs = NewArray( hwaddr_bytes, count );
+			{
+				int i = 0;
+				for( cur = link_ifa; cur && i < count; cur = cur->ifa_next ) {
+					struct sockaddr_dl *sdl;
+					if( !cur->ifa_addr || cur->ifa_addr->sa_family != AF_LINK )
+						continue;
+					sdl = (struct sockaddr_dl*)cur->ifa_addr;
+					StrCpyEx( IFR[i].ifr_name, cur->ifa_name, sizeof( IFR[i].ifr_name ) );
+					mac_data.ifIndexes[i] = sdl->sdl_index ? (int)sdl->sdl_index
+					                                       : (int)if_nametoindex( cur->ifa_name );
+					memset( mac_data.hwaddrs[i], 0, 6 );
+					if( sdl->sdl_alen == 6 )
+						memcpy( mac_data.hwaddrs[i], LLADDR( sdl ), 6 );
+					i++;
+				}
+			}
+			freeifaddrs( link_ifa );
+		}
+#else
 		ifc.ifc_len = sizeof( mac_data.ifbuf );
 		ifc.ifc_buf = mac_data.ifbuf;
 //pc->Socket;
@@ -42336,7 +44357,7 @@ static void setupInterfaces() {
 			{
 				//LogBinary( (const uint8_t*)IFR, sizeof( *IFR));
 				struct ifreq ifr;
-				strcpy( ifr.ifr_name, IFR->ifr_name );
+				StrCpyEx( ifr.ifr_name, IFR->ifr_name, sizeof( ifr.ifr_name ) );
 				if (ioctl(sock_handle, SIOCGIFINDEX, &ifr) == 0) {
 					mac_data.ifIndexes[i] = ifr.ifr_ifindex;
 				}else {
@@ -42361,12 +44382,15 @@ static void setupInterfaces() {
 			}
 		}
 		close( sock_handle );
+#endif
 		{
 			struct ifaddrs *ifa;
 			struct ifaddrs *current_ifa;
 			getifaddrs( &ifa);
 			int addressCount = 0;
 			for( current_ifa = ifa; current_ifa; current_ifa = current_ifa->ifa_next ) {
+ // some interfaces (e.g. utun on macOS) have no address.
+				if( !current_ifa->ifa_addr ) continue;
 				if( current_ifa->ifa_addr->sa_family != AF_INET
  // don't care about non IP addresses.
 				   && current_ifa->ifa_addr->sa_family != AF_INET6 ) continue;
@@ -42380,6 +44404,8 @@ static void setupInterfaces() {
 			addressCount = 0;
 			for( current_ifa = ifa; current_ifa; current_ifa = current_ifa->ifa_next ) {
 				//if( current_ifa->ifa_addr->sa_family == AF_PACKET ) continue; // don't care about packet addresses.
+ // some interfaces (e.g. utun on macOS) have no address.
+				if( !current_ifa->ifa_addr ) continue;
 				if( current_ifa->ifa_addr->sa_family != AF_INET
  // don't care about non IP addresses.
 				   && current_ifa->ifa_addr->sa_family != AF_INET6 ) continue;
@@ -42467,7 +44493,12 @@ static void setupInterfaces() {
 			}
 		}
 #endif
+		LeaveCriticalSec( &macLock );
 }
+#ifndef __MAC__
+// The neighbour cache is streamed over a netlink socket on linux; macOS reads
+// it synchronously via sysctl (see ReadNeighborTable below), so none of this
+// background-thread machinery is built there.
 PTHREAD macThread;
 int macThreadEnd =0;
 PLIST macWaiters;
@@ -42477,9 +44508,33 @@ ATEXIT( CloseMacThread ){
 	macThreadEnd = TRUE;
 	WakeThread( macThread );
 }
+static int rtnetlink_socket = -1;
+static int rtnetlink_seq = 0;
+static uint64_t last_request;
+static void RequestNeighborDump( void ) {
+	if (rtnetlink_socket < 0) return;
+	uint64_t now = timeGetTime64();
+	// a dump is already pending or just completed within the holdoff; the
+	// in-flight snapshot serves this request too.  (NLMSG_DONE clears
+	// last_request so a fresh request can go out immediately after.)
+	if( last_request && ( now < last_request ) )
+		return;
+	last_request = now + 250;
+	struct {
+		struct nlmsghdr nlh;
+		struct ndmsg ndm;
+	} req;
+	memset( &req, 0, sizeof( req ) );
+	req.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(struct ndmsg));
+	req.nlh.nlmsg_type = RTM_GETNEIGH;
+	req.nlh.nlmsg_flags = NLM_F_DUMP | NLM_F_REQUEST;
+	req.nlh.nlmsg_seq = ++rtnetlink_seq;
+	req.ndm.ndm_family = 0;
+	send( rtnetlink_socket, (struct msghdr*)&req, sizeof(req), 0 );
+}
 static uintptr_t MacThread( PTHREAD thread ) {
 	int stat;
-	int rtnetlink_socket = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE);
+	rtnetlink_socket = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE);
 	if( rtnetlink_socket < 0 )
 	{
 		threadFailed = 1;
@@ -42510,23 +44565,21 @@ static uintptr_t MacThread( PTHREAD thread ) {
 		lprintf( "Unable to bind netlink socket %s", strerror( errno ) );
 		return 0;
 	}
-	int seq;
-	struct {
-	struct nlmsghdr nlh;
-	struct ndmsg ndm;
-	char buf[256];
-	} req;
-	req.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(struct ndmsg));
-	req.nlh.nlmsg_type = RTM_GETNEIGH;
-	req.nlh.nlmsg_flags = NLM_F_DUMP | NLM_F_REQUEST;
-	req.nlh.nlmsg_seq =  ++seq;
-	req.ndm.ndm_family = 0;
-	send( rtnetlink_socket, (struct msghdr*)&req, sizeof(req), 0);
+	{
+		// absorb dump/event bursts; overflow shows up as ENOBUFS with
+		// silently dropped messages (capped by net.core.rmem_max)
+		int rcvbuf = 1024 * 1024;
+		setsockopt( rtnetlink_socket, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof( rcvbuf ) );
+	}
+	RequestNeighborDump();
 	while( !macThreadEnd ) {
 		//sendmsg( rtnetlink_socket, (struct msghdr*)&req, 0);
 		ssize_t rstat;
-		static uint8_t buf[8192];
+		// dump datagrams on modern kernels can exceed 8K; a short buffer
+		// truncates the batch and silently drops the tail entries
+		static uint8_t buf[32768];
 		int loop = 1;
+		int gotDone = 0;
 		do {
 /*MSG_DONTWAIT*/
 			rstat = recv( rtnetlink_socket, buf, sizeof(buf), 0 );
@@ -42534,8 +44587,13 @@ static uintptr_t MacThread( PTHREAD thread ) {
 				if( errno == EAGAIN || errno == EWOULDBLOCK ) {
 					//lprintf( "No data available" );
 					Relinquish();
+				} else if( errno == ENOBUFS ) {
+					// kernel dropped messages while we were busy; the stream
+					// has gaps (possibly a dump tail) - force a fresh dump
+					last_request = 0;
+					RequestNeighborDump();
 				} else{
-					lprintf( "Error: %s", strerror( errno ) );
+					lprintf( "netlink recv error: %d %s", errno, strerror( errno ) );
 					loop = 0;
 				}
 			}
@@ -42561,11 +44619,66 @@ static uintptr_t MacThread( PTHREAD thread ) {
 					//lprintf( "message:%d", res->nl.nlmsg_type );
 					switch( res->nl.nlmsg_type ) {
 						case NLMSG_DONE:
-							// end of dump; should send information here.
+ // dump complete; allow the next request
+							last_request = 0;
+      // wake waiters - the snapshot is applied
+							gotDone = 1;
 							break;
-						case RTM_DELNEIGH:
-							// should probably delete the entry in the tree here...
+						case RTM_DELNEIGH: {
+							// kernel dropped this neighbor; drop the cached entry too.
+							uint8_t addrbuf[MAGIC_SOCKADDR_LENGTH + 2 * sizeof( uintptr_t )];
+							memset( addrbuf, 0, sizeof( addrbuf ) );
+							((uintptr_t*)addrbuf)[0] = 3;
+							((uintptr_t*)addrbuf)[1] = 0;
+							SOCKADDR *sa = (SOCKADDR*)(addrbuf + sizeof(uintptr_t) * 2);
+							sa->sa_family = res->rt.ndm_family;
+							size_t attLen = res->nl.nlmsg_len - sizeof( *res );
+							size_t attOfs = priorLen + sizeof( *res );
+							LOGICAL destFound = FALSE;
+							while( attLen >= sizeof( struct rtattr ) ) {
+								struct rtattr *attr = (struct rtattr*)(buf+attOfs);
+								if( attr->rta_len < sizeof( struct rtattr ) )
+									break;
+								if( attr->rta_type == NDA_DST ) {
+									destFound = TRUE;
+									if( res->rt.ndm_family == AF_INET ) {
+										((uint32_t*)(sa->sa_data+2))[0] = ((uint32_t*)(attr+1))[0];
+										SET_SOCKADDR_LENGTH( sa, IN_SOCKADDR_LENGTH );
+									} else {
+										((uint64_t*)(sa->sa_data+6))[0] = ((uint64_t*)(attr+1))[0];
+										((uint64_t*)(sa->sa_data+6))[1] = ((uint64_t*)(attr+1))[1];
+										SET_SOCKADDR_LENGTH( sa, IN6_SOCKADDR_LENGTH );
+									}
+									break;
+								}
+								if( RTA_ALIGN( attr->rta_len ) >= attLen )
+									break;
+								attOfs += RTA_ALIGN( attr->rta_len );
+								attLen -= RTA_ALIGN( attr->rta_len );
+							}
+							if( destFound ) {
+								struct addressNode *gone;
+								EnterCriticalSec( &macLock );
+								gone = (struct addressNode *)FindInBinaryTree( mac_data.pbtAddresses, (uintptr_t)sa );
+								if( gone ) {
+									int isLocal = 0;
+									// never remove the interface self-entries; the
+									// subnet tables hold raw pointers to them
+									for( int i = 0; i < mac_data.addressCount; i++ )
+										if( mac_data.addresses[i] == gone ) { isLocal = 1; break; }
+									if( !isLocal ) {
+#ifdef DEBUG_MAC_ADDRESS_LOOKUP
+										DumpAddr( "Neighbor deleted", sa );
+#endif
+										// safe now: the AVL remove-path bugs are fixed and
+										// covered by test_remove_binary
+										RemoveBinaryNode( mac_data.pbtAddresses, (POINTER)gone, (uintptr_t)sa );
+									}
+								}
+								LeaveCriticalSec( &macLock );
+							}
 							break;
+						}
 						case RTM_NEWNEIGH:
 							//LogBinary( (uint8_t*)(res), res->nl.nlmsg_len );
 							/*
@@ -42579,6 +44692,10 @@ static uintptr_t MacThread( PTHREAD thread ) {
 							// state == NUD_INCOMPLETE, NUD_REACHABLE, NUD_STALE, NUD_DELAY, NUD_PROBE, NUD_FAILED, NUD_NORARP,NUD_PERMANENT
 							// flags == NTF_PROXY, NTF_ROUTER
 							//
+							if( res->rt.ndm_state & (NUD_INCOMPLETE|NUD_FAILED) )
+ // no lladdr yet/ever; a later NEWNEIGH will carry it
+								break;
+							EnterCriticalSec( &macLock );
 							{
 								uint8_t addrbuf[MAGIC_SOCKADDR_LENGTH + 2 * sizeof( uintptr_t )];
 								memset( addrbuf, 0, MAGIC_SOCKADDR_LENGTH + 2 * sizeof( uintptr_t ) );
@@ -42592,6 +44709,10 @@ static uintptr_t MacThread( PTHREAD thread ) {
 								sa->sa_data[0] = 0;
 								sa->sa_data[1] = 0;
 								newAddress.remote = sa;
+								// stack struct; don't let a missed ifindex or attribute
+								// leave garbage in the hardware address fields
+								memset( newAddress.localHw, 0, 6 );
+								memset( newAddress.remoteHw, 0, 6 );
 								for( int i = 0; i < mac_data.interfaceCount; i++ ) {
 									if( mac_data.ifIndexes[i] == res->rt.ndm_ifindex ) {
 										memcpy( newAddress.localHw, mac_data.hwaddrs[i], 6);
@@ -42604,9 +44725,10 @@ static uintptr_t MacThread( PTHREAD thread ) {
 									size_t attLen = res->nl.nlmsg_len-sizeof( *res);
 									size_t attOfs = priorLen + sizeof( *res );
 									destFound = linkFound = FALSE;
+									struct addressNode *existing = NULL;
 									do {
 										struct rtattr *attr = (struct rtattr*)(buf+attOfs);
-										if( !attr->rta_len )
+										if( attr->rta_len < sizeof( struct rtattr ) )
 											break;
 #ifdef DEBUG_MAC_ADDRESS_LOOKUP
 										lprintf( "Attr:%d %d %d", attLen, attr->rta_len, attr->rta_type );
@@ -42627,7 +44749,7 @@ static uintptr_t MacThread( PTHREAD thread ) {
 													SET_SOCKADDR_LENGTH( sa, IN6_SOCKADDR_LENGTH );
 												}
 												//LogMacAddress( &newAddress );
-												if( FindInBinaryTree( mac_data.pbtAddresses, (uintptr_t)sa ) ) {
+												if( existing = (struct addressNode *)FindInBinaryTree( mac_data.pbtAddresses, (uintptr_t)sa ) ) {
 													duplicated = TRUE;
 #ifdef DEBUG_MAC_ADDRESS_LOOKUP
 													DumpAddr( "Duplicate address notification", sa );
@@ -42653,8 +44775,10 @@ static uintptr_t MacThread( PTHREAD thread ) {
 												memcpy( newAddress.remoteHw, (attr+1), 6 );
 												break;
 											case NDA_PROBES: {
+#ifdef DEBUG_MAC_ADDRESS_LOOKUP
 												uint32_t *probes = (uint32_t*)(attr+1);
-												lprintf( "Probes: %d %d %d", probes[0], probes[1], probes[2] );
+												lprintf( "Probes: %d", probes[0] );
+#endif
 												break;
 											}
 											case NDA_CACHEINFO:{
@@ -42665,25 +44789,38 @@ static uintptr_t MacThread( PTHREAD thread ) {
 												break;
 											}
 											default:
+#ifdef DEBUG_MAC_ADDRESS_LOOKUP
+												// proper RTA_ALIGN stepping now reaches trailing
+												// attributes (NDA_FLAGS_EXT etc.); they're benign
 												lprintf( "Unknown attribute type: %d", attr->rta_type );
+#endif
 												break;
 										}
-										attOfs += attr->rta_len;
-										attLen -= attr->rta_len;
-									} while( !duplicated && attLen );
-									if( !linkFound || !destFound || duplicated ) {
-//#ifdef DEBUG_MAC_ADDRESS_LOOKUP
-										if( !duplicated )
-											if( !linkFound || !destFound )
-												lprintf( "Network Address was incomplete: %s %s", linkFound?"":"Link Address", destFound?"":"Destination Address" );
-//#endif
+										if( RTA_ALIGN( attr->rta_len ) >= attLen )
+											break;
+										attOfs += RTA_ALIGN( attr->rta_len );
+										attLen -= RTA_ALIGN( attr->rta_len );
+ // keep parsing past duplicates; LLADDR follows DST
+									} while( 1 );
+									if( !linkFound || !destFound ) {
+										// no MAC in this message (e.g. NUD_NOARP entries);
+										// never overwrite a cached entry from one of these
+#ifdef DEBUG_MAC_ADDRESS_LOOKUP
+										lprintf( "Network Address was incomplete: %s %s", linkFound?"":"Link Address", destFound?"":"Destination Address" );
+#endif
+										LeaveCriticalSec( &macLock );
 										break;
 									}
-#ifdef DEBUG_MAC_ADDRESS_LOOKUP
-									else {
-										lprintf( "duplicated wasn't found?");
+									if( duplicated ) {
+										// known IP seen again (dumps repeat every entry, and
+										// hardware can change) - refresh in place; the tree
+										// key (the address) is untouched
+										memcpy( existing->remoteHw, newAddress.remoteHw, 6 );
+										memcpy( existing->localHw,  newAddress.localHw,  6 );
+										gotDone = 1;
+										LeaveCriticalSec( &macLock );
+										break;
 									}
-#endif
 #ifdef DEBUG_MAC_ADDRESS_LOOKUP
 									LogMacAddress( &newAddress );
 #endif
@@ -42697,11 +44834,15 @@ static uintptr_t MacThread( PTHREAD thread ) {
 										LogMacAddress( storeAddress );
 #endif
 										ReleaseAddress( storeAddress->remote );
-										Deallocate( struct addressNode *, storeAddress );
+										DeleteFromSet( MACADDRESSNODE, mac_data.addressNodePool, storeAddress );
 									}
+									else
+ // tree changed; wake waiters
+										gotDone = 1;
 									//LogBinary( (uint8_t*)(buf+attOfs), res->nl.nlmsg_len-attOfs );
 								}
 							}
+							LeaveCriticalSec( &macLock );
 							break;
 						default:
 							lprintf( "Default message: type:%d len:%d flg:%d pid:%d seq:%d", res->nl.nlmsg_type, res->nl.nlmsg_len
@@ -42713,39 +44854,139 @@ static uintptr_t MacThread( PTHREAD thread ) {
 				}
 				//LogBinary( buf, rstat );
 			}
+			if (gotDone)
 			{
 				INDEX idx;
 				PTHREAD waiter;
 				macTableUpdated = TRUE;
-				LIST_FORALL( macWaiters, idx, PTHREAD, waiter ) {
-					WakeThread( waiter );
+				LIST_FORALL(macWaiters, idx, PTHREAD, waiter) {
+					WakeThread(waiter);
 				}
+				gotDone = 0;
 			}
 		} while( loop );
 	}
 	close( rtnetlink_socket );
 	return 0;
 }
+ // !__MAC__
+#endif
+#ifdef __MAC__
+// macOS/BSD equivalent of the linux netlink neighbour dump: read the kernel
+// ARP (AF_INET) / NDP (AF_INET6) caches with sysctl(NET_RT_FLAGS) and pull the
+// link-layer address out of the sockaddr_dl gateway of each entry.  This is the
+// same data `arp -a` / `ndp -a` report.
+#define NEIGHBOR_ROUNDUP(a) ((a) > 0 ? ( 1 + ( ( (a) - 1 ) | ( sizeof( uint32_t ) - 1 ) ) ) : sizeof( uint32_t ))
+static void ReadNeighborFamily( int family ) {
+	int mib[6] = { CTL_NET, PF_ROUTE, 0, family, NET_RT_FLAGS, RTF_LLINFO };
+	size_t needed = 0;
+	char *buf, *next, *lim;
+	if( sysctl( mib, 6, NULL, &needed, NULL, 0 ) < 0 || !needed )
+		return;
+	buf = NewArray( char, needed );
+	if( sysctl( mib, 6, buf, &needed, NULL, 0 ) < 0 ) {
+		Deallocate( char*, buf );
+		return;
+	}
+	lim = buf + needed;
+	for( next = buf; next < lim; next += ((struct rt_msghdr*)next)->rtm_msglen ) {
+		struct rt_msghdr *rtm = (struct rt_msghdr*)next;
+                              // RTA_DST
+		struct sockaddr *sa = (struct sockaddr*)( rtm + 1 );
+ // RTA_GATEWAY
+		struct sockaddr_dl *sdl = (struct sockaddr_dl*)( (char*)sa + NEIGHBOR_ROUNDUP( sa->sa_len ) );
+		uint8_t addrbuf[MAGIC_SOCKADDR_LENGTH + 2 * sizeof( uintptr_t )];
+		SOCKADDR *key;
+		struct addressNode *node;
+		int i;
+		if( rtm->rtm_msglen == 0 )
+ // guard against a malformed record causing an infinite loop
+			break;
+		if( sdl->sdl_family != AF_LINK || sdl->sdl_alen != 6 )
+ // incomplete entry - link-layer address not (yet) resolved
+			continue;
+		// build a tree key in the same layout setupInterfaces()/compareAddress use.
+		memset( addrbuf, 0, sizeof( addrbuf ) );
+		((uintptr_t*)addrbuf)[0] = 3;
+		((uintptr_t*)addrbuf)[1] = 0;
+		key = (SOCKADDR*)( addrbuf + sizeof( uintptr_t ) * 2 );
+		key->sa_family = (uint16_t)family;
+		key->sa_data[0] = 0;
+		key->sa_data[1] = 0;
+		// Read the address bytes straight out of sa_data (offset 2 = IPv4 addr,
+		// offset 6 = IPv6 addr) to match the rest of this file and avoid the
+		// Windows-compat s_addr/s6_addr32 member macros.
+		if( family == AF_INET ) {
+			((uint32_t*)(key->sa_data+2))[0] = ((uint32_t*)(sa->sa_data+2))[0];
+			SET_SOCKADDR_LENGTH( key, IN_SOCKADDR_LENGTH );
+		} else {
+			((uint64_t*)(key->sa_data+6))[0] = ((uint64_t*)(sa->sa_data+6))[0];
+			((uint64_t*)(key->sa_data+6))[1] = ((uint64_t*)(sa->sa_data+6))[1];
+			SET_SOCKADDR_LENGTH( key, IN6_SOCKADDR_LENGTH );
+		}
+		EnterCriticalSec( &macLock );
+		if( FindInBinaryTree( mac_data.pbtAddresses, (uintptr_t)key ) ) {
+			LeaveCriticalSec( &macLock );
+ // already cached
+			continue;
+		}
+		node = GetFromSet( MACADDRESSNODE, &mac_data.addressNodePool );
+		node->remote = DuplicateAddress( key );
+		memcpy( node->remoteHw, LLADDR( sdl ), 6 );
+		memset( node->localHw, 0, 6 );
+		for( i = 0; i < mac_data.interfaceCount; i++ )
+			if( mac_data.ifIndexes[i] == (int)sdl->sdl_index ) {
+				memcpy( node->localHw, mac_data.hwaddrs[i], 6 );
+				break;
+			}
+		if( !AddBinaryNode( mac_data.pbtAddresses, (CPOINTER)node, (uintptr_t)node->remote ) ) {
+			ReleaseAddress( node->remote );
+			DeleteFromSet( MACADDRESSNODE, mac_data.addressNodePool, node );
+		}
+		LeaveCriticalSec( &macLock );
+	}
+	Deallocate( char*, buf );
+}
+static void ReadNeighborTable( void ) {
+ // needed for the ifindex -> local hardware address mapping
+	setupInterfaces();
+	ReadNeighborFamily( AF_INET );
+	ReadNeighborFamily( AF_INET6 );
+}
+ // __MAC__
+#endif
+ // __LINUX__
 #endif
 NETWORK_PROC( int, GetMacAddress)(PCLIENT pc, uint8_t* bufLocal, size_t *bufLocalLen
 //int get_mac_addr (char *device, unsigned char *buffer)
                                  , uint8_t *bufRemote, size_t* bufRemoteLen )
 {
+#if defined( __LINUX__ )
+	// only the linux netlink path retries
+	int retryCount = 0;
+#endif
+	struct addressNode *newAddress = NULL;
 	if( pc->dwFlags & CF_AVAILABLE )
 		return FALSE;
+	EnterCriticalSec( &macLock );
 	if( !mac_data.pbtAddresses )
 		mac_data.pbtAddresses = CreateBinaryTreeExx( BT_OPT_NODUPLICATES, compareAddress, deleteAddress );
+	LeaveCriticalSec( &macLock );
 	SOCKADDR *saDup = DuplicateAddress_6to4( pc->saClient );
 	// clear Port for later...
 	saDup->sa_data[0] = 0;
 	saDup->sa_data[1] = 0;
-#ifdef __LINUX__
+	// default result: unresolved = zero MACs; success paths overwrite.
+	memset( bufLocal, 0, 6 );  (*bufLocalLen) = 6;
+	memset( bufRemote, 0, 6 ); (*bufRemoteLen) = 6;
+#if defined( __LINUX__ ) && !defined( __MAC__ )
 retry:
 	macTableUpdated = FALSE;
 #endif
 #ifdef DEBUG_MAC_ADDRESS_LOOKUP
-	DumpAddr( "Find address in tree", saDup );
+	DumpAddr("Find address in tree", saDup);
 #endif
+	EnterCriticalSec( &macLock );
 	struct addressNode *oldAddress = (struct addressNode *)FindInBinaryTree( mac_data.pbtAddresses, (uintptr_t)saDup );
 #ifdef DEBUG_MAC_ADDRESS_LOOKUP
 	lprintf( "FindinBinaryTree: %p", oldAddress );
@@ -42753,12 +44994,13 @@ retry:
 	if( oldAddress )
 	{
 		MemCpy( bufLocal, oldAddress->localHw, 6 );
-		(*bufLocalLen) = 6;
 		MemCpy( bufRemote, oldAddress->remoteHw, 6 );
-		(*bufRemoteLen) = 6;
+		if( newAddress ) DeleteFromSet( MACADDRESSNODE, mac_data.addressNodePool, newAddress );
+		LeaveCriticalSec( &macLock );
 		ReleaseAddress( saDup );
 		return TRUE;
 	}
+	LeaveCriticalSec( &macLock );
 	if( ( saDup->sa_family == AF_INET6
 	     && ( ( MemCmp( saDup->sa_data+6, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16 ) == 0 )
 		     || ( MemCmp( saDup->sa_data+6, "\0\0\0\0\0\0\0\0\0\0\xff\xff\x7f\0\0\x1", 16 ) == 0 )
@@ -42767,21 +45009,23 @@ retry:
 	     && MemCmp( saDup->sa_data+2, "\x7f\0\0\x01", 4 ) == 0 ) )
 	{
 		// localhost
-		memset( bufLocal, 0, 6 );
-		(*bufLocalLen) = 6;
-		memset( bufRemote, 0, 6 );
-		(*bufRemoteLen) = 6;
 		ReleaseAddress( saDup );
 		return TRUE;
 	}
 	setupInterfaces();
-#ifdef __LINUX__
+#if defined( __LINUX__ ) && !defined( __MAC__ )
 	if( !macThread ) macThread = ThreadTo( MacThread, 0 );
 #endif
 	int addr;
+	if( !newAddress ) {
+		EnterCriticalSec( &macLock );
 //  (struct addressNode*)AllocateEx( sizeof( struct addressNode ) DBG_SRC );
-	struct addressNode *newAddress = GetFromSet( MACADDRESSNODE, &mac_data.addressNodePool );
-	newAddress->remote = saDup;
+		newAddress = GetFromSet( MACADDRESSNODE, &mac_data.addressNodePool );
+		LeaveCriticalSec( &macLock );
+		memset( newAddress->localHw, 0, 6 );
+		memset( newAddress->remoteHw, 0, 6 );
+		newAddress->remote = saDup;
+	}
 	for( addr = 0; addr < mac_data.addressCount; addr++ ) {
 		if( mac_data.addresses[addr] && saDup->sa_family == mac_data.addresses[addr]->remote->sa_family ) {
 			if( saDup->sa_family == AF_INET ) {
@@ -42816,8 +45060,8 @@ retry:
 					break;
 				}
 			} else {
-				if( ((uint64_t*)(saDup->sa_data+6))[0] == ((uint64_t*)(mac_data.addresses[local_addr]->remote->sa_data+6))[0]
-				  && ((uint64_t*)(saDup->sa_data+6))[1] == ((uint64_t*)(mac_data.addresses[local_addr]->remote->sa_data+6))[1] ) {
+				if( ((uint64_t*)(saSource->sa_data+6))[0] == ((uint64_t*)(mac_data.addresses[local_addr]->remote->sa_data+6))[0]
+				  && ((uint64_t*)(saSource->sa_data+6))[1] == ((uint64_t*)(mac_data.addresses[local_addr]->remote->sa_data+6))[1] ) {
 					MemCpy( bufLocal, mac_data.hwaddrs[mac_data.addr_ifIndexes[local_addr]], 6 );
 					(*bufLocalLen) = 6;
 					break;
@@ -42827,34 +45071,80 @@ retry:
 	}
 	ReleaseAddress( saSource );
 	MemCpy( newAddress->localHw, bufLocal, 6 );
-	if( addr == mac_data.addressCount ) {
-		//lprintf( "No matching address mask found... maybe just fake add this entry for the future?" );
-		memset( newAddress->remoteHw, 0, 6 );
-		(*bufRemoteLen) = 6;
+#if !defined( __LINUX__ ) || defined( __MAC__ )
+	// Off-subnet peer (or the interface snapshot missed it): the OS resolver
+	// can't produce a MAC, so record zeros permanently.  On netlink linux the
+	// kernel neighbor table is authoritative - fall through and let it decide;
+	// the subnet tables there only feed bufLocal.
+	if( addr == mac_data.addressCount || local_addr == mac_data.addressCount ) {
 		// keep this remote address for future checks...
+		EnterCriticalSec( &macLock );
 		AddBinaryNode( mac_data.pbtAddresses, (CPOINTER)newAddress, (uintptr_t)newAddress->remote );
-		memset( bufRemote, 0, 6 );
-		(*bufRemoteLen) = 6;
+		LeaveCriticalSec( &macLock );
 		return TRUE;
 	}
-#ifdef __LINUX__
-	AddLink( &macWaiters, MakeThread() );
-	uint64_t waitTime = timeGetTime64() + 500;
-	while( !macTableUpdated && !threadFailed ) {
-		// guess I should check to see if it is even possible to resolve with netmask...
-		WakeableSleep( 500 );
+#endif
+#if defined( __MAC__ )
+	// Refresh the BSD ARP/NDP neighbour cache into the shared tree, then look up
+	// the requested peer.  The kernel holds an entry once the address has been
+	// resolved (which it is for any active connection) - the same precondition
+	// the linux netlink dump and Windows ResolveIpNetEntry2 rely on.
+	ReadNeighborTable();
+	{
+		struct addressNode *found;
+		EnterCriticalSec( &macLock );
+		found = (struct addressNode *)FindInBinaryTree( mac_data.pbtAddresses, (uintptr_t)saDup );
+		if( found ) {
+			MemCpy( bufLocal, found->localHw, 6 );
+			(*bufLocalLen) = 6;
+			MemCpy( bufRemote, found->remoteHw, 6 );
+			(*bufRemoteLen) = 6;
+			DeleteFromSet( MACADDRESSNODE, mac_data.addressNodePool, newAddress );
+			LeaveCriticalSec( &macLock );
+			ReleaseAddress( saDup );
+			return TRUE;
+		}
+		// Not in the neighbour cache yet (unresolved); report none and let the
+		// caller retry later once traffic has populated the cache.
+		DeleteFromSet( MACADDRESSNODE, mac_data.addressNodePool, newAddress );
+		LeaveCriticalSec( &macLock );
 	}
-	if( threadFailed || ( timeGetTime64() > waitTime ) ) {
-		//lprintf( "Timeout waiting for mac address" );
+	ReleaseAddress( saDup );
+	return FALSE;
+#elif defined( __LINUX__ )
+	{
+		PTHREAD thread = MakeThread();
+		AddLink( &macWaiters, thread );
+		RequestNeighborDump();
+		uint64_t waitTime = timeGetTime64() + 500;
+		while( !macTableUpdated && !( threadFailed || ( timeGetTime64() > waitTime ) ) ) {
+			WakeableSleep( 500 );
+		}
+		DeleteLink( &macWaiters, thread );
+	}
+	// the table changed - re-check the tree (bounded; a busy LAN generates
+	// endless neighbor events, so don't chase updates forever)
+	if( macTableUpdated && !threadFailed && ( retryCount++ < 3 ) )
+		goto retry;
+	// The kernel doesn't know this peer (off-subnet, or its entry expired).
+	// Cache the zeros so lookups don't stall 500ms every call; a later
+	// RTM_NEWNEIGH updates this entry in place if the address ever resolves,
+	// and RTM_DELNEIGH cleans it up.
+	EnterCriticalSec( &macLock );
+	if( !AddBinaryNode( mac_data.pbtAddresses, (CPOINTER)newAddress, (uintptr_t)newAddress->remote ) ) {
+		// raced with the netlink thread adding this address; use its entry
+		struct addressNode *raced = (struct addressNode *)FindInBinaryTree( mac_data.pbtAddresses, (uintptr_t)saDup );
+		if( raced ) {
+			MemCpy( bufLocal, raced->localHw, 6 );
+			MemCpy( bufRemote, raced->remoteHw, 6 );
+		}
+		DeleteFromSet( MACADDRESSNODE, mac_data.addressNodePool, newAddress );
+		LeaveCriticalSec( &macLock );
 		ReleaseAddress( saDup );
-		memset( bufLocal, 0, 6 );
-		(*bufLocalLen) = 6;
-		memset( bufRemote, 0, 6 );
-		(*bufRemoteLen) = 6;
 		return TRUE;
 	}
-	goto retry;
-	return 0;
+	LeaveCriticalSec( &macLock );
+	return TRUE;
 #endif
 #  ifdef WIN32
 	HRESULT hr;
@@ -42863,25 +45153,30 @@ retry:
 	row.Address = *((SOCKADDR_INET*)saDup);
 	row.InterfaceIndex = mac_data.ifIndexes[mac_data.addr_ifIndexes[local_addr]];
 	hr = ResolveIpNetEntry2( &row, (SOCKADDR_INET*)GetNetworkLong( pc, GNL_LOCAL_ADDRESS) );
-	lprintf( "hr=%d", hr );
+	//lprintf( "hr=%d", hr );
 	if( hr == S_OK ) {
-		MemCpy( newAddress->remoteHw, row.PhysicalAddress, row.PhysicalAddressLength );
+		int sz = (int)( row.PhysicalAddressLength<6?row.PhysicalAddressLength:6 );
+		MemCpy( newAddress->remoteHw, row.PhysicalAddress, sz );
+		EnterCriticalSec( &macLock );
 		AddBinaryNode( mac_data.pbtAddresses, (CPOINTER)newAddress, (uintptr_t)newAddress->remote );
-		MemCpy( bufRemote, row.PhysicalAddress, row.PhysicalAddressLength );
-		(*bufRemoteLen) = row.PhysicalAddressLength;
-		lprintf( "Resolve addr: %d  %d", local_addr, hr );
+		LeaveCriticalSec( &macLock );
+		MemCpy( bufRemote, row.PhysicalAddress, sz );
+		(*bufRemoteLen) = sz;
+#ifdef DEBUG_MAC_ADDRESS_LOOKUP
+		// resolved in-time...
+		lprintf( "Resolved addr (RIT): %d  %d", local_addr, hr );
+#endif
 		return TRUE;
-	} else {
-		ReleaseAddress( saDup);
-		memset( bufRemote, 0, 6 );
-		(*bufRemote) = 0;
-		return FALSE;
 	}
+	EnterCriticalSec( &macLock );
+	DeleteFromSet( MACADDRESSNODE, mac_data.addressNodePool, newAddress );
+	LeaveCriticalSec( &macLock );
+	ReleaseAddress( saDup);
 	return FALSE;
 #  endif
 }
 //int get_mac_addr (char *device, unsigned char *buffer)
-NETWORK_PROC( PLIST, GetMacAddresses)( void )
+NETWORK_PROC( PNVLIST, GetMacAddresses)( void )
 {
 	PLIST list = NULL;
 	setupInterfaces();
@@ -42964,19 +45259,22 @@ const char * GetAddrName( SOCKADDR *addr )
 	if( !tmp )
 	{
 		const char *buf = GetAddrString( addr );
-		((char**)addr)[-1] = strdup( buf );
+		((char**)addr)[-1] = StrDup( buf );
 	}
 	return ((char**)addr)[-1];
 }
 void SetAddrName( SOCKADDR *addr, const char *name )
 {
-	((uintptr_t*)addr)[-1] = (uintptr_t)strdup( name );
+	((uintptr_t*)addr)[-1] = (uintptr_t)StrDup( name );
 }
 //---------------------------------------------------------------------------
 SOCKADDR *AllocAddrEx( DBG_VOIDPASS )
 {
+	SOCKADDR *lpsaAddr;
+	EnterCriticalSec( &csAddressPool );
 //(SOCKADDR*)AllocateEx( MAGIC_SOCKADDR_LENGTH + 2 * sizeof( uintptr_t ) DBG_RELAY );
-	SOCKADDR *lpsaAddr=(SOCKADDR*)GetFromSet( NETWORK_ADDRESS_BUFFER, &networkAddressBufferSet );
+	lpsaAddr = (SOCKADDR*)GetFromSet( NETWORK_ADDRESS_BUFFER, &networkAddressBufferSet );
+	LeaveCriticalSec( &csAddressPool );
 #ifdef DEBUG_ADDRESSES
 	lprintf( "New Length: %d", MAGIC_SOCKADDR_LENGTH);
 #endif
@@ -43029,19 +45327,24 @@ SOCKADDR* DuplicateAddress_6to4_Ex( SOCKADDR *pAddr DBG_PASS )
 		if( memcmp( &((struct sockaddr_in6 *)pAddr)->sin6_addr, "\0\0\0\0\0\0\0\0\0\0\xff\xff", 12 ) == 0 ) {
 			// convert to ipv4
 			((SOCKADDR_IN*)dup)->sin_family = AF_INET;
-#ifdef __LINUX__
+#if defined( __MAC__ )
+			// __LINUX__ is also defined on macOS, whose struct in6_addr has no
+			// s6_addr32 member; read the mapped IPv4 (last 4 bytes) via the
+			// portable s6_addr byte array instead.
+			((SOCKADDR_IN*)dup)->sin_addr.S_un.S_addr = ((uint32_t*)(((struct sockaddr_in6 *)pAddr)->sin6_addr.s6_addr))[3];
+#elif defined( __LINUX__ )
 			((SOCKADDR_IN*)dup)->sin_addr.S_un.S_addr = ((struct sockaddr_in6 *)pAddr)->sin6_addr.s6_addr32[3];
 #else
 			((SOCKADDR_IN*)dup)->sin_addr.S_un.S_addr = ((struct sockaddr_in6 *)pAddr)->sin6_addr.s6_words[6] | ( ((struct sockaddr_in6 *)pAddr)->sin6_addr.s6_words[7] << 16);
 #endif
 			((SOCKADDR_IN*)dup)->sin_port = ((SOCKADDR_IN*)pAddr)->sin_port;
-			SOCKADDR_NAME( dup ) = strdup( GetAddrName( pAddr ) );
+			SOCKADDR_NAME( dup ) = StrDup( GetAddrName( pAddr ) );
 			SET_SOCKADDR_LENGTH( dup, IN_SOCKADDR_LENGTH );
 		}
 	}
 	if( ((char**)( ( (uintptr_t)pAddr ) - sizeof(char*) ))[0] )
 		( (char**)( ( (uintptr_t)dup ) - sizeof( char* ) ) )[0]
-				= strdup( ((char**)( ( (uintptr_t)pAddr ) - sizeof( char* ) ))[0] );
+				= StrDup( ((char**)( ( (uintptr_t)pAddr ) - sizeof( char* ) ))[0] );
 	return dup;
 }
 //----------------------------------------------------------------------------
@@ -43058,7 +45361,7 @@ SOCKADDR* DuplicateAddressEx( SOCKADDR *pAddr DBG_PASS )
 	MemCpy( tmp2, tmp, SOCKADDR_LENGTH( pAddr ) + 2*sizeof(uintptr_t) );
 	if( ((char**)( ( (uintptr_t)pAddr ) - sizeof(char*) ))[0] )
 		( (char**)( ( (uintptr_t)dup ) - sizeof( char* ) ) )[0]
-				= strdup( ((char**)( ( (uintptr_t)pAddr ) - sizeof( char* ) ))[0] );
+				= StrDup( ((char**)( ( (uintptr_t)pAddr ) - sizeof( char* ) ))[0] );
 	//lprintf( "original:");
 	//LogBinary( (const uint8_t*)tmp, MAGIC_SOCKADDR_LENGTH + 2*sizeof(uintptr_t) );
 	//lprintf( "duplicate:");
@@ -43242,40 +45545,62 @@ SOCKADDR *CreateRemoteV2( CTEXTSTR lpName, uint16_t nHisPort, enum NetworkAddres
 				      , phe->h_length);
 			}
 #  else
+			// getaddrinfo instead of gethostbyname2: the latter returns a pointer to
+			// static per-process storage, so concurrent resolvers overwrite each
+			// other's hostent and the copy below reads a replaced h_addr/h_length.
+			// That crashed inside libc under the async http client, which spawns a
+			// request thread per call and resolves from all of them at once.
+			// getaddrinfo is thread safe and hands back a caller-owned list (freed
+			// with freeaddrinfo), so no lock is needed - which also means genuinely
+			// slow DNS for distinct hosts still runs in parallel.  This is what the
+			// WIN32 branch of this same function already does.
 			int found = 0;
-			int try_again;
-			do {
-				try_again = 0;
-				if( !( flags & NETWORK_ADDRESS_FLAG_PREFER_V4 )
-				    && ( phe = gethostbyname2( lpName, AF_INET6 ) ) ) {
-					found = 1;
-					SET_SOCKADDR_LENGTH( lpsaAddr, IN6_SOCKADDR_LENGTH );
-         // InetAddress Type.
-					lpsaAddr->sin_family = AF_INET6;
-					//lprintf( "This copy:%d", phe->h_length );
-           // save IP address from host entry.
-					memcpy( ( (struct sockaddr_in6*)lpsaAddr )->sin6_addr.s6_addr
-						, phe->h_addr
-						, phe->h_length );
-				}
-				if( !found
-				    && !( flags & NETWORK_ADDRESS_FLAG_PREFER_V6 )
-				    && ( phe = gethostbyname2( lpName, AF_INET ) ) ) {
-					found = 1;
-					//lprintf( "Strange, gethostbyname failed, but AF_INET worked... %s", tmp );
-					SET_SOCKADDR_LENGTH( lpsaAddr, IN_SOCKADDR_LENGTH );
-					lpsaAddr->sin_family = AF_INET;
-           // save IP address from host entry.
-					memcpy( &lpsaAddr->sin_addr.S_un.S_addr
-						, phe->h_addr
-						, phe->h_length );
+			{
+				struct addrinfo hints;
+				struct addrinfo *result = NULL;
+				struct addrinfo *ai;
+				int families[2];
+				int nFamilies;
+				int n;
+				// preserve the previous preference order exactly:
+				//   PREFER_V4   -> v4, then fall back to v6
+				//   PREFER_V6   -> v6 only (the old loop never fell back to v4)
+				//   PREFER_NONE -> v6, then v4
+				if( flags & NETWORK_ADDRESS_FLAG_PREFER_V4 ) {
+					families[0] = AF_INET; families[1] = AF_INET6; nFamilies = 2;
+				} else if( flags & NETWORK_ADDRESS_FLAG_PREFER_V6 ) {
+					families[0] = AF_INET6; nFamilies = 1;
 				} else {
-					if( flags & NETWORK_ADDRESS_FLAG_PREFER_V4 ) {
-						flags = NETWORK_ADDRESS_FLAG_PREFER_V6;
-						try_again = 1;
-					}
+					families[0] = AF_INET6; families[1] = AF_INET; nFamilies = 2;
 				}
-			} while( try_again && !found );
+				MemSet( &hints, 0, sizeof( hints ) );
+				hints.ai_family = AF_UNSPEC;
+				hints.ai_socktype = SOCK_STREAM;
+				if( getaddrinfo( lpName, NULL, &hints, &result ) == 0 ) {
+					for( n = 0; n < nFamilies && !found; n++ ) {
+						for( ai = result; ai; ai = ai->ai_next ) {
+							if( ai->ai_family != families[n] ) continue;
+							if( families[n] == AF_INET6 ) {
+								SET_SOCKADDR_LENGTH( lpsaAddr, IN6_SOCKADDR_LENGTH );
+         // InetAddress Type.
+								lpsaAddr->sin_family = AF_INET6;
+								memcpy( ( (struct sockaddr_in6*)lpsaAddr )->sin6_addr.s6_addr
+									, &( (struct sockaddr_in6*)ai->ai_addr )->sin6_addr
+									, sizeof( struct in6_addr ) );
+							} else {
+								SET_SOCKADDR_LENGTH( lpsaAddr, IN_SOCKADDR_LENGTH );
+								lpsaAddr->sin_family = AF_INET;
+								memcpy( &lpsaAddr->sin_addr.S_un.S_addr
+									, &( (struct sockaddr_in*)ai->ai_addr )->sin_addr
+									, sizeof( struct in_addr ) );
+							}
+							found = 1;
+							break;
+						}
+					}
+					freeaddrinfo( result );
+				}
+			}
 			if( !found )
 			{
 				// could not find the name in the host file.
@@ -43537,7 +45862,7 @@ LOGICAL CompareAddress( SOCKADDR *sa1, SOCKADDR *sa2 )
 	return CompareAddressEx( sa1, sa2, SA_COMPARE_FULL );
 }
 //----------------------------------------------------------------------------
-PLIST GetLocalAddresses( void )
+PNVLIST GetLocalAddresses( void )
 {
 	return globalNetworkData.addresses;
 }
@@ -43690,9 +46015,10 @@ void ReleaseAddress(SOCKADDR *lpsaAddr)
 	// sockaddr is often skewed from what I would expect it. (contains its own length)
 	if( lpsaAddr )
 	{
-		/* strdup is used for the addr part so use free instead of release */
-		free( ((POINTER*)( ( (uintptr_t)lpsaAddr ) - sizeof(uintptr_t) ))[0] );
+		ReleaseEx( ((POINTER*)( ( (uintptr_t)lpsaAddr ) - sizeof(uintptr_t) ))[0] DBG_SRC );
+		EnterCriticalSec( &csAddressPool );
 		DeleteFromSet( NETWORK_ADDRESS_BUFFER, &networkAddressBufferSet, (POINTER)( ( (uintptr_t)lpsaAddr ) - 2 * sizeof(uintptr_t) ));
+		LeaveCriticalSec( &csAddressPool );
 		//Deallocate(POINTER, (POINTER)( ( (uintptr_t)lpsaAddr ) - 2 * sizeof(uintptr_t) ));
 	}
 }
@@ -43914,7 +46240,7 @@ void LoadNetworkAddresses( void ) {
 void LoadNetworkAddresses( void ) {
 	// Declare and initialize variables
 	PIP_INTERFACE_INFO pInfo;
-	pInfo = (IP_INTERFACE_INFO *) malloc( sizeof(IP_INTERFACE_INFO) );
+	pInfo = New( IP_INTERFACE_INFO );
 	DWORD dwRetVal = 0;
 	PIP_ADAPTER_INFO pAdapterInfo;
 	PIP_ADAPTER_INFO pAdapter = NULL;
@@ -43922,7 +46248,7 @@ void LoadNetworkAddresses( void ) {
 	pAdapterInfo = New(IP_ADAPTER_INFO);
 	if (pAdapterInfo == NULL) {
 		lprintf("Error allocating memory needed to call GetAdaptersinfo\n");
-		free( pInfo );
+		ReleaseEx( pInfo DBG_SRC );
 		return;
 	}
 	// Make an initial call to GetAdaptersInfo to get
@@ -43932,7 +46258,7 @@ void LoadNetworkAddresses( void ) {
 		pAdapterInfo = (IP_ADAPTER_INFO *) NewArray(uint8_t, ulOutBufLen);
 		if (pAdapterInfo == NULL) {
 			lprintf("Error allocating memory needed to call GetAdaptersinfo\n");
-			free( pInfo );
+			ReleaseEx( pInfo DBG_SRC );
 			return;
 		}
 	}
@@ -44017,6 +46343,7 @@ SACK_NETWORK_NAMESPACE_END
 #    undef s_addr
 #  endif
  // IPPROTO_TCP
+     // Unix socket struct sockaddr_un
 //#include <linux/in.h>  // IPPROTO_TCP
  // TCP_NODELAY
 #  include <netinet/tcp.h>
@@ -44057,6 +46384,28 @@ static inline void scheduleSocket( PCLIENT pc, struct peer_thread_info *this_thr
 	if( this_thread == globalNetworkData.root_thread ) {
 		ProcessNetworkMessages( this_thread, 1 );
 	}
+	else if( !this_thread ) {
+		// application thread: watch for the schedule hand-off through the root
+		// thread to complete, and requeue if it was lost.  (successor of the
+		// disabled waitScheduleSocket; its PeekQueueEx scan was unsafe against
+		// a concurrent queue expansion, so just requeue on time instead.)
+		// Relinquish, not Idle - a 1ms sleep is a long time at thousands of
+		// connects per second.
+		uint32_t started = timeGetTime();
+		while( !pc->this_thread && sack_network_is_active( pc ) ) {
+			Relinquish();
+			if( ( timeGetTime() - started ) > 100 ) {
+				started = timeGetTime();
+				lprintf( "Lost client in schedule list:%p (Requeuing)", pc );
+				EnqueLink( &globalNetworkData.client_schedule, pc );
+				WSASetEvent( globalNetworkData.hMonitorThreadControlEvent );
+			}
+		}
+	}
+	// else: on another network event thread (accept path).  Must not block
+	// here - the root thread's close sweep (RemoveThreadEvent) can be waiting
+	// for THIS thread to reach its wait state while we would be waiting for
+	// root to drain the schedule: livelock.  The enqueue+wake above is enough.
 #endif
 #ifdef __LINUX__
 	{
@@ -44130,7 +46479,7 @@ void AcceptClient(PCLIENT pListen)
 			DumpAddr( " Failed from:", pNewClient->saClient);
 			lprintf( "getsockname errno = %d", errno );
 		}
-		if( SOCKADDR_NAME( pNewClient->saSource) ) free( SOCKADDR_NAME( pNewClient->saSource ) );
+		if( SOCKADDR_NAME( pNewClient->saSource) ) ReleaseEx( SOCKADDR_NAME( pNewClient->saSource ) DBG_SRC );
 		SOCKADDR_NAME( pNewClient->saSource ) = NULL;
 		//lprintf( "sockaddrlen: %d", nLen );
 		if( pNewClient->saSource->sa_family == AF_INET )
@@ -44148,7 +46497,7 @@ void AcceptClient(PCLIENT pListen)
 	pNewClient->psvClose                = pListen->psvClose;
 	pNewClient->write.WriteComplete     = pListen->write.WriteComplete;
 	pNewClient->psvWrite                = pListen->psvWrite;
-	pNewClient->dwFlags                |= CF_CONNECTED | ( pListen->dwFlags & CF_CALLBACKTYPES );
+	SetClientFlags( pNewClient, CF_CONNECTED | ( pListen->dwFlags & CF_CALLBACKTYPES ) );
 	if( IsValid(pNewClient->Socket) )
  // and we get one from the accept...
 	{
@@ -44164,12 +46513,9 @@ void AcceptClient(PCLIENT pListen)
 		AddActive( pNewClient );
 		{
 			//lprintf( "Accepted and notifying..." );
-			if( pNewClient->Socket != INVALID_SOCKET ) {
-				scheduleSocket( pNewClient, NULL );
-			}
 			if( pListen->connect.ClientConnected )
 			{
-				pNewClient->dwFlags |= CF_CONNECT_ISSUED;
+				SetClientFlags( pNewClient, CF_CONNECT_ISSUED );
 				// SSL layer(if hooked) will clear CONNECT_ISSUED, and track that state itself.
 				if( pListen->dwFlags & CF_CPPCONNECT )
 					pListen->connect.CPPClientConnected( pListen->psvConnect, pNewClient );
@@ -44180,14 +46526,39 @@ void AcceptClient(PCLIENT pListen)
 			//lprintf(" Initial notifications...");
 			if( pNewClient->read.ReadComplete )
 			{
- // may be... at least we can fail sooner...
-				pNewClient->dwFlags |= CF_READREADY;
+				// CF_READREADY is deliberately NOT preset here.  With it set, the
+				// initial callback's doReadExx2 takes its catch-up FinishPendingRead
+				// branch and performs the recv - and the whole dispatch (parse ->
+				// onrequest -> res.end) then runs inline on the LISTENER's thread,
+				// out of the thread that will own this socket.  For a
+				// Connection: close request that also sets CF_TOCLOSE inside that
+				// call, so FinishPendingRead returns -1 and the caller takes the
+				// "reset connection" branch, which recycles the client while the
+				// accept path still holds its locks.
+				// Without it, this callback only arms the recv buffer; the read
+				// happens on the owning peer thread after scheduleSocket registers
+				// the socket.  Nothing is lost if data already arrived - epoll_ctl
+				// (ADD) reports an already-ready socket, so the edge still fires.
 				if( pNewClient->dwFlags & CF_CPPREAD )
   // process read to get data already pending...
 					pNewClient->read.CPPReadComplete( pNewClient->psvRead, NULL, 0 );
 				else
   // process read to get data already pending...
 					pNewClient->read.ReadComplete( pNewClient, NULL, 0 );
+			}
+			// schedule for event service only after the connect callback and the
+			// initial inline read completed.  On Linux this adds to epoll
+			// immediately, and an event thread would dispatch reads for this
+			// socket CONCURRENTLY with the initial read parsing above (the epoll
+			// read path takes no read lock) - two threads then feed the same
+			// parser state and one frees segments under the other (seen as
+			// GetText(0xfacebead...) in ProcessHttp under AcceptClient).  Data
+			// that arrived meanwhile still fires level-triggered EPOLLIN (and a
+			// signaled WSA event) right after the add.
+			if( pNewClient->Socket != INVALID_SOCKET && sack_network_is_active( pNewClient ) ) {
+				// accept runs on the listener's event thread; scheduleSocket must
+				// know it is on a network thread so it does not block there.
+				scheduleSocket( pNewClient, pListen->this_thread );
 			}
 			NetworkUnlockEx( pNewClient, 0 DBG_SRC );
 			NetworkUnlockEx( pNewClient, 1 DBG_SRC );
@@ -44230,7 +46601,7 @@ static void openSocket( PCLIENT pClient, SOCKADDR *pFromAddr, SOCKADDR *pAddr, L
 		// delete the old socket file if it exists
  // this would only be true for listeners(?)
 		if( pFromAddr == pAddr )
-			unlink( (char*)(((uint16_t*)pAddr)+1));
+			unlink( ((struct sockaddr_un*)pAddr)->sun_path );
 	}
 #endif
 	//	pListen->Socket = socket( *(uint16_t*)pAddr, SOCK_STREAM, 0 );
@@ -44362,12 +46733,12 @@ PCLIENT CPPOpenTCPListenerAddr_v3d( SOCKADDR *pAddr
 	}
 	// openSocket also schedules it for event handling... so setup what events.
  // make sure this flag is clear!
-	pListen->dwFlags &= ~CF_UDP;
-	pListen->dwFlags |= CF_LISTEN;
+	ClearClientFlags( pListen, CF_UDP );
+	SetClientFlags( pListen, CF_LISTEN );
 	pListen->flags.bWaiting = waitForReady;
 	pListen->connect.CPPClientConnected = NotifyCallback;
 	pListen->psvConnect = psvConnect;
-	pListen->dwFlags |= CF_CPPCONNECT;
+	SetClientFlags( pListen, CF_CPPCONNECT );
 	// this does the bind part of the socket also... (if any)
  /*second parameter just selects link protocol, and stream */
 	openSocket( pListen, pAddr, pAddr, autoSocket );
@@ -44423,8 +46794,8 @@ PCLIENT OpenTCPListenerAddr_v2d( SOCKADDR *pAddr
 {
 	PCLIENT result = CPPOpenTCPListenerAddr_v2d( pAddr, (cppNotifyCallback)NotifyCallback, 0, waitForReady DBG_RELAY );
 	if( result ) {
-		result->dwFlags &= ~CF_CPPCONNECT;
-		if( result->pcOther ) result->pcOther->dwFlags &= ~CF_CPPCONNECT;
+		ClearClientFlags( result, CF_CPPCONNECT );
+		if( result->pcOther ) ClearClientFlags( result->pcOther, CF_CPPCONNECT );
 	}
 	return result;
 }
@@ -44434,8 +46805,8 @@ PCLIENT OpenTCPListenerAddrExx( SOCKADDR *pAddr
 {
 	PCLIENT result = CPPOpenTCPListenerAddr_v2d( pAddr, (cppNotifyCallback)NotifyCallback, 0, FALSE DBG_RELAY );
 	if( result ) {
-		result->dwFlags &= ~CF_CPPCONNECT;
-		if( result->pcOther ) result->pcOther->dwFlags &= ~CF_CPPCONNECT;
+		ClearClientFlags( result, CF_CPPCONNECT );
+		if( result->pcOther ) ClearClientFlags( result->pcOther, CF_CPPCONNECT );
 	}
 	return result;
 }
@@ -44456,8 +46827,8 @@ PCLIENT OpenTCPListenerExx(uint16_t wPort, cNotifyCallback NotifyCallback DBG_PA
 {
 	PCLIENT result = CPPOpenTCPListenerExx( wPort, (cppNotifyCallback)NotifyCallback, 0 DBG_RELAY );
 	if( result ) {
-		result->dwFlags &= ~CF_CPPCONNECT;
-		if( result->pcOther ) result->pcOther->dwFlags &= ~CF_CPPCONNECT;
+		ClearClientFlags( result, CF_CPPCONNECT );
+		if( result->pcOther ) ClearClientFlags( result->pcOther, CF_CPPCONNECT );
 	}
 	return result;
 }
@@ -44472,7 +46843,7 @@ int NetworkConnectTCPEx( PCLIENT pc DBG_PASS ) {
 		}
 		Relinquish();
 	}
-	pc->dwFlags |= CF_CONNECTING;
+	SetClientFlags( pc, CF_CONNECTING );
 	while( 1 ) {
 		if( (err = connect( pc->Socket, pc->saClient
 		                  , SOCKADDR_LENGTH( pc->saClient ) )) )
@@ -44532,7 +46903,7 @@ int NetworkConnectTCPEx( PCLIENT pc DBG_PASS ) {
 				// is a union, either is valid to test
 				if( pc->connect.CPPThisConnected ) {
 					//lprintf( "connect callback dispatch... %p", pc->saClient );
-					pc->dwFlags |= CF_CONNECT_ISSUED;
+					SetClientFlags( pc, CF_CONNECT_ISSUED );
 					if( pc->dwFlags & CF_CPPCONNECT )
 						pc->connect.CPPThisConnected( pc->psvConnect, dwError );
 					else
@@ -44556,8 +46927,8 @@ int NetworkConnectTCPEx( PCLIENT pc DBG_PASS ) {
 		{
 			// if FD_CONNECT isn't selected, then this section is called
 			// otherwise this is mostly dead code in this block.
-			pc->dwFlags &= ~CF_CONNECTING;
-			pc->dwFlags |= CF_CONNECTED;
+			ClearClientFlags( pc, CF_CONNECTING );
+			SetClientFlags( pc, CF_CONNECTED );
 			if( !pc->saSource ) {
 #ifdef __LINUX__
 				socklen_t
@@ -44577,7 +46948,7 @@ int NetworkConnectTCPEx( PCLIENT pc DBG_PASS ) {
 			}
 			if( pc->connect.CPPThisConnected ) {
 				//lprintf( "connect callback dispatch... %p", pc->saClient );
-				pc->dwFlags |= CF_CONNECT_ISSUED;
+				SetClientFlags( pc, CF_CONNECT_ISSUED );
 				if( pc->dwFlags & CF_CPPCONNECT )
 					pc->connect.CPPThisConnected( pc->psvConnect, 0 );
 				else
@@ -44676,7 +47047,7 @@ static PCLIENT InternalTCPClientAddrFromAddrExxx( SOCKADDR *lpAddr, SOCKADDR *pF
 			pResult->write.CPPWriteComplete    = WriteComplete;
 			pResult->psvWrite                  = psvWrite;
 			if( bCPP )
-				pResult->dwFlags |= ( CF_CALLBACKTYPES );
+				SetClientFlags( pResult, ( CF_CALLBACKTYPES ) );
 			AddActive( pResult );
 			NetworkUnlockEx(pResult, 1 DBG_SRC);
 			NetworkUnlockEx(pResult, 0 DBG_SRC);
@@ -44694,7 +47065,7 @@ static PCLIENT InternalTCPClientAddrFromAddrExxx( SOCKADDR *lpAddr, SOCKADDR *pF
 					uint64_t Start = timeGetTime64();
 					int bProcessing = 0;
 					// should trigger a rebuild (if it's the root thread)
-					pResult->dwFlags |= CF_CONNECT_WAITING;
+					SetClientFlags( pResult, CF_CONNECT_WAITING );
 					// caller was expecting connect to block....
 					while( !( pResult->dwFlags & (CF_CONNECTED|CF_CONNECTERROR|CF_CONNECT_CLOSED) ) &&
 							( ( timeGetTime64() - Start ) < globalNetworkData.dwConnectTimeout ) )
@@ -44750,7 +47121,7 @@ static PCLIENT InternalTCPClientAddrFromAddrExxx( SOCKADDR *lpAddr, SOCKADDR *pF
 						EnterCriticalSec( &globalNetworkData.csNetwork );
 						InternalRemoveClientEx( pResult, TRUE, FALSE );
 						LeaveCriticalSec( &globalNetworkData.csNetwork );
-						pResult->dwFlags &= ~CF_CONNECT_WAITING;
+						ClearClientFlags( pResult, CF_CONNECT_WAITING );
 						return pResult = NULL;
 					}
 					{
@@ -44769,7 +47140,7 @@ static PCLIENT InternalTCPClientAddrFromAddrExxx( SOCKADDR *lpAddr, SOCKADDR *pF
 						}
 					}
 					//lprintf( "Connect did complete... returning to application");
-					pResult->dwFlags &= ~CF_CONNECT_WAITING;
+					ClearClientFlags( pResult, CF_CONNECT_WAITING );
 				}
 #ifdef VERBOSE_DEBUG
 				else
@@ -44868,13 +47239,13 @@ PCLIENT CPPOpenTCPClientExEx(CTEXTSTR lpName,uint16_t wPort,
 	SOCKADDR *lpsaDest;
 	pClient = NULL;
 	if( lpName ) {
-		if(lpsaDest = CreateSockAddressV2(lpName,wPort
+		if(( lpsaDest = CreateSockAddressV2(lpName,wPort
 		                                 , (flags&OPEN_TCP_FLAG_PREFER_V6)
 		                                   ? NETWORK_ADDRESS_FLAG_PREFER_V6
 		                                   : (flags&OPEN_TCP_FLAG_PREFER_V4)
 		                                   ? NETWORK_ADDRESS_FLAG_PREFER_V4
 		                                   : NETWORK_ADDRESS_FLAG_PREFER_NONE
-		   ) ) {
+		   ) )) {
 			pClient = CPPOpenTCPClientAddrExxx( lpsaDest
 			                                  , pReadComplete
 			                                  , psvRead
@@ -44911,13 +47282,13 @@ PCLIENT OpenTCPClientExxx(CTEXTSTR lpName,uint16_t wPort,
 	SOCKADDR *lpsaDest;
 	pClient = NULL;
 	if( lpName ) {
-		if(lpsaDest = CreateSockAddressV2(lpName,wPort
+		if(( lpsaDest = CreateSockAddressV2(lpName,wPort
 		                                 , (flags&OPEN_TCP_FLAG_PREFER_V6)
 		                                   ? NETWORK_ADDRESS_FLAG_PREFER_V6
 		                                   : (flags&OPEN_TCP_FLAG_PREFER_V4)
 		                                   ? NETWORK_ADDRESS_FLAG_PREFER_V4
 		                                   : NETWORK_ADDRESS_FLAG_PREFER_NONE
-		   ) ) {
+		   ) )) {
 			pClient = OpenTCPClientAddrExxx( lpsaDest
 			                               , pReadComplete
 			                               , CloseCallback
@@ -44974,7 +47345,7 @@ int FinishPendingRead(PCLIENT lpClient DBG_PASS )
 			//lpClient->dwFlags |= CF_READREADY; // read ready is set if FinishPendingRead returns 0; and it's from the core read...
 			if( lpClient->dwFlags & CF_WANTCLOSE ) {
 				// the application didn't queue a buffer to read into, have to force accepting a close.
-				lpClient->dwFlags |= CF_TOCLOSE;
+				SetClientFlags( lpClient, CF_TOCLOSE );
    // return pending finished...
 				return -1;
 			}
@@ -45028,7 +47399,7 @@ int FinishPendingRead(PCLIENT lpClient DBG_PASS )
 				case WSAEWOULDBLOCK:
 					//lprintf( "Pending Receive would block..." );
 					goto dispatch_ReadEvent;
-					lpClient->dwFlags &= ~CF_READREADY;
+					ClearClientFlags( lpClient, CF_READREADY );
 					return (int)lpClient->RecvPending.dwUsed;
 #ifdef __LINUX__
 				case ECONNRESET:
@@ -45053,7 +47424,7 @@ int FinishPendingRead(PCLIENT lpClient DBG_PASS )
 							  lpClient->RecvPending.dwUsed );
 						lprintf("LOG:ERROR FinishPending discovered unhandled error (closing connection) %" _32f "", dwError );
 					}
-					lpClient->dwFlags |= CF_TOCLOSE;
+					SetClientFlags( lpClient, CF_TOCLOSE );
    // return pending finished...
 					return -1;
 				}
@@ -45066,7 +47437,7 @@ int FinishPendingRead(PCLIENT lpClient DBG_PASS )
 				lprintf( "Received (0) %d", nRecv );
 #endif
 				//_lprintf( DBG_RELAY )( "Closing closed socket... Hope there's also an event... ");
-				lpClient->dwFlags |= CF_TOCLOSE;
+				SetClientFlags( lpClient, CF_TOCLOSE );
  // while dwAvail... try read...
 				break;
 				//return -1;
@@ -45087,7 +47458,7 @@ int FinishPendingRead(PCLIENT lpClient DBG_PASS )
 					         + lpClient->RecvPending.dwUsed, nRecv );
 				}
 				if( lpClient->RecvPending.s.bStream )
-					lpClient->dwFlags &= ~CF_READREADY;
+					ClearClientFlags( lpClient, CF_READREADY );
 				lpClient->RecvPending.dwLastRead = nRecv;
 				lpClient->RecvPending.dwAvail -= nRecv;
 				//lprintf( "Receive pending is now %d after %d", lpClient->RecvPending.dwAvail, nRecv );
@@ -45118,7 +47489,7 @@ dispatch_ReadEvent:
 #ifdef LOG_PENDING
 				//lprintf( "Sending completed read to application" );
 #endif
-				lpClient->dwFlags &= ~CF_READPENDING;
+				ClearClientFlags( lpClient, CF_READPENDING );
   // and there's a read complete callback available
 				if( lpClient->read.ReadComplete )
 				{
@@ -45168,7 +47539,7 @@ dispatch_ReadEvent:
 			{
 				// this like never happens... so maybe remove this sort of wake logic
 				//lprintf( "Wake waiting thread... clearing pending read flag." );
-				lpClient->dwFlags &= ~CF_READPENDING;
+				ClearClientFlags( lpClient, CF_READPENDING );
 				if( lpClient->pWaiting )
 					WakeThread( lpClient->pWaiting );
 			}
@@ -45245,14 +47616,14 @@ size_t doReadExx2(PCLIENT lpClient,POINTER lpBuffer,size_t nBytes, LOGICAL bIsSt
 		// if the pending finishes it will call the ReadComplete Callback.
 		// otherwise there will be more data to read...
 		//lprintf( "Ok ... buffers set up - now we can handle read events" );
-		lpClient->dwFlags |= CF_READPENDING;
+		SetClientFlags( lpClient, CF_READPENDING );
 #ifdef LOG_PENDING
 		lprintf( "Setup read pending %p %08x", lpClient, lpClient->dwFlags );
 #endif
 		if( bWait )
 		{
 			//lprintf( "setting read waiting so we get awoken... and callback dispatch does not happen." );
-			lpClient->dwFlags |= CF_READWAITING;
+			SetClientFlags( lpClient, CF_READWAITING );
 		}
 		//else
 		//   lprintf( "No read waiting... allow forward going..." );
@@ -45279,7 +47650,7 @@ size_t doReadExx2(PCLIENT lpClient,POINTER lpBuffer,size_t nBytes, LOGICAL bIsSt
 		}
 		else
 		{
-			lpClient->dwFlags &= ~CF_READWAITING;
+			ClearClientFlags( lpClient, CF_READWAITING );
 		 }
 	}
 	if( bWait )
@@ -45319,15 +47690,15 @@ size_t doReadExx2(PCLIENT lpClient,POINTER lpBuffer,size_t nBytes, LOGICAL bIsSt
 		}
 		if( !(lpClient->dwFlags & CF_ACTIVE ) )
 		{
-#ifdef REQUIRE_READ_LOCK
+			// The relock above is NOT under REQUIRE_READ_LOCK, so its release must not
+			// be either - REQUIRE_READ_LOCK is defined nowhere in the tree, so every
+			// blocking read used to leak one csLockRead recursion, and the client then
+			// went back to the free pool still held.
 			NetworkUnlockEx( lpClient, 1 DBG_SRC );
-#endif
 			return -1;
 		}
-		 lpClient->dwFlags &= ~CF_READWAITING;
-#ifdef REQUIRE_READ_LOCK
+		 ClearClientFlags( lpClient, CF_READWAITING );
 		NetworkUnlockEx( lpClient, 1 DBG_SRC);
-#endif
 		if( timeout )
 			return 0;
 		else
@@ -45384,6 +47755,18 @@ int TCPWriteEx(PCLIENT pc DBG_PASS)
 //		if( pc->dwFlags & CF_CONNECTING )
 			lprintf( "Sending previously queued data." );
 #endif
+/*
+An automatic feature that might be worht the pain....
+int state = 1;
+// 1. "Cork" the socket (tells the kernel: don't push the packet yet)
+setsockopt(pc->fd, IPPROTO_TCP, TCP_CORK, &state, sizeof(state));
+// 2. Fire your zero-copy writes sequentially
+SendTCP(pc, GetText(send), GetTextSize(send));
+SendTCPLong(pc, options->content, options->contentLen); // Zero copy!
+// 3. Uncork the socket (tells the kernel: merge it all right now and send!)
+state = 0;
+setsockopt(pc->fd, IPPROTO_TCP, TCP_CORK, &state, sizeof(state));
+*/
 		if( pc->lpFirstPending->dwAvail )
 		{
 			uint32_t dwError;
@@ -45405,8 +47788,12 @@ int TCPWriteEx(PCLIENT pc DBG_PASS)
 						MemCpy( ((uint8_t*)newbuffer) + size
 								, ((const uint8_t*)lpNext->buffer.c)+lpNext->dwUsed
 								, lpNext->dwAvail );
-						if( lpNext->s.bDynBuffer )
+						if( lpNext->s.bDynBuffer ) {
 							Release( lpNext->buffer.p );
+ // Zero out immediately
+							lpNext->buffer.p = NULL;
+							lpNext->s.bDynBuffer = FALSE;
+						}
 						size += lpNext->dwAvail;
 						PendingBuffer *next = lpNext->lpNext;
 						if( lpNext != &pc->FirstWritePending )
@@ -45421,7 +47808,8 @@ int TCPWriteEx(PCLIENT pc DBG_PASS)
 #ifdef LOG_WRITE_AGGREGATION
 					lprintf( "Aggregated %d bytes into single buffer %p", size, pc );
 #endif
-					pc->lpLastPending =	pc->lpFirstPending = &pc->FirstWritePending;
+					pc->lpLastPending = &pc->FirstWritePending;
+					pc->lpFirstPending = &pc->FirstWritePending;
 				}
 			}
 			if( globalNetworkData.flags.bLogSentData )
@@ -45449,32 +47837,38 @@ int TCPWriteEx(PCLIENT pc DBG_PASS)
 #ifdef VERBOSE_DEBUG
 					lprintf( "Pending write...(EBLOCK) %p %zd", pc, pc->lpFirstPending->dwAvail );
 #endif
-					pc->dwFlags &= ~CF_WRITEREADY;
-					pc->dwFlags |= CF_WRITEPENDING;
+					ClearClientFlags( pc, CF_WRITEREADY );
+					SetClientFlags( pc, CF_WRITEPENDING );
 					return TRUE;
 				}
 				if( dwError == EPIPE ) {
-					//_lprintf(DBG_RELAY)( "EPIPE on send() to socket...");
-					pc->dwFlags |= CF_TOCLOSE;
+					// This drops response data that was already handed to the network
+					// layer, so it must not be silent - and it has to survive the
+					// release log filter (lprintf defaults to LOG_LEVEL_DEBUG, which
+					// is filtered at the release level of 1000).
+					xlprintf( LOG_ERROR )( "EPIPE on send(); %" _size_f " bytes discarded unsent. %s"
+					                     , pc->lpFirstPending->dwAvail
+					                     , NetworkExpandFlags( pc ) );
+					SetClientFlags( pc, CF_TOCLOSE );
 					return FALSE;
 				}
 				if( dwError == ECONNREFUSED ) {
 					_lprintf(DBG_RELAY)( "ECONNREFUSED on send() to socket...");
-					pc->dwFlags |= CF_TOCLOSE;
+					SetClientFlags( pc, CF_TOCLOSE );
 					return FALSE;
 				}
 #ifdef _WIN32
 				// especially websockets that try to gracefully cloose
 				if( dwError == WSAESHUTDOWN) {
 					if( pc->dwFlags & CF_WANTCLOSE )
-						pc->dwFlags |= CF_TOCLOSE;
+						SetClientFlags( pc, CF_TOCLOSE );
 					else
 						_lprintf(DBG_RELAY)( "WSAESHUTDOWN on send() to socket...");
-					pc->dwFlags |= CF_TOCLOSE;
+					SetClientFlags( pc, CF_TOCLOSE );
 					return FALSE;
 				}
 				if( dwError == WSAECONNABORTED ) {
-					pc->dwFlags |= CF_TOCLOSE;
+					SetClientFlags( pc, CF_TOCLOSE );
 					return FALSE;
 				}
 #endif
@@ -45494,7 +47888,7 @@ int TCPWriteEx(PCLIENT pc DBG_PASS)
 #endif
 					  )
 					{
-						pc->dwFlags |= CF_TOCLOSE;
+						SetClientFlags( pc, CF_TOCLOSE );
 					}
  // get out of here! (say we sent whatever was pending...; don't repend long buffers)
 					return FALSE;
@@ -45503,19 +47897,19 @@ int TCPWriteEx(PCLIENT pc DBG_PASS)
 			} else if (!nSent) {
 				//lprintf( "sent zero bytes - assume it was closed - and HOPE there's an event..." );
 				// this is more likely to show up as an EPIPE
-				pc->dwFlags |= CF_TOCLOSE;
+				SetClientFlags( pc, CF_TOCLOSE );
 				// if this happened - don't return TRUE result which would
 				// result in queuing a pending buffer...
   // no sence processing the rest of this.
 				return FALSE;
 			} else if( pc->lpFirstPending && ( nSent < (int)pc->lpFirstPending->dwAvail ) ) {
-				pc->dwFlags &= ~CF_WRITEREADY;
-				pc->dwFlags |= CF_WRITEPENDING;
+				ClearClientFlags( pc, CF_WRITEREADY );
+				SetClientFlags( pc, CF_WRITEPENDING );
 			}
 #ifdef _WIN32
 			// windows only gives a FD_WRITE when a send gets an ewouldblock...
 			else
-				pc->dwFlags |= CF_WRITEREADY;
+				SetClientFlags( pc, CF_WRITEREADY );
 #endif
 		}
 		else {
@@ -45578,7 +47972,7 @@ int TCPWriteEx(PCLIENT pc DBG_PASS)
 						pc->bWriteComplete = FALSE;
 					}
 					if( !pc->lpFirstPending ) {
-						pc->dwFlags &= ~CF_WRITEPENDING;
+						ClearClientFlags( pc, CF_WRITEPENDING );
 						//lprintf( "nothing left pending.... %p", pc );
 					}
 				}
@@ -45589,7 +47983,7 @@ int TCPWriteEx(PCLIENT pc DBG_PASS)
 					if( !(pc->dwFlags & CF_WRITEPENDING) )
 					{
 						//lprintf( "And set writepending again?  Do a scheduled timer?" );
-						pc->dwFlags |= CF_WRITEPENDING;
+						SetClientFlags( pc, CF_WRITEPENDING );
 					}
 					return TRUE;
 				}
@@ -45660,136 +48054,209 @@ static void triggerWrite( uintptr_t psv ){
 }
 static PDATAQUEUE pdqPendingWrites = NULL;
 static PTHREAD writeWaitThread = NULL;
+// writes dequeued from pdqPendingWrites whose client was still locked; these are
+// older than anything in pdqPendingWrites and must be sent first (per client).
+static PDATALIST pdlStalledWrites = NULL;
+static volatile uint32_t stalledWriteLock;
+static void lockStalledWrites( void ) {
+	while( LockedExchange( &stalledWriteLock, 1 ) )
+		Relinquish();
+}
+static void unlockStalledWrites( void ) {
+	stalledWriteLock = 0;
+}
 void clearPending( PCLIENT pc ) {
 	INDEX i;
-	struct PendingWrite pending;
+	struct PendingWrite *pending;
 	i = 0;
-	while( PeekDataQueueEx( &pdqPendingWrites, struct PendingWrite*, &pending, i++ ) ){
-		if( pending.pc == pc ) {
-			pending.pc = NULL;
+	// PeekDataQueueEx copies the entry out, so writing to the copy never marked
+	// anything; get the entry in-queue and clear the client so the write cannot
+	// be delivered to a closed (and later recycled) client.
+	// (An entry already copied out by the write thread, or an expansion of the
+	// queue during this scan, can still slip a stale client through; delivery
+	// re-checks the client flags, and a client generation serial would close
+	// that entirely.)
+	while( ( pending = (struct PendingWrite*)PeekDataInQueueEx( &pdqPendingWrites, i++ ) ) ) {
+		if( pending->pc == pc )
+			pending->pc = NULL;
+	}
+	lockStalledWrites();
+	{
+		struct PendingWrite *stalled;
+		DATA_FORALL( pdlStalledWrites, i, struct PendingWrite*, stalled ) {
+			if( stalled->pc == pc )
+				stalled->pc = NULL;
 		}
 	}
+	unlockStalledWrites();
 }
-static LOGICAL hasPending( PCLIENT pc ) {
+// stall list lock must be held; TRUE if a write for this client is stalled
+// in a slot before `before` - in which case a later write for the same client
+// must wait behind it to keep the client's writes in issue order.
+static LOGICAL stalledEarlier( PCLIENT pc, INDEX before ) {
 	INDEX i;
-	struct PendingWrite pending;
-	i = 0;
-	while( PeekDataQueueEx( &pdqPendingWrites, struct PendingWrite*, &pending, i++ ) ){
-		if( pending.pc == pc ) {
-			lprintf( "Might have still been able to get the lock...");
+	struct PendingWrite *entry;
+	for( i = 0; i < before; i++ ) {
+		entry = (struct PendingWrite*)GetDataItem( &pdlStalledWrites, i );
+		if( entry && entry->pc == pc )
 			return TRUE;
-		}
 	}
 	return FALSE;
 }
+// attempt delivery of one deferred write.  TRUE if the entry was disposed
+// (delivered, or dropped because the client closed); FALSE if the client is
+// still locked and the write remains stalled.
+static LOGICAL deliverPendingWrite( struct PendingWrite *pending, PTHREAD thread ) {
+	if( !pending->pc ) {
+		// clearPending() found this while the client closed.
+		if( !pending->bLong && pending->buffer )
+			Release( pending->buffer );
+		return TRUE;
+	}
+	if( !( pending->pc->dwFlags & CF_ACTIVE ) || ( pending->pc->dwFlags & CF_CLOSED ) ) {
+		// left active state without passing clearPending yet; the counter is
+		// reset with the rest of the client state on recycle, don't touch it.
+		if( !pending->bLong && pending->buffer )
+			Release( pending->buffer );
+		return TRUE;
+	}
+	// CF_TOCLOSE is NOT a reason to drop this write.  Now that the close path
+	// counts nWritesPended as outstanding data, the flag means "close once these
+	// have flushed" - a close requested after this write was queued.  Discarding
+	// here would throw away exactly the response the close is waiting on; the
+	// socket is still ACTIVE and not CLOSED, so deliver it and let the drain
+	// check below finish the close.
+	if( !NetworkLockEx( pending->pc, 0 DBG_SRC ) ) {
+		// still contended; make sure the lock owner wakes this thread on unlock.
+		pending->pc->wakeOnUnlock = thread;
+		if( NetworkLockEx( pending->pc, 0 DBG_SRC ) ) {
+			// the owner released between the failure above and setting the wake;
+			// this unlock (without the wake-suppress flag) posts the missed wake.
+			NetworkUnlockEx( pending->pc, 0 DBG_SRC );
+		}
+		return FALSE;
+	}
+	doTCPWriteV2( pending->pc, pending->buffer, pending->len, pending->bLong, pending->failpending, FALSE DBG_SRC );
+	// short buffers were copied when queued (and doTCPWriteV2 copies again if it
+	// has to pend); long buffers belong to the caller in all cases.
+	if( !pending->bLong && pending->buffer )
+		Release( pending->buffer );
+	{
+		PCLIENT pc = pending->pc;
+		uint32_t serial = pc->serial;
+		LOGICAL finishClose;
+		LockedDecrement( &pc->nWritesPended );
+		if( !pc->nWritesPended )
+			pc->wakeOnUnlock = NULL;
+		// A close that was deferred because this write was outstanding has nothing
+		// else to retrigger it when the write goes straight out: the deferred-close
+		// machinery keys off lpFirstPending draining on a write-ready event, and a
+		// pdqPendingWrites entry never produces one.  (If doTCPWriteV2 did have to
+		// pend it, lpFirstPending is set and that machinery still owns the close.)
+		// bInUse means the application still holds the socket; ClearNetWork closes
+		// it on release, as the event threads do.
+		finishClose = ( !pc->nWritesPended && !pc->lpFirstPending
+		             && ( pc->dwFlags & CF_TOCLOSE ) && !pc->flags.bInUse );
+		if( finishClose )
+			ClearClientFlags( pc, CF_TOCLOSE );
+		NetworkUnlockEx( pc, 0|0x10 DBG_SRC );
+		// Deliberately the public graceful close, after the unlock and re-validated
+		// against the serial: it takes its own locks and now sees nothing pending,
+		// so it does the same shutdown(SHUT_WR) an undeferred response would have,
+		// and the normal event teardown follows.  Tearing the client down inline
+		// here instead recycles it underneath the unlock above.
+		if( finishClose && NetworkClientValid( pc, serial ) )
+			RemoveClientEx( pc, FALSE, TRUE );
+	}
+	return TRUE;
+}
 uintptr_t WaitToWrite( PTHREAD thread ) {
-	PDATALIST requeued = CreateDataList( sizeof( struct PendingWrite ) );
-	INDEX lastCount = 0;
 	if( !pdqPendingWrites )
 		pdqPendingWrites = CreateDataQueue( sizeof( struct PendingWrite ) );
+	if( !pdlStalledWrites )
+		pdlStalledWrites = CreateDataList( sizeof( struct PendingWrite ) );
 	//lprintf( "started waittowrite" );
 	while( 1 ) {
-		//uint32_t tick; tick = timeGetTime();
-		if( lastCount == GetDataQueueLength( pdqPendingWrites ) || IsDataQueueEmpty( &pdqPendingWrites ) ) {
-			//lprintf( "WaitToWrite sleeps..." );
-			WakeableSleep( 10000 );
-			/*
-			uint32_t now; now = timeGetTime();
-			if( now -tick < 9000 ) {
-				lprintf( "woke to write writes %d", now-tick);
-			}else {
-				if( !IsDataQueueEmpty( &pdqPendingWrites ))
-					lprintf( "delayed like 10 seconds and now checking writes");
-			}
-			*/
-		} else {
-//lprintf( "already have writes to check" );
-			;
-		}
+		int progress = 0;
+		INDEX idx;
+		INDEX count;
 		struct PendingWrite pending;
-		struct PendingWrite *lpPending = &pending;
 #ifdef LOG_PENDING_WRITES
 		lprintf( "WaitToWrite is checking for writes" );
 #endif
+		// stalled writes are older than anything in the queue; retry them first,
+		// in order.  Entries stay in their slot during delivery so clearPending()
+		// can still mark them; disposed slots are compacted out below.
+		lockStalledWrites();
+		count = pdlStalledWrites->Cnt;
+		for( idx = 0; idx < count; idx++ ) {
+			struct PendingWrite *slot = (struct PendingWrite*)GetDataItem( &pdlStalledWrites, idx );
+			if( !slot->pc && !slot->buffer )
+ // already disposed
+				continue;
+			if( slot->pc && stalledEarlier( slot->pc, idx ) )
+ // an older write for this client is still stalled
+				continue;
+			pending = slot[0];
+			unlockStalledWrites();
+			if( deliverPendingWrite( &pending, thread ) ) {
+				lockStalledWrites();
+				// refetch; the list does not move while entries are only marked
+				slot = (struct PendingWrite*)GetDataItem( &pdlStalledWrites, idx );
+				slot->pc = NULL;
+				slot->buffer = NULL;
+				progress++;
+			}
+			else
+				lockStalledWrites();
+		}
+		// compact disposed slots out of the stall list
+		{
+			INDEX to = 0;
+			for( idx = 0; idx < pdlStalledWrites->Cnt; idx++ ) {
+				struct PendingWrite *slot = (struct PendingWrite*)GetDataItem( &pdlStalledWrites, idx );
+				if( !slot->pc && !slot->buffer )
+					continue;
+				if( to != idx )
+					SetDataItemEx( &pdlStalledWrites, to, slot DBG_SRC );
+				to++;
+			}
+			pdlStalledWrites->Cnt = to;
+		}
+		unlockStalledWrites();
 		while( DequeData( &pdqPendingWrites, &pending ) ) {
+			LOGICAL defer = FALSE;
 			if( !pending.pc ) {
-				Release( pending.buffer );
 				lprintf( "Socket closed while data was pending");
+				if( !pending.bLong && pending.buffer )
+					Release( pending.buffer );
 				continue;
 			}
 #ifdef LOG_PENDING_WRITES
 			lprintf( "Handling pending writes... %p %zd", pending.pc, pending.len );
 #endif
-			{
-				INDEX idx;
-				struct PendingWrite* lpPending;
-				DATA_FORALL( requeued, idx, struct PendingWrite*, lpPending ) {
-					if( lpPending->pc == pending.pc ) {
-						lprintf( "socket is already pending, requeue more:%p", pending.pc );
-						AddDataItem( &requeued, lpPending );
-						break;
-					}
-				}
-				if( lpPending ) {
-					lprintf( "This was already found as pending, saved for requeue");
-					continue;
-				}
+			lockStalledWrites();
+			if( stalledEarlier( pending.pc, pdlStalledWrites->Cnt ) ) {
+				// an older write for this client is still stalled; keep this one
+				// behind it instead of letting it pass out of order.
+				AddDataItem( &pdlStalledWrites, &pending );
+				defer = TRUE;
 			}
-			if( !( pending.pc->dwFlags & CF_ACTIVE )  || (pending.pc->dwFlags & CF_TOCLOSE) ) {
-				if(pending.pc->dwFlags & CF_TOCLOSE)
-					lprintf( "Socket is intended to close already... %08x %p" , pending.pc->dwFlags, pending.pc );
-				else
-//lprintf( "Socket is inactive already... %08x %p" , pending.pc->dwFlags, pending.pc );
-					;
+			unlockStalledWrites();
+			if( defer )
 				continue;
+			if( deliverPendingWrite( &pending, thread ) )
+				progress++;
+			else {
+				lockStalledWrites();
+				AddDataItem( &pdlStalledWrites, &pending );
+				unlockStalledWrites();
 			}
-			if( !NetworkLockEx( pending.pc, 0 DBG_SRC ) ) {
-				if( !( pending.pc->dwFlags & CF_ACTIVE ) || (pending.pc->dwFlags & CF_TOCLOSE) ) {
-					lprintf( "Pending write on socket can't happen, no longer active." );
- // do not requeue this... the socket has closed.
-					continue;
-				}
-#ifdef LOG_PENDING_WRITES
-				lprintf( "(pending writer)Failed to lock network... requeueing %p", pending.pc );
-#endif
-				AddDataItem( &requeued, &pending );
-			} else {
-#ifdef LOG_PENDING_WRITES
-				LogBinary( (const uint8_t*)pending.buffer, pending.len );
-				lprintf( "Send pending block %p %p %zd", pending.pc, pending.buffer, pending.len );
-#endif
-				LOGICAL stillPend = doTCPWriteV2( pending.pc, pending.buffer, pending.len, pending.bLong, pending.failpending, FALSE DBG_SRC );
-				if( stillPend == -1 ) {
-#ifdef LOG_PENDING_WRITES
-					lprintf( "--- This should not happen - have the lock already... %08x", pending.pc->dwFlags );
-#endif
-					AddDataItem( &requeued, &pending );
-				} else {
-					if( !hasPending( pending.pc ))
-						pending.pc->wakeOnUnlock = NULL;
-#ifdef LOG_PENDING_WRITES
-					else
-						lprintf( "Still has pending writes... %p", pending.pc );
-#endif
-				}
-				NetworkUnlockEx( lpPending->pc, 0|0x10 DBG_SRC );
-			}
-			;
-			//i++;
 		}
-		{
-			INDEX idx;
-			struct PendingWrite* lpPending;
-			DATA_FORALL( requeued, idx, struct PendingWrite*, lpPending ) {
-#ifdef LOG_PENDING_WRITES
-				lprintf( "Requeing block %p %p %zd", lpPending->pc, lpPending->buffer, lpPending->len );
-#endif
-				EnqueData( &pdqPendingWrites, lpPending );
-				lpPending->pc->wakeOnUnlock = thread;
-			}
-			lastCount = idx;
-			//lprintf( "Emptied requeue list...");
-			EmptyDataList( &requeued );
+		if( !progress && IsDataQueueEmpty( &pdqPendingWrites ) ) {
+			// nothing deliverable; stalled clients wake this thread when their
+			// lock owner releases (wakeOnUnlock), new writes wake it on queue.
+			WakeableSleep( 10000 );
 		}
 	}
 }
@@ -45810,8 +48277,18 @@ LOGICAL doTCPWriteV2( PCLIENT lpClient
   // cannot process a closed channel. data not sent.
 		return FALSE;
 	}
-/*hasPending(lpClient)*/
-	while( ( pend_on_fail && lpClient->wakeOnUnlock ) || !NetworkLockEx( lpClient, 0 DBG_RELAY ) )
+	// A zero length write has nothing to deliver, and letting one through is
+	// actively harmful: it reaches send() with a 0 length, whose 0 return is
+	// read as "peer closed" and sets CF_TOCLOSE on a healthy connection.  It
+	// would also count against nWritesPended and hold a graceful close open
+	// for a write that can never move any bytes.
+	if( !nInLen )
+		return TRUE;
+	// nWritesPended gates the direct path: while any older write for this client
+	// is still in the deferred queue/stall list, this write has to follow it
+	// through the queue or it would pass it on the wire.  (wakeOnUnlock can't be
+	// the gate - NetworkUnlockEx consumes it on any write unlock.)
+	while( ( pend_on_fail && lpClient->nWritesPended ) || !NetworkLockEx( lpClient, 0 DBG_RELAY ) )
 	{
 #ifdef LOG_NETWORK_LOCKING
 		if( lpClient->wakeOnUnlock )
@@ -45847,17 +48324,14 @@ LOGICAL doTCPWriteV2( PCLIENT lpClient
 			if( pw.len < 16 ) LogBinary( (uint8_t*)pw.buffer, pw.len );
 			fprintf( stderr, DBG_FILELINEFMT "Saving buffer to queue %p %d %p %zd\n" DBG_RELAY, lpClient, bLongBuffer, pw.buffer, pw.len );
 #endif
+			// close the direct-path gate before the entry is visible so another
+			// thread's write cannot pass this one.
+			LockedIncrement( &lpClient->nWritesPended );
 			EnqueData( &pdqPendingWrites, &pw );
 			lpClient->wakeOnUnlock = writeWaitThread;
-			if( NetworkLockEx( lpClient, 0 DBG_SRC ) ) {
-#ifdef LOG_PENDING_WRITES
-				lprintf( "Network lock would not have been unlocked (wakeOnUnlock)... %p", lpClient );
-#endif
-				NetworkUnlockEx( lpClient, 0 DBG_SRC );
-			}
-#ifdef LOG_PENDING_WRITES
-			else lprintf( "pended on fail - queued buffer as pending... %p ", lpClient );
-#endif
+			// wake the writer directly; the unlock wake alone can be missed if
+			// the lock owner released between the lock failure and just now.
+			WakeThread( writeWaitThread );
 		}
 		return -1;
 	}
@@ -45896,7 +48370,7 @@ LOGICAL doTCPWriteV2( PCLIENT lpClient
 #endif
 			}
  // shouldn't have to do this - this there is a race condition somewhere...
-			lpClient->dwFlags |= CF_WRITEPENDING;
+			SetClientFlags( lpClient, CF_WRITEPENDING );
 			//TCPWriteEx( lpClient DBG_SRC ); // make sure we don't lose a write event during the queuing...
 			NetworkUnlockEx( lpClient, 0 DBG_SRC );
 			return TRUE;
@@ -45920,7 +48394,7 @@ LOGICAL doTCPWriteV2( PCLIENT lpClient
 		lpClient->FirstWritePending.s.bStream    = FALSE;
 		lpClient->FirstWritePending.s.bDynBuffer = FALSE;
 		lpClient->FirstWritePending.lpNext       = NULL;
-		lpClient->lpLastPending =
+		lpClient->lpLastPending = &lpClient->FirstWritePending;
 		lpClient->lpFirstPending = &lpClient->FirstWritePending;
 		if( lpClient->flags.bAggregateOutput)
 		{
@@ -45939,7 +48413,7 @@ LOGICAL doTCPWriteV2( PCLIENT lpClient
 #ifdef LOG_WRITE_AGGREGATION
 			_lprintf(DBG_RELAY)("Write with aggregate (firstpending forced)... %d %d %d %p", bLongBuffer, nInLen, lpClient->writeTimer, lpClient);
 #endif
-			lpClient->dwFlags |= CF_WRITEPENDING;
+			SetClientFlags( lpClient, CF_WRITEPENDING );
 			//lprintf( "First Write with aggregate... %d %d %d %p", nInLen, lpClient->writeTimer, wasTimer, lpClient );
 			NetworkUnlockEx( lpClient, 0 DBG_SRC );
 			return TRUE;
@@ -45957,6 +48431,16 @@ LOGICAL doTCPWriteV2( PCLIENT lpClient
 				MemCpy( lpClient->FirstWritePending.buffer.p, pInBuffer, nInLen );
 				lpClient->FirstWritePending.s.bDynBuffer = TRUE;
 			}
+			if( ( lpClient->dwFlags & CF_CONNECTED ) && lpClient->lpFirstPending )
+			{
+				// TCPWriteEx above bailed because the socket wasn't connected yet,
+				// and the connect completed between that check and now.  The
+				// connect-time FD_WRITE flush may have already run (it saw an
+				// empty pending chain, or is spinning on our lock and will see the
+				// data) - flushing here under the lock closes the window where the
+				// data sits queued with nothing left to trigger a send.
+				TCPWriteEx( lpClient DBG_RELAY );
+			}
 		}
 #ifdef VERBOSE_DEBUG
 		else
@@ -45968,105 +48452,9 @@ LOGICAL doTCPWriteV2( PCLIENT lpClient
 	return TRUE;
 }
 //----------------------------------------------------------------------------
-#if 0 && !DrainSupportDeprecated
-#define DRAIN_MAX_READ 2048
-// used internally to read directly to drain buffer.
-LOGICAL TCPDrainRead( PCLIENT pClient )
-{
-	size_t nDrainRead;
-	char byBuffer[DRAIN_MAX_READ];
-	while( pClient && pClient->nDrainLength )
-	{
-		nDrainRead = pClient->nDrainLength;
-		if( nDrainRead > DRAIN_MAX_READ )
-			nDrainRead = DRAIN_MAX_READ;
-		nDrainRead = recv( pClient->Socket
-							  , byBuffer
-						 , (int)nDrainRead, 0 );
-//SOCKET_ERROR )
-		if( nDrainRead == 0 )
-		{
-			uint32_t dwError;
-			dwError = WSAGetLastError();
-			if( dwError == WSAEWOULDBLOCK )
-			{
-				if( !pClient->bDrainExact )
-					pClient->nDrainLength = 0;
-				break;
-			}
-			lprintf(" Network Error during drain: %d (from: %p  to: %p  has: %" _size_f "  toget: %" _size_f ")"
-			       , dwError
-			       , pClient->Socket
-			       , pClient->RecvPending.buffer.p
-			       , pClient->RecvPending.dwUsed
-			       , pClient->RecvPending.dwAvail );
-			InternalRemoveClient( pClient );
-			NetworkUnlockEx( pClient, 1 DBG_SRC );
-			return FALSE;
-		}
-		else
-		{
-			if( globalNetworkData.flags.bShortLogReceivedData )
-			{
-				LogBinary( (uint8_t*)byBuffer, (nDrainRead<64 )?nDrainRead:64 );
-			}
-			if( globalNetworkData.flags.bLogReceivedData )
-			{
-				LogBinary( (uint8_t*)byBuffer, nDrainRead );
-			}
-		}
-		if( nDrainRead == 0 )
-		{
- // closed.
-			InternalRemoveClient( pClient );
-			NetworkUnlockEx( pClient, 1 DBG_SRC );
-			return FALSE;
-		}
-		if( pClient->bDrainExact )
-			pClient->nDrainLength -= nDrainRead;
-	}
-	if( pClient )
-		return pClient->bDraining = (pClient->nDrainLength != 0);
- // no data available....
-	return 0;
-}
-//----------------------------------------------------------------------------
-NETWORK_PROC( LOGICAL, TCPDrainEx)( PCLIENT pClient, size_t nLength, int bExact )
-{
-	if( pClient )
-	{
-		LOGICAL bytes;
-		while( !NetworkLockEx( pClient, 0 DBG_SRC ) )
-		{
-			if( !(pClient->dwFlags & CF_ACTIVE ) )
-			{
-				return FALSE;
-			}
-			Relinquish();
-		}
-		if( pClient->bDraining )
-		{
-			pClient->nDrainLength += nLength;
-		}
-		else
-		{
-			pClient->bDraining = TRUE;
-			pClient->nDrainLength = nLength;
-		}
-		pClient->bDrainExact = bExact;
-		if( !pClient->bDrainExact )
- // default optimal read
-			pClient->nDrainLength = DRAIN_MAX_READ;
-		bytes = TCPDrainRead( pClient );
-		NetworkUnlockEx( pClient, 1 DBG_SRC );
-		return bytes;
-	}
-	return 0;
-}
-#endif
-//----------------------------------------------------------------------------
 void SetTCPNoDelay( PCLIENT pClient, int bEnable )
 {
+	if( !pClient || IsInvalid( pClient->Socket ) ) return;
 	if( setsockopt( pClient->Socket, IPPROTO_TCP,
 						TCP_NODELAY,
 						(const char *)&bEnable, sizeof(bEnable) ) == SOCKET_ERROR )
@@ -46078,6 +48466,7 @@ void SetTCPNoDelay( PCLIENT pClient, int bEnable )
 //----------------------------------------------------------------------------
 void SetClientKeepAlive( PCLIENT pClient, int bEnable )
 {
+	if( !pClient || IsInvalid( pClient->Socket ) ) return;
 	if( setsockopt( pClient->Socket, SOL_SOCKET,
 						SO_KEEPALIVE,
 						(const char *)&bEnable, sizeof(bEnable) ) == SOCKET_ERROR )
@@ -46173,7 +48562,7 @@ PCLIENT CPPServeUDPAddrEx( SOCKADDR *pAddr
 #ifdef LOG_SOCKET_CREATION
 	lprintf( "Created UDP %p(%d)", pc, pc->Socket );
 #endif
-	pc->dwFlags |= CF_UDP;
+	SetClientFlags( pc, CF_UDP );
 	if( pAddr? pc->saSource = DuplicateAddress( pAddr ),1:0 )
 	{
 		if (bind(pc->Socket,pc->saSource,SOCKADDR_LENGTH(pc->saSource)))
@@ -46211,7 +48600,7 @@ PCLIENT CPPServeUDPAddrEx( SOCKADDR *pAddr
 	pc->close.CloseCallback = Close;
 	pc->psvClose = psvClose;
 	if( bCPP )
-		pc->dwFlags |= (CF_CPPREAD|CF_CPPCLOSE );
+		SetClientFlags( pc, (CF_CPPREAD|CF_CPPCLOSE ) );
 #ifdef __LINUX__
 	AddThreadEvent( pc, 0 );
 #endif
@@ -46244,7 +48633,7 @@ PCLIENT ServeUDPAddrEx( SOCKADDR *pAddr
 {
 	PCLIENT result = CPPServeUDPAddrEx( pAddr, pReadComplete, 0, Close, 0, FALSE DBG_RELAY );
 	if( result )
-		result->dwFlags &= ~(CF_CPPREAD|CF_CPPCLOSE);
+		ClearClientFlags( result, (CF_CPPREAD|CF_CPPCLOSE) );
 	return result;
 }
 //----------------------------------------------------------------------------
@@ -46294,7 +48683,8 @@ void UDPEnableBroadcast( PCLIENT pc, int bEnable )
 				GetAddressParts( pc->saSource, NULL, &port );
 				SetAddressPort( broadcastAddr, port );
 				if( bind( pc->SocketBroadcast, broadcastAddr, SOCKADDR_LENGTH( broadcastAddr ) ) ) {
-					lprintf( "Failed to rebind to broadcast address when enabling... %d", errno );
+					int error = errno;
+					lprintf( "Failed to rebind to broadcast address when enabling... %d", error );
 				}
 				if( setsockopt( pc->SocketBroadcast, SOL_SOCKET
 				              , SO_BROADCAST, (char*)&bEnable, sizeof( bEnable ) ) )
@@ -46378,7 +48768,7 @@ PCLIENT CPPConnectUDPAddrEx( SOCKADDR *sa
 	pc->psvRead = psvRead;
 	pc->close.CloseCallback = Close;
 	pc->psvClose = psvClose;
-	pc->dwFlags |= (CF_CPPREAD|CF_CPPCLOSE );
+	SetClientFlags( pc, (CF_CPPREAD|CF_CPPCLOSE ) );
 	if( pReadComplete )
  // allow server to start a read method...
 		pReadComplete( pc, NULL, 0, NULL );
@@ -46401,7 +48791,7 @@ PCLIENT ConnectUDPAddrEx( SOCKADDR *sa
 {
 	PCLIENT result = CPPConnectUDPAddrEx( sa, saTo, pReadComplete, 0, Close, 0 DBG_RELAY );
 	if( result )
-		result->dwFlags &= ~( CF_CPPREAD|CF_CPPCLOSE );
+		ClearClientFlags( result, ( CF_CPPREAD|CF_CPPCLOSE ) );
 	return result;
 }
 //----------------------------------------------------------------------------
@@ -46433,14 +48823,14 @@ static PCLIENT CPPConnectUDPExx( CTEXTSTR pFromAddr, uint16_t wFromPort
 	pc->psvClose = psvClose;
 	if( bCPP )
 	{
-		pc->dwFlags |= (CF_CPPREAD|CF_CPPCLOSE );
+		SetClientFlags( pc, (CF_CPPREAD|CF_CPPCLOSE ) );
 		if( pReadComplete )
  // allow server to start a read method...
 			pc->read.CPPReadCompleteEx( psvRead, NULL, 0, NULL );
 	}
 	else
 	{
-		pc->dwFlags &= ~( CF_CPPREAD|CF_CPPCLOSE );
+		ClearClientFlags( pc, ( CF_CPPREAD|CF_CPPCLOSE ) );
 		if( pReadComplete )
  // allow server to start a read method...
 			pReadComplete( pc, NULL, 0, NULL );
@@ -46490,7 +48880,12 @@ NETWORK_PROC( LOGICAL, SendUDPEx )( PCLIENT pc, CPOINTER pBuf, size_t nSize, SOC
 	              );
 	if( nSent < 0 )
 	{
-		Log1( "SendUDP: Error (%d)", WSAGetLastError() );
+#ifdef WIN32
+		DWORD dwError = WSAGetLastError();
+#else
+		int dwError = errno;
+#endif
+		Log1( "SendUDP: Error (%d)", dwError );
 		DumpAddr( "SendTo Socket", (sa) );
 		return FALSE;
 	}
@@ -46523,7 +48918,7 @@ NETWORK_PROC( int, doUDPRead )( PCLIENT pc, POINTER lpBuffer, int nBytes )
 	pc->RecvPending.dwUsed = 0;
 	pc->RecvPending.buffer.p = lpBuffer;
 	{
-		pc->dwFlags |= CF_READPENDING;
+		SetClientFlags( pc, CF_READPENDING );
 		// we are now able to read, so schedule the socket.
 	}
 #if 0
@@ -46565,7 +48960,7 @@ int FinishUDPRead( PCLIENT pc, int broadcastEvent )
 // get address...
 	                    &Size);
 	uintptr_t name = (((uintptr_t*)pc->saLastClient) - 1)[0];
-	if( name ) free( (void*)name );
+	if( name ) ReleaseEx( (void*)name DBG_SRC );
 	(((uintptr_t*)pc->saLastClient) - 1)[0] = 0;
 	// address size in recvfrom on linux results with '256' which
 	// then results with a sockaddr that can't sendto with.
@@ -46584,7 +48979,7 @@ int FinishUDPRead( PCLIENT pc, int broadcastEvent )
  // NO data returned....
 		case WSAEWOULDBLOCK:
 			//lprintf( "got EWOULDBLOCK(EAGAIN)..." );
-			pc->dwFlags |= CF_READPENDING;
+			SetClientFlags( pc, CF_READPENDING );
 			return TRUE;
 #ifdef _WIN32
 		// this happens on WIN2K/XP - ICMP Port Unreachable (nothing listening there)
@@ -46613,7 +49008,7 @@ int FinishUDPRead( PCLIENT pc, int broadcastEvent )
 		LogBinary( (uint8_t*)pc->RecvPending.buffer.p +
 					 pc->RecvPending.dwUsed, nReturn );
 	}
-	pc->dwFlags &= ~CF_READPENDING;
+	ClearClientFlags( pc, CF_READPENDING );
   // allow further reads...
 	pc->RecvPending.dwAvail = 0;
 	pc->RecvPending.dwUsed += nReturn;
@@ -47434,7 +49829,7 @@ LOGICAL ssl_IsClientSecure( PCLIENT pc ) {
 CTEXTSTR ssl_GetRequestedHostName( PCLIENT pc ) {
 	return NULL;
 }
-void ssl_CloseSession( PCLIENT pc ) {
+void ssl_CloseSession( PCLIENT pc, LOGICAL bLinger ) {
    return;
 }
 SACK_NETWORK_NAMESPACE_END
@@ -47593,18 +49988,27 @@ void ssl_ClosePipeSession( struct ssl_session** ssl_session )
 #if defined( DEBUG_SSL_FALLBACK )
 	lprintf( "Close generic session %p", ssl_session );
 #endif
-	if( ssl_session[0] )
+	// Take the session out of the slot atomically.  ssl_ClosePipe claims this same
+	// slot from the network thread; reading it here and then freeing races that -
+	// both threads capture the same pointer and both call Release, which the
+	// allocator's block check caught as a double free (SIGTRAP in DropMemEx).
+	struct ssl_session *ses = (struct ssl_session*)(uintptr_t)LockedExchangePtrSzVal( ssl_session, 0 );
+	if( ses )
 	{
-		struct ssl_session *ses = ssl_session[0];
 		struct ssl_hostContext* hostctx;
 		INDEX idx;
 		PTEXT seg;
-		SSL_shutdown( ses->ssl );
-		//lprintf( "SSL Shutdown... but this should only be done if handshake complete..." );
+		// The shutdown has to be inside this test, not before it: SSL_shutdown sends a
+		// close_notify alert, and on a session whose handshake never completed the
+		// TLS1.3 record layer has no wire_write callback yet - libressl then calls
+		// through a NULL pointer (tls13_record_send with wire_write=0x0) and the
+		// process dies.  A connection torn down mid-handshake has no session to
+		// notify anyway, so there is nothing to send.
 		if( SSL_is_init_finished( ses->ssl ) ) {
 #if defined( DEBUG_SSL_FALLBACK )
 			lprintf( "SSL Shutdown... but this should only be done if handshake complete..." );
 #endif
+			SSL_shutdown( ses->ssl );
 			ssl_handlePendingControlwrites( ses );
 		}
 		// usually this isn't released... the server socket (LISTENER)
@@ -47629,16 +50033,18 @@ void ssl_ClosePipeSession( struct ssl_session** ssl_session )
 			ses->hostname = NULL;
 		}
 		/* this should probably have a do_close action event too like send/recv */
-		ssl_session[0] = NULL;
+ // slot was already cleared by the claim above
 		Release( ses );
 	} else {
 		//lprintf( "Session already closed" );
 	}
 }
-void ssl_CloseSession( PCLIENT pc ) {
+void ssl_CloseSession( PCLIENT pc, LOGICAL bLinger ) {
 	struct ssl_session *ses = pc->ssl_session;
 	// mark that this should be closed down to the socket.
 	ses->closed = TRUE;
+  // survives the deleteInUse deferral below
+	ses->closeLinger = bLinger;
 	if( ses->inUse ) {
 #ifdef DEBUG_NO_HOST_AND_FALLBACK
 		lprintf( "Setting close session for later" );
@@ -47661,10 +50067,14 @@ void ssl_CloseSession( PCLIENT pc ) {
 #ifdef DEBUG_NO_HOST_AND_FALLBACK
 		lprintf( "RemoveClient (Again?) %s", NetworkExpandFlags( pc ));
 #endif
+		// Forward the caller's linger.  RemoveClient() is the abortive default
+		// (bLinger FALSE), and using it here threw away the graceful intent that
+		// httpObject::end passed in - so this second pass took the !bLinger branch
+		// and shutdown(SHUT_WR)'d while the response ciphertext was still queued.
 		if( pc->dwFlags & CF_CONNECT_ISSUED )
-			RemoveClient( pc );
+			RemoveClientEx( pc, FALSE, bLinger );
 		else
-			RemoveClientEx( pc, TRUE, FALSE );
+			RemoveClientEx( pc, TRUE, bLinger );
 	}
 }
 static int handshake( struct ssl_session** ses ) {
@@ -47773,6 +50183,13 @@ static void ssl_ReadComplete_( PCLIENT pc, struct ssl_session** ses, POINTER buf
 		{
 			int len;
 			int hs_rc;
+			// ses[0] is &pc->ssl_session - shared state that the closing thread stores
+			// NULL into.  Re-reading it at every use is why a passing `if( ses[0] )`
+			// check is followed by a faulting deref on the next line.  Capture it into
+			// this local at each point where the value is about to be used repeatedly.
+			// inUse is held across those regions, so the object cannot be freed while
+			// we work with it; only the attachment (ses[0]) can be dropped.
+			struct ssl_session *s;
 			//lprintf( "Read from network: %d", length );
 			//LogBinary( (const uint8_t*)buffer, length );
 			EnterCriticalSec( &ses[0]->csReadWrite );
@@ -47811,8 +50228,8 @@ static void ssl_ReadComplete_( PCLIENT pc, struct ssl_session** ses, POINTER buf
 				return;
 			}
 			if( !ses[0] ) {
-				ses[0]->inUse--;
-				LeaveCriticalSec( &ses[0]->csReadWrite );
+				// the session is already gone - it cannot be un-marked or unlocked,
+				// both of those dereference the NULL this branch just tested for.
 				return;
 			}
 			// == 1 if is already done, and not newly done
@@ -47844,12 +50261,18 @@ static void ssl_ReadComplete_( PCLIENT pc, struct ssl_session** ses, POINTER buf
 						// clients use the same read callback.  They only get the initial read complete
 						// no callbacks to setup.
 						//lprintf( "### Sent connect...");
-						pc->dwFlags |= CF_CONNECT_ISSUED;
+						SetClientFlags( pc, CF_CONNECT_ISSUED );
 						if( pc->pcServer->ssl_session->dwOriginalFlags & CF_CPPCONNECT )
 							pc->pcServer->ssl_session->cpp_user_connected( pc->pcServer->psvConnect, pc );
 						else
 							pc->pcServer->ssl_session->user_connected( pc->pcServer, pc );
 					}
+					// We are OUTSIDE the lock from here until the re-enter below, and the
+					// callback just dispatched can close the connection - that frees the
+					// session and clears pc->ssl_session, which is this ses[0].  Everything
+					// following dereferences it, so re-validate before going on.  Nothing is
+					// held at this point, so returning is clean.
+					if( !ses[0] ) return;
 					//lprintf( "Initial read dispatch.. %d", ses[0]->dwOriginalFlags & CF_CPPREAD );
 					if( ses[0]->dwOriginalFlags & CF_CPPREAD ) {
 						if( ses[0]->cpp_user_read )
@@ -47860,6 +50283,9 @@ static void ssl_ReadComplete_( PCLIENT pc, struct ssl_session** ses, POINTER buf
 							ses[0]->user_read( pc, NULL, 0 );
 						else lprintf( "Couldn't send initial read - no function?!" );
 					}
+					// same again: the initial-read callback can close the connection.
+					// (crash was at the SSL_pending( ses[0]->ssl ) below, from a core dump)
+					if( !ses[0] ) return;
 					if( ses[0]->deleteInUse ){
 						lprintf( "Pending close... was in-use when closed.");
 					}
@@ -47871,33 +50297,37 @@ static void ssl_ReadComplete_( PCLIENT pc, struct ssl_session** ses, POINTER buf
 			{
 				// 1 is 'needs to send some data to complete handshake'
 			read_more:
+				// arrived here either by falling through or by the `goto` after the
+				// application read callback, which may have detached the session.
+				s = ses[0];
+				if( !s ) return;
 				// if read isn't done before pending, pending doesn't get set
 				// but this read doens't return a useful length.
  //-V575
-				len = SSL_read( ses[0]->ssl, NULL, 0 );
+				len = SSL_read( s->ssl, NULL, 0 );
 				//lprintf( "return of 0 read: %d", len );
 				//if( len < 0 )
-				//	lprintf( "error of 0 read is %d", SSL_get_error( ses[0]->ssl, len ) );
-				len = SSL_pending( ses[0]->ssl );
+				//	lprintf( "error of 0 read is %d", SSL_get_error( s->ssl, len ) );
+				len = SSL_pending( s->ssl );
 				if( len ) {
-					if( len > (int)ses[0]->dbuflen ) {
+					if( len > (int)s->dbuflen ) {
 						//lprintf( "Needed to expand buffer..." );
-						Release( ses[0]->dbuffer );
-						ses[0]->dbuflen = ( len + 4095 ) & 0xFFFF000;
-						ses[0]->dbuffer = NewArray( uint8_t, ses[0]->dbuflen );
+						Release( s->dbuffer );
+						s->dbuflen = ( len + 4095 ) & 0xFFFF000;
+						s->dbuffer = NewArray( uint8_t, s->dbuflen );
 					}
-					len = SSL_read( ses[0]->ssl, ses[0]->dbuffer, (int)ses[0]->dbuflen );
+					len = SSL_read( s->ssl, s->dbuffer, (int)s->dbuflen );
 #ifdef DEBUG_SSL_IO_VERBOSE
 					lprintf( "normal read - just get the data from the other buffer : %d", len );
 #endif
 					if( len < 0 ) {
-						int error = SSL_get_error( ses[0]->ssl, len );
+						int error = SSL_get_error( s->ssl, len );
 						if( error == SSL_ERROR_WANT_READ ) {
 							lprintf( "want more data?" );
 						} else
 							lprintf( "SSL_Read failed. %d", error );
-						if( pc && ses[0]->errorCallback )
-							ses[0]->errorCallback( ses[0]->psvErrorCallback, pc, SACK_NETWORK_ERROR_SSL_FAIL );
+						if( pc && s->errorCallback )
+							s->errorCallback( s->psvErrorCallback, pc, SACK_NETWORK_ERROR_SSL_FAIL );
 					}
 				}
 			}
@@ -47957,37 +50387,46 @@ static void ssl_ReadComplete_( PCLIENT pc, struct ssl_session** ses, POINTER buf
 			}
 			else
 				len = 0;
-			ssl_handlePendingControlwrites( ses[0] );
-			LeaveCriticalSec( &ses[0]->csReadWrite );
+			// ses[0] is pc->ssl_session, which a concurrent close clears (ssl_ClosePipe
+			// takes the session out of it).  This check has to happen BEFORE the two
+			// dereferences below, not after them: unlocking &ses[0]->csReadWrite on a
+			// NULL session computes a bogus lock address (0xf0) and faults.  The lock
+			// is gone along with the session, so there is nothing to release here.
 			if( !ses[0] ) {
 				return;
 			}
+			// this is the block that faulted with pcs=0xf0: the check above passed and
+			// then ses[0] was NULLed before the unlock re-read it.
+			s = ses[0];
+			ssl_handlePendingControlwrites( s );
+			LeaveCriticalSec( &s->csReadWrite );
 			// do was have any decrypted data to give to the application?
-			if( ses[0] && len > 0 ) {
+			if( len > 0 ) {
 #ifdef DEBUG_SSL_IO_BUFFERS
 				if( ssl_global.flags.bLogBuffers ) {
 					lprintf( "READ BUFFER:" );
-					LogBinary( ses[0]->dbuffer, (( ssl_global.flags.bLogBuffers ) || ( 256 > len ))? len : 256 );
+					LogBinary( s->dbuffer, (( ssl_global.flags.bLogBuffers ) || ( 256 > len ))? len : 256 );
 				}
 #endif
-				if( ses[0]->dwOriginalFlags & CF_CPPREAD ) {
-					if( ses[0]->cpp_user_read )
-						ses[0]->cpp_user_read( ses[0]->psvRead, ses[0]->dbuffer, len );
+				if( s->dwOriginalFlags & CF_CPPREAD ) {
+					if( s->cpp_user_read )
+						s->cpp_user_read( s->psvRead, s->dbuffer, len );
 					else lprintf( "Somehow missing the C++ read function?");
 				} else {
-					if( ses[0]->user_read )
-						ses[0]->user_read( pc, ses[0]->dbuffer, len );
+					if( s->user_read )
+						s->user_read( pc, s->dbuffer, len );
 					else lprintf( "Somehow missing the read function?");
 				}
- // might have closed during read.
+				// the read callback above may have closed/detached; ses[0] is the
+				// attachment test, s stays valid because inUse is still held.
 				if( ses[0] ) {
-					if( ses[0] && ses[0]->deleteInUse ){
+					if( s->deleteInUse ){
 						//lprintf( "Pending close(3)... was in-use when closed.");
-						ses[0]->inUse--;
+						s->inUse--;
 						RemoveClient( pc );
 					}
 					else {
-						EnterCriticalSec( &ses[0]->csReadWrite );
+						EnterCriticalSec( &s->csReadWrite );
 						goto read_more;
 					}
 				} else {
@@ -47995,7 +50434,7 @@ static void ssl_ReadComplete_( PCLIENT pc, struct ssl_session** ses, POINTER buf
 				}
 			}
 			else if( len == 0 ) {
-				ses[0]->inUse--;
+				s->inUse--;
 #ifdef DEBUG_SSL_IO_VERBOSE
 				lprintf( "incomplete read (no more data to read)" );
 #endif
@@ -48043,7 +50482,7 @@ static void ssl_ReadComplete_( PCLIENT pc, struct ssl_session** ses, POINTER buf
 				LeaveCriticalSec( &ses[0]->csReadWrite );
 				if( ses[0]->deleteInUse ){
 					lprintf( "Pending close... was in-use when closed. (DO CLOSE!)");
-					ssl_CloseSession( pc );
+					ssl_CloseSession( pc, ses[0]->closeLinger );
 				}
 			}
 		}
@@ -48066,6 +50505,21 @@ static void ssl_ReadComplete( PCLIENT pc, POINTER buffer, size_t length ) {
 void ssl_WriteData( struct ssl_session *session, POINTER buffer, size_t length ) {
 	ssl_ReadComplete_( NULL, &session, buffer, length );
 }
+#ifdef __NOTE_TO_SELF_USE_TLS_BUFFERING___
+// When setting up the SSL connection:
+BIO *buf_bio = BIO_new(BIO_f_buffer());
+ // 16KB buffer for headers
+BIO_int_ctrl(buf_bio, BIO_C_SET_BUFF_SIZE, 16384, NULL);
+ // Push it onto your network socket BIO
+BIO_push(buf_bio, network_bio);
+// Inside your send code:
+ // Goes into the 16KB buffer
+SSL_write(ssl, GetText(send), GetTextSize(send));
+ // Zero copy, flushes the buffer out smoothly
+SSL_write(ssl, options->content, options->contentLen);
+ // Force anything remaining out to the network
+BIO_flush(buf_bio);
+#endif
 LOGICAL ssl_SendPipe( struct ssl_session **ses, CPOINTER buffer, size_t length )
 {
 	int len;
@@ -48155,10 +50609,14 @@ unsigned long pthreads_thread_id(void)
 {
 	return (unsigned long)GetThisThreadID();
 }
+// ex_data slot on the SSL itself, so the servername callback can get straight to the
+// accepting session instead of searching a list that other threads are mutating.
+static int ssl_ex_session_idx = -1;
 LOGICAL ssl_InitLibrary( void ){
 	if( !ssl_global.flags.bInited )
 	{
 		SSL_library_init();
+		ssl_ex_session_idx = SSL_get_ex_new_index( 0, (void*)"sack ssl_session", NULL, NULL, NULL );
 		ssl_global.lock_cs = NewArray( uint32_t, CRYPTO_num_locks() );
 		memset( ssl_global.lock_cs, 0, sizeof( uint32_t ) * CRYPTO_num_locks() );
 		CRYPTO_set_locking_callback(win32_locking_callback);
@@ -48180,6 +50638,7 @@ static void ssl_InitSession( struct ssl_session *ses ) {
 	//InitializeCriticalSec( &ses->csWrite );
 }
 void ssl_ClosePipe( struct ssl_session **ses ) {
+	struct ssl_session *session;
 	if (!ses[0]) {
 		//lprintf("(ClosePipe)already closed?");
 		return;
@@ -48189,23 +50648,30 @@ void ssl_ClosePipe( struct ssl_session **ses ) {
 		ses[0]->deleteInUse++;
 		return;
 	}
-	DeleteCriticalSec( &ses[0]->csReadWrite );
+	// Take the session away atomically before tearing it down.  The JS end() thread
+	// (RemoveClient -> ssl_CloseSession) and a network thread (InternalRemoveClientExx
+	// -> close.CloseCallback -> ssl_CloseCallback) both reach here for the same
+	// connection; the !ses[0] test above is a TOCTOU that lets both through, and the
+	// loser then double-frees ->ssl / ->ctx (crash was in SSL_CTX_free).  Only the
+	// thread that takes the pointer runs the teardown.
+	session = (struct ssl_session*)(uintptr_t)LockedExchangePtrSzVal( ses, 0 );
+	if( !session ) return;
+	DeleteCriticalSec( &session->csReadWrite );
 	//DeleteCriticalSec( &ses->csWrite );
-	Release( ses[0]->dbuffer );
-	Release( ses[0]->ibuffer );
-	Release( ses[0]->obuffer );
-	if( ses[0]->cert ) {
-		EVP_PKEY_free( ses[0]->cert->pkey );
-		X509_free( ses[0]->cert->x509 );
-		Release( ses[0]->cert );
+	Release( session->dbuffer );
+	Release( session->ibuffer );
+	Release( session->obuffer );
+	if( session->cert ) {
+		EVP_PKEY_free( session->cert->pkey );
+		X509_free( session->cert->x509 );
+		Release( session->cert );
 	}
-	SSL_free( ses[0]->ssl );
-	SSL_CTX_free( ses[0]->ctx );
+	SSL_free( session->ssl );
+	SSL_CTX_free( session->ctx );
 	// these are closed... with the ssl connection.
 	//BIO_free( ses->rbio );
 	//BIO_free( ses->wbio );
-	Release( ses[0] );
-	ses[0] = NULL;
+	Release( session );
 }
 // this is from network layer, so it will be a PCLIENT
 static void ssl_CloseCallback( PCLIENT pc ) {
@@ -48248,8 +50714,13 @@ static void ssl_ClientConnected( PCLIENT pcServer, PCLIENT pcNew ) {
 	struct ssl_session *ses;
 	ses = New( struct ssl_session );
 	MemSet( ses, 0, sizeof( struct ssl_session ) );
-	pcNew->dwFlags &= ~CF_CONNECT_ISSUED;
+	ClearClientFlags( pcNew, CF_CONNECT_ISSUED );
 	ses->ssl = SSL_new( pcServer->ssl_session->ctx );
+	if( !ses->ssl ) {
+		lprintf( "Failed to allcoate a new ssl session" );
+		DebugBreak();
+		return;
+	}
 	{
 		static uint32_t tick;
 		tick++;
@@ -48263,6 +50734,8 @@ static void ssl_ClientConnected( PCLIENT pcServer, PCLIENT pcNew ) {
 #endif
 	ses->hostname = DupCStrLen( (CTEXTSTR)"no extension", 12 );
 	ses->pc = pcNew;
+ // servername callback looks this up
+	SSL_set_ex_data( ses->ssl, ssl_ex_session_idx, ses );
 	AddLink( &pcServer->ssl_session->accepting, ses );
 	ses->errorCallback = pcServer->ssl_session?pcServer->ssl_session->errorCallback:pcServer->errorCallback;
 	ses->psvErrorCallback = pcServer->ssl_session?pcServer->ssl_session->psvErrorCallback:pcServer->psvErrorCallback;
@@ -48289,9 +50762,9 @@ static void ssl_ClientConnected( PCLIENT pcServer, PCLIENT pcNew ) {
 	ses->recv_callback = ssl_layer_recver;
 	ses->psvSendRecv = (uintptr_t)pcNew;
 	pcNew->read.ReadComplete = ssl_ReadComplete;
-	pcNew->dwFlags &= ~CF_CPPREAD;
+	ClearClientFlags( pcNew, CF_CPPREAD );
 	pcNew->close.CloseCallback = ssl_CloseCallback;
-	pcNew->dwFlags &= ~CF_CPPCLOSE;
+	ClearClientFlags( pcNew, CF_CPPCLOSE );
 }
 struct ssl_session* ssl_ClientPipeConnected( struct ssl_session* session, uintptr_t psvNew, void (*read)(uintptr_t psv, POINTER, size_t), void ( **write )( struct ssl_session *session, POINTER, size_t )
 				, void ( *connect )( uintptr_t psv, POINTER, size_t ), void (*close)(uintptr_t psv ), void (*netrecv)(uintptr_t psv, POINTER, size_t), void (*netsend)(uintptr_t psv, POINTER, size_t) ) {
@@ -48309,6 +50782,8 @@ struct ssl_session* ssl_ClientPipeConnected( struct ssl_session* session, uintpt
 	SSL_set_accept_state( ses->ssl );
 	ses->hostname = DupCStrLen( (CTEXTSTR)"no extension", 12 );
 	ses->pc = (PCLIENT)psvNew;
+ // servername callback looks this up
+	SSL_set_ex_data( ses->ssl, ssl_ex_session_idx, ses );
 	AddLink( &session->accepting, ses);
 	//pcNew->ssl_session = ses;
 #ifdef DEBUG_SSL_IO_VERBOSE
@@ -48329,10 +50804,11 @@ static int handleServerName( SSL* ssl, int* al, void* param ) {
 	struct ssl_session* ses = (struct ssl_session*)param;
 	struct ssl_session* ssl_Accept;
 	INDEX idx;
-	LIST_FORALL( ses->accepting, idx, struct ssl_session*, ssl_Accept) {
-		if( ses && (ses->ssl == ssl) )
-			break;
-	}
+	// same as the libressl branch below: look the session up on the SSL rather than
+	// walking the unlocked accepting list.  (The walk this replaces also tested
+	// `ses->ssl == ssl` - the listener - instead of the `ssl_Accept` it was iterating,
+	// so it never actually matched on the entries it was searching.)
+	ssl_Accept = (struct ssl_session*)SSL_get_ex_data( ssl, ssl_ex_session_idx );
 	if( !ssl_Accept ) {
 		lprintf( "FATAL, NO SUCH ACCEPTING SOCKET" );
 		return 0;
@@ -48385,7 +50861,7 @@ static int handleServerName( SSL* ssl, int* al, void* param ) {
 					while( ofs < len ) {
 						int plen = buf[2 + ofs];
 						char const* p = (char const*)buf + 3 + ofs;
-						AddLink( &ssl_Accept->ssl_session->protocols, SegCreateFromCharLen( p, plen ) );
+						AddLink( &ssl_Accept->protocols, SegCreateFromCharLen( p, plen ) );
 						ofs += plen + 1;
 					}
 				}
@@ -48408,7 +50884,7 @@ static int handleServerName( SSL* ssl, int* al, void* param ) {
 								INDEX idx;
 								struct ssl_hostContext* hostctx;
 								unsigned char const* host = buf + 5;
-								ssl_Accept->ssl_session->hostname = DupCStrLen( (CTEXTSTR)host, strlen );
+								ssl_Accept->hostname = DupCStrLen( (CTEXTSTR)host, strlen );
 								//lprintf( "Have hostchange: %.*s", strlen, host );
 								LIST_FORALL( ctxList[0], idx, struct ssl_hostContext*, hostctx ) {
 									char* checkName;
@@ -48457,18 +50933,20 @@ static int handleServerName( SSL* ssl, int* al, void* param ) {
 static int handleServerName( SSL* ssl, int* al, void* param ) {
 	//PCLIENT pcListener = (PCLIENT)param;
 	struct ssl_session* ses = (struct ssl_session*)param;
-	PLIST list = ses->accepting;
 	struct ssl_session *ssl_Accept;
 	INDEX idx;
-	LIST_FORALL( list, idx, struct ssl_session*, ssl_Accept ) {
-		if( ssl_Accept->ssl == ssl)
-			break;
-	}
+	// The session is hung off the SSL itself at accept time.  Searching ses->accepting
+	// for it used to dereference every entry (ssl_Accept->ssl == ssl) while other
+	// threads were AddLink/SetLink-ing that same unlocked PLIST - at any real handshake
+	// concurrency this faults on an entry being replaced mid-walk.
+	ssl_Accept = (struct ssl_session*)SSL_get_ex_data( ssl, ssl_ex_session_idx );
 	if( !ssl_Accept ) {
 		lprintf( "FATAL, NO SUCH ACCEPTING SOCKET" );
 		return 0;
 	}
-	SetLink( &ses->accepting, idx, NULL );
+	// remove by value - there is no walk to hand us an index any more, and comparing
+	// pointers (rather than dereferencing each entry) cannot fault on a stale one.
+	DeleteLink( &ses->accepting, ssl_Accept );
 	PLIST* ctxList = &ses->hosts;
 	// if no hosts to check.
 	if( !ctxList[0] ) return SSL_TLSEXT_ERR_OK;
@@ -48496,12 +50974,14 @@ static int handleServerName( SSL* ssl, int* al, void* param ) {
 	LIST_FORALL( ctxList[0], idx, struct ssl_hostContext*, hostctx ) {
 		char const* checkName;
 		char const* nextName;
-		size_t maxhosts = StrLen( hostctx->host );
+		size_t maxhosts;
 		if( !hostctx->host ) {
+			// a host context registered without a name is the default/fallback cert
 			//lprintf(" No host - setup default result?" );
 			defaultHostctx = hostctx;
 			continue;
 		}
+		maxhosts = StrLen( hostctx->host );
 		//lprintf( "Host:%s", hostctx->host );
 		for( checkName = hostctx->host; checkName ? (nextName = StrChr( checkName, '~' )), 1 : 0; checkName = nextName ) {
 			//lprintf( "check: %s next: %s %d", checkName, nextName, maxhosts );
@@ -48520,9 +51000,26 @@ static int handleServerName( SSL* ssl, int* al, void* param ) {
 		}
 	}
 	if( defaultHostctx ) {
-		//SSL_set_SSL_CTX( ssl, defaultHostctx->ctx );
-		//return SSL_TLSEXT_ERR_OK;
-		return SSL_TLSEXT_ERR_NOACK;
+		// a nameless host context was registered as the fallback; use its cert.
+		// (NOACK here would leave the accepting SSL_CTX in place, which carries no
+		// certificate of its own, so the handshake would fail instead of falling back.)
+		SSL_set_SSL_CTX( ssl, defaultHostctx->ctx );
+		return SSL_TLSEXT_ERR_OK;
+	}
+	if( !strlen ) {
+		// The client sent no SNI at all (connected to a bare IP, or older tooling).
+		// The match loop above cannot select anything in that case - every configured
+		// name has a non-zero length, so the namelen != strlen test skips them all.
+		// With exactly one host context configured there is no ambiguity to resolve,
+		// so accept using it rather than failing the handshake.  With several, the
+		// choice really is ambiguous; fall through to the error below.
+		if( GetLinkCount( ctxList[0] ) == 1 ) {
+			hostctx = (struct ssl_hostContext*)GetLink( ctxList, 0 );
+			if( hostctx ) {
+				SSL_set_SSL_CTX( ssl, hostctx->ctx );
+				return SSL_TLSEXT_ERR_OK;
+			}
+		}
 	}
 	//lprintf( "NOACK! %p", ssl_Accept );
 	ssl_Accept->noHost = TRUE;
@@ -48632,7 +51129,7 @@ struct ssl_hostContext* ssl_setupHost( struct ssl_session* ses, CTEXTSTR hosts, 
 		}
 		*/
 		if( certStruc && certStruc->chain ) {
-			lprintf( "checking cert because chain was made?");
+			//lprintf( "checking cert because chain was made?");
 			r = SSL_CTX_use_certificate( ctx->ctx, sk_X509_value( certStruc->chain, 0 ) );
 			if( r <= 0 ) {
 				ERR_print_errors_cb( logerr, (void*)__LINE__ );
@@ -48723,9 +51220,9 @@ LOGICAL ssl_BeginServer_v2( PCLIENT pc, CPOINTER cert, size_t certlen
 			ses_o->cpp_user_connected = pc->pcOther->connect.CPPClientConnected;
 		}
 		pc->connect.ClientConnected = ssl_ClientConnected;
-		pc->dwFlags &= ~CF_CPPCONNECT;
+		ClearClientFlags( pc, CF_CPPCONNECT );
 		if( pc->pcOther ) {
-			pc->pcOther->dwFlags &= ~CF_CPPCONNECT;
+			ClearClientFlags( pc->pcOther, CF_CPPCONNECT );
 			pc->pcOther->connect.ClientConnected = ssl_ClientConnected;
 		}
 		ses->errorCallback = pc->errorCallback;
@@ -48794,13 +51291,14 @@ static int verify_cb( int preverify_ok, X509_STORE_CTX *ctx) {
 		err = X509_V_ERR_CERT_CHAIN_TOO_LONG;
 		X509_STORE_CTX_set_error(ctx, err);
 	}
-	if( !mydata->always_continue )
+	if( !mydata->always_continue ) {
 		if (!preverify_ok ) {
 			lprintf("verify error:num=%d:%s:depth=%d:%s", err,
 				   X509_verify_cert_error_string(err), depth, buf);
 		} else if (mydata->verbose_mode) {
 			lprintf("depth=%d:%s", depth, buf);
 		}
+	}
 	/*
 	 * At this point, err contains the last verification error. We can use
 	 * it for something special
@@ -48896,6 +51394,10 @@ LOGICAL ssl_BeginClientSession( PCLIENT pc, CPOINTER client_keypair, size_t clie
 	//LOGICAL status =
 	ssl_BeginClientSession_( ses, client_keypair, client_keypairlen, keypass, keypasslen, rootCert, rootCertLen );
 	{
+		// SNI (RFC 6066 server_name) must be a bare DNS hostname: strip any :port,
+		// and emit nothing for IP literals (leading digit = numeric IPv4/IPv6, or
+		// bracketed [ipv6]).  A stored name may carry a nonstandard :port (default
+		// ports are not appended); IIS/HTTP.sys rejects a "host:port" SNI as Bad Host.
 		const char *addr = GetAddrName( pc->saClient );
 		SSL_set_tlsext_host_name( ses->ssl, addr );
 	}
@@ -48910,7 +51412,7 @@ LOGICAL ssl_BeginClientSession( PCLIENT pc, CPOINTER client_keypair, size_t clie
 	ses->recv_callback = ssl_layer_recver;
 	ses->psvSendRecv = (uintptr_t)pc;
 	pc->read.ReadComplete = ssl_ReadComplete;
-	pc->dwFlags &= ~CF_CPPREAD;
+	ClearClientFlags( pc, CF_CPPREAD );
 	ses->errorCallback = pc->errorCallback;
 	ses->psvErrorCallback = pc->psvErrorCallback;
 	pc->ssl_session = ses;
@@ -48997,7 +51499,7 @@ void ssl_EndSecure(PCLIENT pc, POINTER buffer, size_t length ) {
 #if defined( DEBUG_SSL_FALLBACK )
 			lprintf( "is ssl_session gone(yes)? %p %p %d %d %p", pc, pc->ssl_session, pc->ssl_session?pc->ssl_session->deleteInUse:-1, pc->ssl_session?pc->ssl_session->inUse:-1, pc->read.CPPReadComplete );
 #endif
-			pc->dwFlags |= CF_CONNECT_ISSUED;
+			SetClientFlags( pc, CF_CONNECT_ISSUED );
 			if( pc->pcServer->ssl_session->dwOriginalFlags & CF_CPPCONNECT )
 				pc->pcServer->ssl_session->cpp_user_connected( pc->pcServer->psvConnect, pc );
 			else
@@ -49090,8 +51592,8 @@ struct entry entries[] =
 {
     { "countryName", "US" },
     { "stateOrProvinceName", "FL" },
-    { "localityName", "Fernandina Beach" },
-    { "organizationName", "d3x0r.org" },
+    { "localityName", "Here" },
+    { "organizationName", "none specified" },
     { "organizationalUnitName", "Development" },
     { "commonName", "Internal Project" },
 };
@@ -49204,12 +51706,12 @@ struct internalCert * MakeRequest( void )
 			TEXTCHAR org[48];
 			TEXTCHAR country[8];
 #ifndef __NO_OPTIONS__
-			SACK_GetProfileString( "TLS", "Default CA Common Name", "d3x0r.org", commonName, 48 );
-			SACK_GetProfileString( "TLS", "Default CA Org", "Freedom Collective", org, 48 );
+			SACK_GetProfileString( "TLS", "Default CA Common Name", "NotSpecified", commonName, 48 );
+			SACK_GetProfileString( "TLS", "Default CA Org", "NotSpecified", org, 48 );
 			SACK_GetProfileString( "TLS", "Default CA Country", "US", country, 8 );
 #else
-			strcpy( commonName, "d3x0r.org" );
-			strcpy( org, "Freedom Collective" );
+			strcpy( commonName, "NotSpecified" );
+			strcpy( org, "NotSpecified" );
 			strcpy( country, "US" );
 #endif
 			name = X509_get_subject_name( x509 );
@@ -49272,7 +51774,7 @@ void loadSystemCerts( SSL_CTX* ctx,X509_STORE *store )
 		lprintf( "FATAL, CANNOT OPEN ROOT STORE" );
 		return;
 	}
-	while (pContext = CertEnumCertificatesInStore(hStore, pContext))
+	while ((pContext = CertEnumCertificatesInStore(hStore, pContext)))
 	{
 		//uncomment the line below if you want to see the certificates as pop ups
 		//CryptUIDlgViewContext(CERT_STORE_CERTIFICATE_CONTEXT, pContext,   NULL, NULL, 0, NULL);
@@ -49560,6 +52062,12 @@ WEBSOCKET_EXPORT void SetWebSocketPipeDataCompletion( struct html5_web_socket* w
 typedef struct web_socket_input_state *WebSocketInputState;
 struct web_socket_input_state
 {
+	// The socket this input state is reading, so protocol-level failures detected in
+	// the common parser (which is handed only the input state) can be reported with
+	// the peer identity attached - web_socket_error takes a PCLIENT, and an
+	// application reacting to an abusive peer needs its address.  NULL for pipe
+	// sockets, which have no PCLIENT.
+	PCLIENT pc;
 	struct web_socket_common_flags
 	{
 		BIT_FIELD closed : 1;
@@ -49628,8 +52136,8 @@ struct web_socket_input_state
 	uintptr_t psv_on;
  // result of the open, to pass to read
 	uintptr_t psv_open;
-	int close_code;
-	char *close_reason;
+	//int close_code;
+	//char *close_reason;
 	//struct html5_web_socket* socket;
  // when set by enable auto_ping is the delay between packets to generate a ping
 	uint32_t ping_delay;
@@ -49921,10 +52429,31 @@ void ProcessWebSockProtocol( WebSocketInputState websock, const uint8_t* msg, si
 			{
 				if( websock->frame_length > 125 )
 				{
-					lprintf( "Bad length of control packet: %" _size_f, length );
-					// RemoveClient( websock->pc );
+					// 126/127 in the 7-bit field are the extended-length markers, which a
+					// control frame may never use, so this frame is unparseable.  Dropping
+					// the bytes and hoping the next packet resynchronises cannot work on a
+					// stream protocol -- there is no frame boundary to find.  Report the
+					// error and drop the connection instead.
+					lprintf( "Bad control packet: length field %" _size_f " exceeds the 125 byte limit"
+					         " (buffer held %" _size_f " bytes); dropping connection"
+					       , (size_t)websock->frame_length, (size_t)length );
+					// psv_open, NOT psv_on: the error callback is registered as "this gets
+					// psv returned from open" (websocket_module.cc ~2997), same as on_close
+					// which passes psv_open at the bottom of this function.  Passing psv_on
+					// yields a bogus object whose eventQueue pointer lands in unrelated
+					// memory; EnqueLinkEx then spins on a lock word that never reads zero and
+					// the peer thread wedges forever holding the client read lock, taking
+					// every other socket it owns deaf with it.
+					if( websock->on_error )
+						websock->on_error( websock->pc, websock->psv_open
+						                 , SACK_NETWORK_ERROR_WS_BAD_CONTROL_FRAME );
+					else if( websock->pc )
+						TriggerNetworkErrorCallback( websock->pc, SACK_NETWORK_ERROR_WS_BAD_CONTROL_FRAME );
 					ResetInputState( websock );
-					// drop the rest of the data, maybe the beginning of the next packet will make us happy
+					if( websock->pc )
+						RemoveClient( websock->pc );
+					else if( websock->do_close )
+						websock->do_close( websock->psvCloser );
 					return;
 				}
 			}
@@ -50008,6 +52537,33 @@ void ProcessWebSockProtocol( WebSocketInputState websock, const uint8_t* msg, si
 			if( websock->fragment_collection_avail < ( websock->fragment_collection_length + websock->frame_length ) )
 			{
 				uint8_t* new_fragbuf;
+				// frame_length comes off the wire - a 64-bit length frame can claim up
+				// to 2^63 - and fragments accumulate across continuation frames, so
+				// without a ceiling a peer can drive this Allocate without bound and
+				// exhaust memory.  Refuse the message instead, and report it so the
+				// application can decide what to do about the peer (rate limit, ban,
+				// firewall rule); a bare disconnect gives it nothing to act on.
+				if( ( websock->fragment_collection_length + websock->frame_length )
+				    > WEBSOCKET_MAX_MESSAGE_SIZE )
+				{
+					lprintf( "websocket message of %" _size_f " bytes exceeds the %" _size_f " byte limit; refusing"
+					       , (size_t)( websock->fragment_collection_length + websock->frame_length )
+					       , (size_t)WEBSOCKET_MAX_MESSAGE_SIZE );
+					// psv_open, not psv_on -- see the note at the control-frame check above.
+					// This site had the same defect and would wedge a peer thread instead of
+					// closing the socket if the size limit were ever hit.
+					if( websock->on_error )
+						websock->on_error( websock->pc, websock->psv_open
+						                 , SACK_NETWORK_ERROR_WS_MESSAGE_TOO_BIG );
+					else if( websock->pc )
+						TriggerNetworkErrorCallback( websock->pc, SACK_NETWORK_ERROR_WS_MESSAGE_TOO_BIG );
+					ResetInputState( websock );
+					if( websock->pc )
+						RemoveClient( websock->pc );
+					else if( websock->do_close )
+						websock->do_close( websock->psvCloser );
+					return;
+				}
 				websock->fragment_collection_avail += websock->frame_length;
 				if( websock->fragment_collection_avail > websock->fragment_collection_buffer_size ) {
 					new_fragbuf = (uint8_t*)Allocate( websock->fragment_collection_avail * 2 );
@@ -50113,29 +52669,66 @@ void ProcessWebSockProtocol( WebSocketInputState websock, const uint8_t* msg, si
 					if( !websock->flags.closed )
 					{
 						//lprintf( "reply close with same payload." );
-						SendWebSocketMessage( websock, 0x08, 1, websock->flags.expect_masking, websock->fragment_collection, websock->frame_length );
+						if( websock->frame_length == 1 ) {
+							// RFC 6455 7.4.1: a Close frame with a 1-byte body is malformed.
+							// The spec says to treat it as a protocol error (1002) and close
+							// the connection.  The code below was sending the same 1-byte
+							// body back, which is not a valid Close frame, so the peer would
+							// have to ignore it and close anyway.
+							// send a proper Close frame with a 1002 code and a reason string instead.
+ // 1002 in network byte order
+							static const uint8_t _1002[] = { 0x03, 0xea
+										, 'P','r','o','t','o','c','o','l',' ','E','r','r','o','r',',',' '
+										,'s','h','o','r','t',' ','c','l','o','s','e',' ','c','o','d','e','.'};
+							websock->frame_length = 0;
+							SendWebSocketMessage( websock, 0x08, 1, websock->flags.expect_masking, _1002, sizeof(_1002) );
+						}else
+							SendWebSocketMessage( websock, 0x08, 1, websock->flags.expect_masking, websock->fragment_collection, websock->frame_length );
 						websock->flags.closed = 1;
 					}
 					if( websock->on_close ) {
 						int code;
 						char buf[128];
 						if( websock->frame_length > 2 ) {
-							// assume the buffer is longer by 1 so the NUL terminator gets put after the string
+							// assume the buffer is longer by 1 so the NUL terminator gets
+							// put after the string (By strncpy which MUST put NUL)
 							StrCpyEx( buf, (char*)(websock->fragment_collection + 2), websock->frame_length - 1 );
 							//buf[websock->frame_length - 2] = 0;
 							code = ((int)websock->fragment_collection[0] << 8) + websock->fragment_collection[1];
 						}
-						else if( websock->frame_length ) {
-							code = ((int)websock->fragment_collection[0] << 8) + websock->fragment_collection[1];
-							buf[0] = 0;
-						}
 						else {
-							code = 1000;
+							// frame_length == 1: a body that cannot carry the 2-byte status
+							// code, so the frame is malformed.  Reading fragment_collection[1]
+							// here was a 1-byte overread synthesising a code out of 1.5 bytes.
+							// Report "no code" instead.  (RFC 6455 7.4.1 would treat this as a
+							// protocol error, 1002 -- available if strictness is ever wanted.)
+							// frame_length == 0: No body at all means no status code: 5.5.1 puts the code INSIDE
+							// the body, so absent body == absent code.  0 is the internal
+							// "none" sentinel; the JS binding maps it to 1005 "No Status Rcvd".
+							// Reporting 1000 here was a fabrication -- it told the local
+							// handler "normal closure, explicitly stated" while the echo on the
+							// wire correctly said nothing at all.  Two stories, one close.
+							code = 1;
 							buf[0] = 0;
 						}
-						websock->close_code = code;
-						websock->close_reason = DupCStrLen( buf, websock->frame_length - 2 );
-						websock->on_close( (PCLIENT)websock->psvSender, websock->psv_open, code, buf );
+						//websock->close_code = code;
+						// frame_length is size_t: a Close frame with an EMPTY payload gives
+						// 0 - 2 = SIZE_MAX-1 here (and 1 - 2 = SIZE_MAX), which either
+						// allocates absurdly or overflows length+1 to a tiny block and then
+						// copies enormously.  The corruption surfaces at the NEXT allocation
+						// -- the StrDup(reason) inside the on_close handler below.
+						// An empty Close body is legal (RFC 6455 5.5.1: the frame MAY have a
+						// body), and is what WebSocket.close() with no code sends, so any
+						// conformant peer can trigger it with one packet.  Browsers always
+						// send a 2-byte code, which is why this was never seen in production.
+						//websock->close_reason = NULL;
+						// comes from the wire; last message - saved state
+						// clears the callback, so even the close() event won't re-use this close_reason
+						websock->on_close( (PCLIENT)websock->psvSender, websock->psv_open
+						                 , code == 0 ? 1005 : code == 1 ? 1002 : code
+						                 , code == 0 ?"Close with no body; no code, no reason."
+						                 : code == 1 ?"Remote close with incomplete numeric code."
+						                 : buf );
 						websock->on_close = NULL;
 					}
 					websock->fragment_collection_length = 0;
@@ -50549,6 +53142,12 @@ MD5_PROC( void, MD5Final )(unsigned char [16], MD5_CTX *);
 typedef struct web_socket_input_state *WebSocketInputState;
 struct web_socket_input_state
 {
+	// The socket this input state is reading, so protocol-level failures detected in
+	// the common parser (which is handed only the input state) can be reported with
+	// the peer identity attached - web_socket_error takes a PCLIENT, and an
+	// application reacting to an abusive peer needs its address.  NULL for pipe
+	// sockets, which have no PCLIENT.
+	PCLIENT pc;
 	struct web_socket_common_flags
 	{
 		BIT_FIELD closed : 1;
@@ -50617,8 +53216,8 @@ struct web_socket_input_state
 	uintptr_t psv_on;
  // result of the open, to pass to read
 	uintptr_t psv_open;
-	int close_code;
-	char *close_reason;
+	//int close_code;
+	//char *close_reason;
 	//struct html5_web_socket* socket;
  // when set by enable auto_ping is the delay between packets to generate a ping
 	uint32_t ping_delay;
@@ -50787,12 +53386,12 @@ HTML5_WEBSOCKET_PROC( PCLIENT, WebSocketSetProtocols )( PCLIENT pc, const char *
 /* a server side utility to get the request headers that came in.
 this is for going through proxy agents mostly where the header might have x-forwarded-for
 */
-HTML5_WEBSOCKET_PROC( PLIST, GetWebSocketHeaders )( PCLIENT pc );
+HTML5_WEBSOCKET_PROC( PNVLIST, GetWebSocketHeaders )( PCLIENT pc );
 /* for server side sockets, get the requested resource path from the client request.
 */
 HTML5_WEBSOCKET_PROC( PTEXT, GetWebSocketResource )( PCLIENT pc );
 HTML5_WEBSOCKET_PROC( HTTPState, GetWebSocketHttpState )( PCLIENT pc );
-HTML5_WEBSOCKET_PROC( PLIST, GetWebSocketPipeHeaders )( struct html5_web_socket* socket );
+HTML5_WEBSOCKET_PROC( PNVLIST, GetWebSocketPipeHeaders )( struct html5_web_socket* socket );
 HTML5_WEBSOCKET_PROC( PTEXT, GetWebSocketPipeResource )( struct html5_web_socket* socket );
 HTML5_WEBSOCKET_PROC( HTTPState, GetWebSocketPipeHttpState )( struct html5_web_socket* socket );
 HTML5_WEBSOCKET_PROC( void, ResetWebsocketRequestHandler )( PCLIENT pc_client );
@@ -50809,6 +53408,7 @@ HTML5_WEBSOCKET_NAMESPACE_END
 USE_HTML5_WEBSOCKET_NAMESPACE
 #endif
 HTML5_WEBSOCKET_NAMESPACE
+//#define DEBUG_WEBSOCKET_CLOSE
 #define WSS_DEFAULT_BUFFER_SIZE 4096
 typedef struct html5_web_socket *HTML5WebSocket;
 const TEXTCHAR *wssbase64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
@@ -51002,20 +53602,51 @@ uintptr_t WebSocketPipeGetServerData( HTML5WebSocket socket ) {
 }
 static void CPROC destroyHttpState( HTML5WebSocket socket, PCLIENT pc_client ) {
 	//HTML5WebSocket socket = (HTML5WebSocket)GetNetworkLong( pc_client, 0 );
+	if( !socket ) return;
 	if( socket->input_state.flags.in_open_event ) {
+		// not a destroy yet - deferred until the open event finishes; leave Magic alone.
 		socket->flags.closed = 1;
 		return;
 	}
-	SetNetworkLong( pc_client, 0, 0 );
+	// Two threads reach here for the same socket: the JS end() thread via
+	// RemoveClient -> ssl_CloseSession (which closes synchronously), and a network
+	// thread via InternalRemoveClientExx.  A plain "is it still valid" test is a
+	// TOCTOU - both read a valid Magic, both proceed, and the loser then reads fields
+	// the winner has already torn down.  The observed fault read close_reason as
+	// 0xFACEBEAD... (FREE_MEMORY_TAG = never allocated, as opposed to
+	// CLEAR_MEMORY_TAG 0xDEADBEEF... which marks released), so the loser was reading
+	// memory that is not a live allocation at all, and handing it to Release.
+	// Claim the teardown atomically: only the thread that takes the valid Magic away
+	// runs it, everyone else returns immediately.
+	uint32_t magic = LockedExchange( &socket->Magic, 0 );
+	if( magic != 0x20130912 && magic != 0x20240310 ) {
+		//lprintf( "destroyHttpState: socket %p already claimed by another thread", socket );
+		return;
+	}
+	//lprintf( "destoyHttpState %p %p", socket, pc_client );
+	if( pc_client ) {
+		SetNetworkLong( pc_client, 0, 0 );
+		SetNetworkLong( pc_client, 1, 0 );
+	}
+ // Magic was zeroed by the claim above
+	else if( magic == 0x20130912 && socket->pc ) {
+		// freeing without a close event (deferred destroy); the client must not
+		// be able to reach this socket after it is freed, or a later close
+		// event reads freed memory.
+		SetNetworkLong( socket->pc, 0, 0 );
+		SetNetworkLong( socket->pc, 1, 0 );
+	}
 	//lprintf( "ServerWebSocket Connection closed event..." );
 	if( pc_client && socket->input_state.on_close && socket->input_state.psv_open  ) {
-		socket->input_state.on_close( pc_client, socket->input_state.psv_open, socket->input_state.close_code, socket->input_state.close_reason );
+		web_socket_closed close = socket->input_state.on_close;
+		socket->input_state.on_close = NULL;
+		close( pc_client, socket->input_state.psv_open, 1006, "HTTP State Destroyed" );
 	}
 	else if( pc_client && socket->input_state.on_http_close ) {
-		socket->input_state.on_http_close( pc_client, socket->input_state.psv_on );
+		web_socket_http_close close = socket->input_state.on_http_close;
+		socket->input_state.on_http_close = NULL;
+		close( pc_client, socket->input_state.psv_on );
 	}
-	if( socket->input_state.close_reason )
-		Deallocate( char*, socket->input_state.close_reason );
 #ifndef __NO_WEBSOCK_COMPRESSION__
 	if( socket->input_state.flags.deflate ) {
 		deflateEnd( &socket->input_state.deflater );
@@ -51026,11 +53657,17 @@ static void CPROC destroyHttpState( HTML5WebSocket socket, PCLIENT pc_client ) {
 #endif
 	Deallocate( uint8_t*, socket->input_state.fragment_collection );
 	DestroyHttpState( socket->http_state );
+	socket->http_state = NULL;
 	Deallocate( POINTER, socket->buffer );
+#ifdef DEBUG_WEBSOCKET_CLOSE
+ // TRACE close-path debugging
+	lprintf( "WSS destroy socket %p pc %p/%p", socket, pc_client, socket->pc );
+#endif
 	Deallocate( HTML5WebSocket, socket );
 }
 static void CPROC read_complete_process_data( HTML5WebSocket socket ) {
 	int result;
+	//lprintf( "Got some data, process it...");
 	while( ( result = ProcessHttp( socket->http_state, socket->input_state.on_send, socket->input_state.psvSender ) ) ) {
 		switch( result ) {
 		default:
@@ -51287,6 +53924,7 @@ void WebSocketWrite( HTML5WebSocket socket, CPOINTER buffer, size_t length )
 {
 	if( buffer )
 	{
+		//lprintf( "more data on socket?");
 		if( !( socket->input_state.flags.initial_handshake_done
              || socket->input_state.flags.in_open_event )
           || socket->flags.http_request_only )
@@ -51305,6 +53943,7 @@ void WebSocketWrite( HTML5WebSocket socket, CPOINTER buffer, size_t length )
 	}
 	else
 	{
+		//lprintf( "First read on socket..");
 		// it's possible that we ended SSL on first read and are falling back...
 		// re-check here to see if it's still SSL.
 		// buffer is allocated by SSL layer if it is enabled.
@@ -51331,16 +53970,17 @@ void WebSocketWrite( HTML5WebSocket socket, CPOINTER buffer, size_t length )
 		}
 	}
 }
-static void CPROC read_complete( PCLIENT pc, POINTER buffer, size_t length )
+static void CPROC read_complete( uintptr_t psv, POINTER buffer, size_t length )
 {
-	HTML5WebSocket socket = (HTML5WebSocket)GetNetworkLong( pc, 0 );
+//GetNetworkLong( pc, 0 );
+	HTML5WebSocket socket = (HTML5WebSocket)psv;
 	if( !socket ) {
-		lprintf( "read wasn't initilaized yet with socket %p %p", pc, socket );
+		lprintf( "read wasn't initilaized yet with socket %p %p", socket->pc, socket );
  // closing/closed....
 		return;
 	}
 	WebSocketWrite( socket, buffer, length );
-	if( socket->input_state.flags.use_ssl  && !ssl_IsClientSecure( pc ) ) {
+	if( socket->input_state.flags.use_ssl  && !ssl_IsClientSecure( socket->pc ) ) {
 		socket->input_state.flags.use_ssl = 0;
 		socket->input_state.on_send = WebSocketSendTCP;
 	}
@@ -51348,16 +53988,22 @@ static void CPROC read_complete( PCLIENT pc, POINTER buffer, size_t length )
 		if( socket->flags.skip_read )
 			socket->flags.skip_read = 0;
 		else
-			ReadTCP( pc, socket->buffer, WSS_DEFAULT_BUFFER_SIZE );
+			ReadTCP( socket->pc, socket->buffer, WSS_DEFAULT_BUFFER_SIZE );
 	}
 }
-static void CPROC closed( PCLIENT pc_client ) {
+static void CPROC closed( uintptr_t psv  ) {
+	HTML5WebSocket socket = (HTML5WebSocket)psv;
+	PCLIENT pc_client = socket->pc;
 	// this better be the last operation - this is a network socket close callback.
-	HTML5WebSocket socket = (HTML5WebSocket)GetNetworkLong( pc_client, 0 );
+#ifdef DEBUG_WEBSOCKET_CLOSE
+ // TRACE close-path debugging
+	lprintf( "WSS closed event %p socket %p", pc_client, socket );
+#endif
+	if( socket )
  // does all of the memory cleanup (lower case d)
-	destroyHttpState( socket, pc_client );
-	SetNetworkLong( pc_client, 0, 0 );
-	SetNetworkLong( pc_client, 1, 0 );
+		destroyHttpState( socket, pc_client );
+	//SetNetworkLong( pc_client, 0, 0 );
+	//SetNetworkLong( pc_client, 1, 0 );
 }
 static void CPROC connected( PCLIENT pc_server, PCLIENT pc_new )
 {
@@ -51373,19 +54019,22 @@ static void CPROC connected( PCLIENT pc_server, PCLIENT pc_new )
  // clone callback methods and config flags
 	socket->input_state = server_socket->input_state;
 #endif
-	socket->input_state.close_code = 1006;
-	socket->input_state.close_reason = StrDup( "Because I don't Like You?");
+	SetTCPNoDelay( pc_new, TRUE );
+	//socket->input_state.close_code = 1006;
+	//socket->input_state.close_reason = "Because I don't Like You?";
 	socket->input_state.psvSender = (uintptr_t)pc_new;
+	// after the clone above, which would otherwise overwrite it with the listener's
+	socket->input_state.pc = pc_new;
 	// assume secure, when the handshake fails, it demotes to insecure
 	socket->input_state.flags.use_ssl = 1;
 	socket->input_state.on_send = WebSocketSendSSL;
  // start a new http state collector
-	socket->http_state = CreateHttpState( &socket->pc );
+	socket->http_state = CreateHttpState(&socket->pc);
 	//lprintf( "Init socket: handshake: %p %p  %d", pc_new, socket, socket->flags.initial_handshake_done );
 	SetNetworkLong( pc_new, 0, (uintptr_t)socket );
 	SetNetworkLong( pc_new, 1, (uintptr_t)&socket->input_state );
-	SetNetworkReadComplete( pc_new, read_complete );
-	SetNetworkCloseCallback( pc_new, closed );
+	SetCPPNetworkReadComplete( pc_new, read_complete, (uintptr_t)socket );
+	SetCPPNetworkCloseCallback( pc_new, closed, (uintptr_t)socket );
 }
 PCLIENT WebSocketCreate_v2( CTEXTSTR hosturl
                           , web_socket_opened on_open
@@ -51404,7 +54053,7 @@ PCLIENT WebSocketCreate_v2( CTEXTSTR hosturl
 	socket->input_state.on_close = on_closed;
 	socket->input_state.on_error = on_error;
 	socket->input_state.psv_on = psv;
-	socket->input_state.close_code = 1006;
+	//socket->input_state.close_code = 1006;
 	struct url_data *url = SACK_URLParse( hosturl );
 	socket->pc = OpenTCPListenerAddr_v2( CreateSockAddress( url->host, url->port?url->port:url->default_port )
 		, connected
@@ -51438,7 +54087,7 @@ HTML5WebSocket WebSocketPipeConnect( HTML5WebSocket pipe, uintptr_t psvNew ) {
 	socket->input_state.psvSender = psvNew;
 	// this new socket gets a http state.
  // start a new http state collector
-	socket->http_state = CreateHttpState( &socket->pc );
+	socket->http_state = CreateHttpState(&socket->pc);
 	//lprintf( "Init socket: handshake: %p %p  %d", pc_new, socket, socket->flags.initial_handshake_done );
 	return socket;
 }
@@ -51487,7 +54136,7 @@ HTML5WebSocket WebSocketCreateServerPipe( web_socket_opened on_open
 	socket->input_state.on_http_close = ws_http_close;
 	socket->input_state.on_fragment_done = ws_completion;
 	socket->input_state.psv_on = psv;
-	socket->input_state.close_code = 1006;
+	//socket->input_state.close_code = 1006;
 	socket->input_state.flags.use_ssl = 0;
 	// an accepted socket should have an http state - the listener itself doesn't use one.
  // CreateHttpState( &socket->pc ); // start a new http state collector
@@ -51523,7 +54172,8 @@ void WebSocketPipeEof( HTML5WebSocket pipe ) {
 void WebSocketPipeAccept( HTML5WebSocket socket, char *protocols, int yesno ) {
 	PVARTEXT pvt_output = VarTextCreate();
 	PTEXT key1, key2, value;
-	if( !(socket->flags.accepted = yesno) ) {
+	socket->flags.accepted = yesno;
+	if (!yesno) {
 		vtprintf( pvt_output, "HTTP/1.1 403 Connection refused\r\n" );
 		value = VarTextPeek( pvt_output );
 		if( socket->input_state.on_send )
@@ -51657,7 +54307,7 @@ PCLIENT WebSocketCreate( CTEXTSTR hosturl
 {
 	return WebSocketCreate_v2( hosturl, on_open, on_event, on_closed, on_error, psv, 0 );
 }
-PLIST GetWebSocketHeaders( PCLIENT pc ) {
+PNVLIST GetWebSocketHeaders( PCLIENT pc ) {
 	HTML5WebSocket socket = (HTML5WebSocket)GetNetworkLong( pc, 0 );
 	if( socket && socket->Magic == 0x20130912 ) {
 		return GetHttpHeaderFields( socket->http_state );
@@ -51682,7 +54332,7 @@ HTTPState GetWebSocketHttpState( PCLIENT pc ) {
 	}
 	return NULL;
 }
-PLIST GetWebSocketPipeHeaders( HTML5WebSocket socket ) {
+PNVLIST GetWebSocketPipeHeaders( HTML5WebSocket socket ) {
 	if( socket && socket->Magic == 0x20240310 ) {
 		return GetHttpHeaderFields( socket->http_state );
 	}
@@ -52030,9 +54680,10 @@ static void CPROC WebSocketClientReceive( PCLIENT pc, POINTER buffer, size_t len
 	{
 		if( !websock )
 		{
-			if( websock = wsc_local.opening_client )
+			if( ( websock = wsc_local.opening_client ) )
 			{
-				//SetTCPNoDelay( pc, TRUE );
+   // avoid Nagle/delayed-ACK stall on chunked TLS/WS records
+				SetTCPNoDelay( pc, TRUE );
 				SetNetworkLong( pc, 0, (uintptr_t)wsc_local.opening_client );
 				SetNetworkLong( pc, 1, (uintptr_t)&wsc_local.opening_client->input_state );
  // clear this to allow open to return.
@@ -52101,14 +54752,9 @@ static void CPROC WebSocketClientClosed( PCLIENT pc )
 	{
 		//lprintf( "Send close to application." );
 		if( websock->input_state.on_close ) {
-			if( websock->flags.connected )
-				websock->input_state.on_close( pc, websock->input_state.psv_on, websock->input_state.close_code, websock->input_state.close_reason );
-			else
-				websock->input_state.on_close( pc, websock->input_state.psv_on, 1006, "Connection Failed" );
+			websock->input_state.on_close( pc, websock->input_state.psv_on, 1006, "Connection Failed" );
 			websock->input_state.on_close = NULL;
 		}
-		if( websock->input_state.close_reason )
-			Deallocate( char*, websock->input_state.close_reason );
 		Deallocate( uint8_t*, websock->input_state.fragment_collection );
 		Release( websock->buffer );
 		DestroyHttpState( websock->pHttpState );
@@ -52168,7 +54814,7 @@ PCLIENT WebSocketOpen( CTEXTSTR url_address
 	//va_arg args;
 	//va_start( args, psv );
 	websock->buffer = Allocate( 4096 );
-	websock->pHttpState = CreateHttpState( &websock->pc );
+	websock->pHttpState = CreateHttpState(&websock->pc);
 	websock->input_state.on_open = on_open;
 	websock->input_state.on_event = on_event;
 	websock->input_state.on_close = on_closed;
@@ -52177,8 +54823,8 @@ PCLIENT WebSocketOpen( CTEXTSTR url_address
 	websock->protocols = protocols;
  // client to server is MUST mask because of proxy handling in that direction
 	websock->input_state.flags.expect_masking = 1;
-	websock->input_state.close_code = 1006;
-	websock->input_state.close_reason = StrDup( "Socket Close" );
+	//websock->input_state.close_code = 1006;
+	//websock->input_state.close_reason = NULL;
 	websock->url = SACK_URLParse( url_address );
 	if( !websock->url->host ) {
 		SACK_ReleaseURL( websock->url );
@@ -52206,6 +54852,9 @@ PCLIENT WebSocketOpen( CTEXTSTR url_address
 		{
 			SetNetworkLong( websock->pc, 0, (uintptr_t)websock );
 			SetNetworkLong( websock->pc, 1, (uintptr_t)&websock->input_state );
+ // so the common parser can report errors against this peer
+			websock->input_state.pc = websock->pc;
+			SetTCPNoDelay( websock->pc, TRUE );
 #ifndef NO_SSL
 			if( StrCaseCmp( websock->url->protocol, "wss" ) == 0 )
 				websock->input_state.flags.use_ssl = 1;
@@ -52297,6 +54946,20 @@ void WebSocketPipeClose( struct html5_web_socket* wss, int code, const char* rea
 }
 static void WebSocketEnableAutoPing_( WebSocketInputState input , uint32_t delay )
 {
+		// This never actually pings.  WebSocketTimer walks wsc_local.clients, and
+		// nothing anywhere adds to that list, so its body never runs for any socket -
+		// ping_delay, last_reception and sent_ping are read only from inside that
+		// unreachable loop.  Left in place rather than silently removed so existing
+		// callers keep linking, but say so, because a caller here believes it has a
+		// keep-alive and does not.
+		// A control-frame ping is the wrong layer for this regardless: a browser's
+		// WebSocket API gives script no access to ping/pong frames, so the server
+		// learning that a peer is gone never reaches a browser client.  Put the
+		// heartbeat in the protocol layer instead - see the server/client protocol
+		// modules under apps/http-ws, which exchange it as an ordinary message.
+		lprintf( "WebSocketEnableAutoPing: not implemented - no pings will be sent."
+		         "  Use a protocol-level heartbeat (apps/http-ws protocol modules);"
+		         " browsers cannot observe websocket ping/pong control frames." );
 		if( !wsc_local.timer )
 			wsc_local.timer = AddTimer( 2000, WebSocketTimer, 0 );
 		input->ping_delay = delay;
@@ -52466,7 +55129,7 @@ JSON_EMITTER_PROC( int, json_parse_add_data )( struct json_parse_state *context
                                              , size_t msglen
                                              );
 // these are common functions that work for json or json6 stream parsers
-JSON_EMITTER_PROC( PDATALIST, json_parse_get_data )( struct json_parse_state *context );
+JSON_EMITTER_PROC( PNVDATALIST, json_parse_get_data )( struct json_parse_state *context );
 // get actual allocated root for a value... allows holding that.
 JSON_EMITTER_PROC( const char *, json_get_parse_buffer )(struct json_parse_state *pState, const char *buf);
 JSON_EMITTER_PROC( void, json_parse_dispose_state )( struct json_parse_state **context );
@@ -52507,7 +55170,7 @@ JSON_EMITTER_PROC( int, json6_parse_add_data )( struct json_parse_state *context
                                               , size_t msglen
                                               );
 JSON_EMITTER_PROC( LOGICAL, json_decode_message )( struct json_context *format
-                                                 , PDATALIST parsedMsg
+                                                 , PNVDATALIST parsedMsg
                                                  , struct json_context_object **result_format
                                                  , POINTER *msg_data_out
                                                  );
@@ -53105,12 +55768,14 @@ static void json_state_init( struct json_parse_state *state )
 	if( !ppQueue[0] ) ppQueue[0] = CreateLinkQueue();
 // CreateLinkQueue();
 	state->inBuffers = ppQueue;
-	state->inBuffers[0]->Top = state->inBuffers[0]->Bottom = 0;
+	state->inBuffers[0]->Top = 0;
+	state->inBuffers[0]->Bottom = 0;
 	ppQueue = GetFromSet( PLINKQUEUE, &jpsd.linkQueues );
 	if( !ppQueue[0] ) ppQueue[0] = CreateLinkQueue();
 // CreateLinkQueue();
 	state->outQueue = ppQueue;
-	state->outQueue[0]->Top = state->outQueue[0]->Bottom = 0;
+	state->outQueue[0]->Top = 0;
+	state->outQueue[0]->Bottom = 0;
 	ppList = GetFromSet( PLIST, &jpsd.listSet );
 	if( ppList[0] ) ppList[0]->Cnt = 0;
 	state->outValBuffers = ppList;
@@ -53981,7 +56646,7 @@ static void FillDataToElement( struct json_context_object_element *element
 }
 */
 LOGICAL json_decode_message( struct json_context *format
-								, PDATALIST msg_data
+								, PNVDATALIST msg_data
 								, struct json_context_object **result_format
 								, POINTER *_msgbuf )
 {
@@ -56066,7 +58731,7 @@ int json6_parse_add_data( struct json_parse_state *state
 	logTick(9);
 	return retval;
 }
-PDATALIST json_parse_get_data( struct json_parse_state *state ) {
+PNVDATALIST json_parse_get_data( struct json_parse_state *state ) {
 	PDATALIST *result = state->elements;
 // CreateDataList( sizeof( state->val ) );
 	state->elements = GetFromSet( PDATALIST, &jpsd.dataLists );
@@ -56077,13 +58742,13 @@ PDATALIST json_parse_get_data( struct json_parse_state *state ) {
 void json_parse_clear_state( struct json_parse_state *state ) {
 	if( state ) {
 		PPARSE_BUFFER buffer;
-		while( buffer = (PPARSE_BUFFER)PopLink( state->outBuffers ) ) {
+		while( ( buffer = (PPARSE_BUFFER)PopLink( state->outBuffers ) ) ) {
 			Deallocate( const char *, buffer->buf );
 			DeleteFromSet( PARSE_BUFFER, jpsd.parseBuffers, buffer );
 		}
-		while( buffer = (PPARSE_BUFFER)DequeLinkNL( state->inBuffers ) )
+		while( ( buffer = (PPARSE_BUFFER)DequeLinkNL( state->inBuffers ) ) )
 			DeleteFromSet( PARSE_BUFFER, jpsd.parseBuffers, buffer );
-		while( buffer = (PPARSE_BUFFER)DequeLinkNL( state->outQueue ) ) {
+		while( ( buffer = (PPARSE_BUFFER)DequeLinkNL( state->outQueue ) ) ) {
 			Deallocate( const char*, buffer->buf );
 			DeleteFromSet( PARSE_BUFFER, jpsd.parseBuffers, buffer );
 		}
@@ -56138,10 +58803,10 @@ const char *json_get_parse_buffer( struct json_parse_state *pState, const char *
 	INDEX idx;
 	PPARSE_BUFFER buffer;
 	//lprintf( "Getting buffer from %p", pState );
-	for( idx = 0; buffer = (PPARSE_BUFFER)PeekLinkEx( pState->outBuffers, idx ); idx++ )
+	for( idx = 0; ( buffer = (PPARSE_BUFFER)PeekLinkEx( pState->outBuffers, idx ) ); idx++ )
 		if( ((uintptr_t)buf) >= ((uintptr_t)buffer->buf) && ((uintptr_t)buf) < ((uintptr_t)buffer->pos) )
 			return buffer->buf;
-	for( idx = 0; buffer = (PPARSE_BUFFER)PeekQueueEx( *pState->outQueue, (int)idx ); idx++ )
+	for( idx = 0; ( buffer = (PPARSE_BUFFER)PeekQueueEx( *pState->outQueue, (int)idx ) ); idx++ )
 		if( ((uintptr_t)buf) >= ((uintptr_t)buffer->buf) && ((uintptr_t)buf) < ((uintptr_t)buffer->pos) )
 			return buffer->buf;
 	LIST_FORALL( pState->outValBuffers[0], idx, PPARSE_BUFFER, buffer ) {
@@ -56157,7 +58822,7 @@ void json_parse_dispose_state( struct json_parse_state **ppState ) {
 	PPARSE_BUFFER buffer;
 	_json_dispose_message( state->elements );
 	//DeleteDataList( &state->elements );
-	while( buffer = (PPARSE_BUFFER)PopLink( state->outBuffers ) ) {
+	while( ( buffer = (PPARSE_BUFFER)PopLink( state->outBuffers ) ) ) {
 		Deallocate( const char *, buffer->buf );
 		DeleteFromSet( PARSE_BUFFER, jpsd.parseBuffers, buffer );
 	}
@@ -56173,9 +58838,9 @@ void json_parse_dispose_state( struct json_parse_state **ppState ) {
 		DeleteFromSet( PLIST, jpsd.listSet, state->outValBuffers );
 		//DeleteList( &state->outValBuffers );
 	}
-	while( buffer = (PPARSE_BUFFER)DequeLinkNL( state->inBuffers ) )
+	while( ( buffer = (PPARSE_BUFFER)DequeLinkNL( state->inBuffers ) ) )
 		DeleteFromSet( PARSE_BUFFER, jpsd.parseBuffers, buffer );
-	while( buffer = (PPARSE_BUFFER)DequeLinkNL( state->outQueue ) ) {
+	while( ( buffer = (PPARSE_BUFFER)DequeLinkNL( state->outQueue ) ) ) {
 		Deallocate( const char*, buffer->buf );
 		DeleteFromSet( PARSE_BUFFER, jpsd.parseBuffers, buffer );
 	}
@@ -56415,7 +59080,7 @@ JSOX_PARSER_PROC( int, jsox_parse_add_data )(struct jsox_parse_state *context
 	, size_t msglen
 	);
 JSOX_PARSER_PROC( PTEXT, jsox_parse_get_error )(struct jsox_parse_state *state);
-JSOX_PARSER_PROC( PDATALIST, jsox_parse_get_data )(struct jsox_parse_state *context);
+JSOX_PARSER_PROC( PNVDATALIST, jsox_parse_get_data )(struct jsox_parse_state *context);
 // single all-in-one parsing of an input buffer.
 JSOX_PARSER_PROC( LOGICAL, jsox_parse_message )(const char * msg
 	, size_t msglen
@@ -56450,7 +59115,7 @@ JSOX_PARSER_PROC( char *, jsox_escape_string )(const char *string);
 	jsox_get_parsed_value() returns a value from a PDATALIST
 	jsox_get_parsed_object_value() and jsox_get_parsed_array_value() :  returns a value from a value member.
 */
-JSOX_PARSER_PROC( struct jsox_value_container *, jsox_get_parsed_value )(PDATALIST pdlMessage, const char *path
+JSOX_PARSER_PROC( struct jsox_value_container *, jsox_get_parsed_value )(PNVDATALIST pdlMessage, const char *path
 	, void( *callback )(uintptr_t psv, struct jsox_value_container *val), uintptr_t psv
 	);
 JSOX_PARSER_PROC( struct jsox_value_container *, jsox_get_parsed_object_value )(struct jsox_value_container *pdlMessage, const char *path
@@ -56593,7 +59258,7 @@ enum jsox_parse_object_context_modes {
 /*
 #define JSOX_RESET_VAL()  {	  val.value_type = JSOX_VALUE_UNSET;	 val.contains = NULL;	              val._contains = NULL;	             val.name = NULL;	                  val.string = NULL;	                val.className = NULL;	             negative = FALSE; }
 */
-#define JSOX_RESET_STATE_VAL()  {	  state->val.value_type = JSOX_VALUE_UNSET;	 state->val.contains = NULL;	              state->val._contains = NULL;	             state->val.name = NULL;	                  state->val.string = NULL;	                state->val.className = NULL;	             state->completedString = FALSE;	          state->negative = FALSE; }
+#define JSOX_RESET_STATE_VAL()  {	  state->val.value_type = JSOX_VALUE_UNSET;	 state->val.contains = NULL;	              state->val._contains = NULL;	             state->val.name = NULL;	                  state->val.string = NULL;	                state->val.className = NULL;	             state->completedString = FALSE;	          state->signPending = FALSE;	              state->negative = FALSE; }
 struct jsox_input_buffer {
       // prior input buffer
 	char const * buf;
@@ -56679,6 +59344,10 @@ struct jsox_parse_state {
 	enum jsox_word_char_states word;
 	LOGICAL status;
 	LOGICAL negative;
+	// A '+' or '-' has been consumed and its number has not started yet.  The sign
+	// belongs to the literal, so nothing may come between them -- "+ 8" is a sign
+	// with no number followed by a second value, which is an expression, not JSOX.
+	LOGICAL signPending;
 	LOGICAL literalString;
 	PLINKSTACK *context_stack;
 	PLIST classes;
@@ -56807,12 +59476,14 @@ static void jsox_state_init( struct jsox_parse_state *state )
 	if( !ppQueue[0] ) ppQueue[0] = CreateLinkQueue();
 // CreateLinkQueue();
 	state->inBuffers = ppQueue;
-	state->inBuffers[0]->Top = state->inBuffers[0]->Bottom = 0;
+	state->inBuffers[0]->Top = 0;
+	state->inBuffers[0]->Bottom = 0;
 	ppQueue = GetFromSet( PLINKQUEUE, &jxpsd.linkQueues );
 	if( !ppQueue[0] ) ppQueue[0] = CreateLinkQueue();
 // CreateLinkQueue();
 	state->outQueue = ppQueue;
-	state->outQueue[0]->Top = state->outQueue[0]->Bottom = 0;
+	state->outQueue[0]->Top = 0;
+	state->outQueue[0]->Bottom = 0;
 	ppList = GetFromSet( PLIST, &jxpsd.listSet );
 	if( ppList[0] ) ppList[0]->Cnt = 0;
 	state->outValBuffers = ppList;
@@ -57771,7 +60442,42 @@ static void pushValue( struct jsox_parse_state *state, PDATALIST *pdl, struct js
 		//lprintf( "Setting value type as JSOX_VALUD_TYPED_ARRAY+%d",val->value_type - JSOX_VALUE_TYPED_ARRAY );
 		if( (val->value_type - JSOX_VALUE_TYPED_ARRAY) >= 0 && (val->value_type - JSOX_VALUE_TYPED_ARRAY) < 12 ) {
 			struct jsox_value_container *innerVal = (struct jsox_value_container *)GetDataItem( &val->contains, 0 );
-			val->string = (char*)DecodeBase64Ex( innerVal->string, innerVal->stringLen, &val->stringLen, NULL );
+			// A base64 payload is a string token.  A loose (unquoted) string cannot start
+			// with a digit -- that lexes as a number -- so the stringifier quotes every
+			// payload that does.  Decoding a number's decimal text invents bytes, and a
+			// leading zero (a real base64 digit) is already lost by the time it gets here,
+			// so refuse it rather than hand back something that cannot round-trip.
+			if( innerVal && innerVal->value_type == JSOX_VALUE_NUMBER ) {
+				if( !state->pvtError ) state->pvtError = VarTextCreate();
+				vtprintf( state->pvtError, "Invalid base64 payload; a payload starting with a digit must be quoted at %" _size_f " %" _size_f ":%" _size_f, state->n, state->line, state->col );
+				state->status = FALSE;
+				return;
+			}
+			// `ab[]` carries no payload at all -- an empty buffer, not a decode.  Passing
+			// the NULL through is safe now that DecodeBase64Ex guards a zero length.
+			val->string = (char*)DecodeBase64Ex( innerVal ? innerVal->string : NULL
+			                                   , innerVal ? innerVal->stringLen : 0
+			                                   , &val->stringLen, NULL );
+			{
+				// The payload has to decode to a whole number of elements.  Anything that
+				// emitted an f32 emitted a multiple of 4, so a remainder means the data is
+				// damaged.  Truncating instead -- a 6-byte payload became a 1-element
+				// Float32Array and the other 2 bytes were dropped without a word -- turns
+				// malformed input into plausible-looking data, which is the worst of the
+				// available outcomes.  ("ab" is index 0 and has no element size.)
+				static const size_t elementSize[12] = { 1,1,1,1, 2,2, 4,4, 8,8, 4,8 };
+				size_t per = elementSize[val->value_type - JSOX_VALUE_TYPED_ARRAY];
+				if( per > 1 && ( val->stringLen % per ) ) {
+					if( !state->pvtError ) state->pvtError = VarTextCreate();
+					vtprintf( state->pvtError, "bad encoding for typed array data; %" _size_f " bytes is not a multiple of %" _size_f " at %" _size_f " %" _size_f ":%" _size_f
+					        , val->stringLen, per, state->n, state->line, state->col );
+					Release( val->string );
+					val->string = NULL;
+					val->stringLen = 0;
+					state->status = FALSE;
+					return;
+				}
+			}
 		}
 	}
 	AddDataItem( pdl, val );
@@ -57813,7 +60519,7 @@ int jsox_parse_add_data( struct jsox_parse_state *state
 	if( !state->status )
 		return -1;
 	if( msg && msglen ) {
-		if( input = (PJSOX_PARSE_BUFFER)PeekQueue( state->inBuffers[0] ) ) {
+		if( ( input = (PJSOX_PARSE_BUFFER)PeekQueue( state->inBuffers[0] ) ) ) {
 			size_t used = input->pos - input->buf;
 			size_t unused = input->size - used;
 			if( input->tempBuf || ( unused < 6 ) ) {
@@ -57925,6 +60631,27 @@ int jsox_parse_add_data( struct jsox_parse_state *state
 					state->status = FALSE;
 					return -1;
 				}
+				// A bare word that is a prefix of a keyword -- 'fal', 'tru', 'nul',
+				// 'Na', 'In', 'undefine' ... -- reaches the end of input still
+				// mid-match, with no following character to trigger the usual
+				// recovery, so it never becomes the string it plainly is.  Recover it
+				// here exactly as a delimiter would have; JSOX's own parser gained
+				// the same step in 1.2.123.
+				if( state->val.value_type == JSOX_VALUE_UNSET
+				 && state->word != JSOX_WORD_POS_RESET ) {
+					// the buffer that carried the input was already retired when it was
+					// consumed (nothing was pending in it), so take a fresh one for the
+					// recovered text to live in; val.string will point into it.  The
+					// longest partial keyword is 8 characters ("undefine", "-Infinit").
+					output = (struct jsox_output_buffer*)GetFromSet( JSOX_PARSE_BUFFER, &state->parseBuffers );
+					output->pos = output->buf = NewArray( char, 16 );
+					output->size = 16;
+/*' '*/
+ // space is not appended
+					recoverIdent( state, output, 32 );
+					output->pos[0] = 0;
+					PushLink( state->outBuffers, output );
+				}
 				if( state->val.value_type || state->word != JSOX_WORD_POS_RESET ) {
 					state->completed = 1;
 				}
@@ -57977,6 +60704,11 @@ int jsox_parse_add_data( struct jsox_parse_state *state
 #if defined( DEBUG_PARSING ) && defined( DEBUG_CHARACTER_PARSING )
 			lprintf( "parse character %c %d %d %d %d", c<32?'.':c, state->word, state->parse_context, state->val.value_type, state->word );
 #endif
+			// A sign only reaches the next character; whatever that is either starts
+			// the number it belongs to or ends its claim on one.  Captured and cleared
+			// here so exactly one character sees it.
+			const LOGICAL sawSignPending = state->signPending;
+			state->signPending = FALSE;
 			state->col++;
 			newN = input->pos - input->buf;
 			if( newN > input->size ) {
@@ -57985,6 +60717,18 @@ int jsox_parse_add_data( struct jsox_parse_state *state
 				break;
 			}
 			state->n = newN;
+			// A sign binds to the literal it precedes, so the very next character has to
+			// begin one: a digit, a '.', or the 'I'/'N' of Infinity/NaN.  Anything else
+			// leaves the sign with no number -- "+ 8" is a second value ("1 + 3" is an
+			// expression, not JSOX), and "+_0" quietly dropped the sign and produced the
+			// string "_0" ('_' is a digit separator, but it cannot start the number).
+			if( sawSignPending
+			 && !( ( c >= '0' && c <= '9' ) || c == '.' || c == 'I' || c == 'N' ) ) {
+				state->status = FALSE;
+				if( !state->pvtError ) state->pvtError = VarTextCreate();
+				vtprintf( state->pvtError, "extra data after token; sign is not followed by a number at %" _size_f "  %" _size_f ":%" _size_f, state->n, state->line, state->col );
+				break;
+			}
 			if( state->comment ) {
 				if( state->comment == 1 ) {
 					if( c == '*' ) { state->comment = 3; continue; }
@@ -58090,7 +60834,7 @@ int jsox_parse_add_data( struct jsox_parse_state *state
 						// allow starting a new word
 						state->word = JSOX_WORD_POS_RESET;
 					}
-					if( ( state->parse_context == JSOX_CONTEXT_OBJECT_FIELD ) ) {
+					if( state->parse_context == JSOX_CONTEXT_OBJECT_FIELD ) {
 						if( state->current_class ) {
 							if( state->objectContext == JSOX_OBJECT_CONTEXT_CLASS_FIELD ) {
 								// allow blank comma at end to not be a field
@@ -58337,6 +61081,13 @@ int jsox_parse_add_data( struct jsox_parse_state *state
 					// empty comma , field,field... woudlbe ,,,, '
 				}
 				else if( state->parse_context == JSOX_CONTEXT_IN_ARRAY ) {
+					// A partial keyword ended by this comma -- [fal,1] -- is a string,
+					// the same as it is in a field value below.  It has to be recovered
+					// before the EMPTY default claims the slot, or the word is dropped
+					// and the element silently becomes an elided one instead.
+					if( state->word > JSOX_WORD_POS_END
+					 && state->word < JSOX_WORD_POS_FIELD )
+						recoverIdent( state, output, c );
 					if( state->val.value_type == JSOX_VALUE_UNSET )
  // in an array, elements after a comma should init as undefined...
 						state->val.value_type = JSOX_VALUE_EMPTY;
@@ -58650,7 +61401,7 @@ int jsox_parse_add_data( struct jsox_parse_state *state
 						if( state->parse_context == JSOX_CONTEXT_UNKNOWN )
 							state->completed = TRUE;
 						break;
-					} else if( (state->word == JSOX_WORD_POS_RESET) ) {
+					} else if( state->word == JSOX_WORD_POS_RESET ) {
 						break;
 					} else if( state->word == JSOX_WORD_POS_FIELD ) {
 						if( state->val.string ) {
@@ -58762,7 +61513,20 @@ int jsox_parse_add_data( struct jsox_parse_state *state
 					//
 					//----------------------------------------------------------
 				case '-':
-					state->negative = !state->negative;
+					if( state->word == JSOX_WORD_POS_RESET ) {
+						state->negative = !state->negative;
+						state->signPending = TRUE;
+					}
+					else recoverIdent( state, output, c );
+					break;
+				case '+':
+					// A leading '+' is a sign, not the first character of the number --
+					// falling into the number gatherer below meant "+ 8" collected just
+					// "+" and converted to 0, losing the value.  Consumed and ignored at
+					// value start, exactly as JSOX's own parser does; anywhere else it
+					// is part of an identifier.
+					if( state->word != JSOX_WORD_POS_RESET ) recoverIdent( state, output, c );
+					else state->signPending = TRUE;
 					break;
 				default:
 					if( state->word == JSOX_WORD_POS_RESET && ( (c >= '0' && c <= '9') || (c == '+') || (c == '.') ) )
@@ -58803,12 +61567,35 @@ int jsox_parse_add_data( struct jsox_parse_state *state
 								continue;
 							if( c >= '0' && c <= '9' )
 							{
+								// A digit still has to be legal in the radix that was written.
+								// IntCreateFromTextRef stops at the first one that is not, so
+								// `0b12` quietly became 1 instead of an error.  (The prefix was
+								// stored lower-cased at index 1, so this only tests one case.)
+								if( state->fromHex
+								 && ( ( state->val.string[1] == 'b' && c > '1' )
+								   || ( state->val.string[1] == 'o' && c > '7' ) ) ) {
+									state->status = FALSE;
+									if( !state->pvtError ) state->pvtError = VarTextCreate();
+									vtprintf( state->pvtError, "fault while parsing number; '%c' unexpected at %" _size_f "  %" _size_f ":%" _size_f, c, state->n, state->line, state->col );
+									break;
+								}
 								(*output->pos++) = c;
 								if( state->exponent )
 									state->exponent_digit = TRUE;
 							}
 							// to be implemented
-							else if( c == ':' || c == '-' || c == 'T' || c == 'Z' || c == '+' ) {
+							// '-' and '+' belong to a date here only where ISO-8601 puts
+							// them: the two separators in YYYY-MM-DD, or a zone offset once
+							// ':'/'T'/'Z' has established this is a date.  Taking them
+							// unconditionally swallowed them everywhere and made the
+							// exponent handling below unreachable -- "123+44" silently
+							// became 12344, and "1e+5" only worked by falling in here.
+							else if( c == ':' || c == 'T' || c == 'Z'
+							      || ( ( c == '-' || c == '+' )
+							         && ( state->numberFromDate
+							            || ( c == '-'
+							               && ( ( output->pos - state->val.string ) == 4
+							                  || ( output->pos - state->val.string ) == 7 ) ) ) ) ) {
 								/* toISOString()
 								var today = new Date('05 October 2011 14:48 UTC');
 								console.log(today.toISOString());
@@ -58817,6 +61604,18 @@ int jsox_parse_add_data( struct jsox_parse_state *state
 								(*output->pos++) = c;
 								if( c != '+' && c != '-' )
 									state->numberFromDate = TRUE;
+							}
+							else if( state->fromHex && state->val.string[1] == 'x'
+							       && ( ( c >= 'a' && c <= 'f' ) || ( c >= 'A' && c <= 'F' ) ) ) {
+								// Hex digits have to be taken before both the prefix branch just
+								// below and the exponent branch after it: 'b' and 'o' introduce a
+								// radix only at position 1, and 'e'/'E' mark an exponent in
+								// decimal but are ordinary digits in hex.  Without this every hex
+								// literal containing a letter faulted -- 0x10 parsed, 0xff did
+								// not -- and 0xe fell into the exponent branch instead.
+								// IntCreateFromTextRef already decodes a-f/A-F, so only the lexer
+								// was ever missing them.
+								(*output->pos++) = c;
 							}
 							else if( ( c == 'x' || c == 'b' || c =='o' || c == 'X' || c == 'B' || c == 'O')
 							       && ( output->pos - state->val.string) == 1
@@ -59028,9 +61827,15 @@ int jsox_parse_add_data( struct jsox_parse_state *state
 		}
 		state->completed = FALSE;
 	}
+	// That pushValue is the top-level value's, and it runs after the status check above,
+	// so anything it rejects had no way to be reported -- the caller got retval 1 and the
+	// half-built value as though it had parsed.  A nested value pushes earlier in the loop
+	// and so was caught; only the outermost one could slip through.
+	if( !state->status )
+		return -1;
 	return retval;
 }
-PDATALIST jsox_parse_get_data( struct jsox_parse_state *state ) {
+PNVDATALIST jsox_parse_get_data( struct jsox_parse_state *state ) {
 	PDATALIST *result = state->elements;
 	EnterCriticalSec( &jxpsd.cs_states );
 // CreateDataList( sizeof( state->val ) );
@@ -59047,7 +61852,7 @@ const char *jsox_get_parse_buffer( struct jsox_parse_state *pState, const char *
 	int idx;
 	PJSOX_PARSE_BUFFER buffer;
 	for( idx = 0; ; idx-- )
-		while( buffer = (PJSOX_PARSE_BUFFER)PeekLinkEx( pState->outBuffers, idx ) ) {
+		while( ( buffer = (PJSOX_PARSE_BUFFER)PeekLinkEx( pState->outBuffers, idx ) ) ) {
 			if( !buffer ) break;
 			if( ((uintptr_t)buf) >= ((uintptr_t)buffer->buf) && ((uintptr_t)buf) < ((uintptr_t)buffer->pos) )
 				return buffer->buf;
@@ -59094,25 +61899,15 @@ static uintptr_t jsox_FindDataList( void*p, uintptr_t psv ) {
 static PLINKQUEUE dispose_queue;
 static PTHREAD dispose_thread;
 static uintptr_t jsox_dispose_thread( PTHREAD thread ) {
-	PDATALIST msg_data;
+	PNVDATALIST msg_data;
 	while( 1 ) {
-		while( msg_data = (PDATALIST)DequeLink( &dispose_queue ) ) {
-			/*
-			INDEX listIndex = GetMemberIndex( PDATALIST, &jxpsd.dataLists, (POINTER)msg_data );
-			if( listIndex != INVALID_INDEX ) {
-				PDATALIST* actual = GetSetMember( PDATALIST, &jxpsd.dataLists, listIndex );
-				_jsox_dispose_message( actual );
-				DeleteSetMember( PDATALIST, &jxpsd.dataLists, listIndex );
-			} else
-			*/
-			{
-				uintptr_t actual = ForAllInSet( PDATALIST, jxpsd.dataLists, jsox_FindDataList, (uintptr_t)msg_data );
-				//lprintf( "Disposing message: %p %p", msg_data, actual );
-				if( actual )
-					_jsox_dispose_message( (PDATALIST*)actual );
-				else
-					lprintf( "Failed to find message to dispose (not from JSOX parsing?) %p", msg_data );
-			}
+		while( ( msg_data = (PNVDATALIST)DequeLink( &dispose_queue ) ) ) {
+			uintptr_t actual = ForAllInSet( PDATALIST, jxpsd.dataLists, jsox_FindDataList, (uintptr_t)msg_data );
+			//lprintf( "Disposing message: %p %p", msg_data, actual );
+			if( actual )
+				_jsox_dispose_message( (PDATALIST*)actual );
+			else
+				lprintf( "Failed to find message to dispose (not from JSOX parsing?) %p", msg_data );
 		}
 		WakeableSleep( 100000 );
 	}
@@ -59127,13 +61922,13 @@ void jsox_dispose_message( PDATALIST *msg_data ) {
 void jsox_parse_clear_state( struct jsox_parse_state *state ) {
 	if( state ) {
 		PJSOX_PARSE_BUFFER buffer;
-		while( buffer = (PJSOX_PARSE_BUFFER)PopLink( state->outBuffers ) ) {
+		while( ( buffer = (PJSOX_PARSE_BUFFER)PopLink( state->outBuffers ) ) ) {
 			Deallocate( const char *, buffer->buf );
 			DeleteFromSet( JSOX_PARSE_BUFFER, state->parseBuffers, buffer );
 		}
-		while( buffer = (PJSOX_PARSE_BUFFER)DequeLinkNL( state->inBuffers ) )
+		while( ( buffer = (PJSOX_PARSE_BUFFER)DequeLinkNL( state->inBuffers ) ) )
 			DeleteFromSet( JSOX_PARSE_BUFFER, state->parseBuffers, buffer );
-		while( buffer = (PJSOX_PARSE_BUFFER)DequeLinkNL( state->outQueue ) ) {
+		while( ( buffer = (PJSOX_PARSE_BUFFER)DequeLinkNL( state->outQueue ) ) ) {
 			Deallocate( const char*, buffer->buf );
 			DeleteFromSet( JSOX_PARSE_BUFFER, state->parseBuffers, buffer );
 		}
@@ -59202,7 +61997,7 @@ void jsox_parse_dispose_state( struct jsox_parse_state **ppState ) {
 	PJSOX_PARSE_BUFFER buffer;
 	EnterCriticalSec( &jxpsd.cs_states );
 	_jsox_dispose_message( state->elements );
-	while( buffer = (PJSOX_PARSE_BUFFER)PopLink( state->outBuffers ) ) {
+	while( ( buffer = (PJSOX_PARSE_BUFFER)PopLink( state->outBuffers ) ) ) {
 		Deallocate( const char *, buffer->buf );
 		DeleteFromSet( JSOX_PARSE_BUFFER, state->parseBuffers, buffer );
 	}
@@ -59217,10 +62012,10 @@ void jsox_parse_dispose_state( struct jsox_parse_state **ppState ) {
 		DeleteFromSet( PLIST, jxpsd.listSet, state->outValBuffers );
 		//DeleteList( &state->outValBuffers );
 	}
-	while( buffer = (PJSOX_PARSE_BUFFER)DequeLinkNL( state->inBuffers ) )
+	while( ( buffer = (PJSOX_PARSE_BUFFER)DequeLinkNL( state->inBuffers ) ) )
 		DeleteFromSet( JSOX_PARSE_BUFFER, state->parseBuffers, buffer );
 	state->val.string = NULL;
-	while( buffer = (PJSOX_PARSE_BUFFER)DequeLinkNL( state->outQueue ) ) {
+	while( ( buffer = (PJSOX_PARSE_BUFFER)DequeLinkNL( state->outQueue ) ) ) {
 		Deallocate( const char*, buffer->buf );
 		DeleteFromSet( JSOX_PARSE_BUFFER, state->parseBuffers, buffer );
 	}
@@ -59335,7 +62130,7 @@ struct jsox_value_container *jsox_get_parsed_object_value( struct jsox_value_con
 	}
 	return NULL;
 }
-struct jsox_value_container *jsox_get_parsed_value( PDATALIST pdlMessage, const char *path
+struct jsox_value_container *jsox_get_parsed_value( PNVDATALIST pdlMessage, const char *path
 	, void( *callback )(uintptr_t psv, struct jsox_value_container *val), uintptr_t psv
 ) {
 	INDEX idx;
@@ -59406,7 +62201,7 @@ VESL_EMITTER_PROC( int, vesl_parse_add_data )( struct vesl_parse_state *context
                                                  , size_t msglen
                                                  );
 // these are common functions that work for VESL stream parsers
-VESL_EMITTER_PROC( PDATALIST, vesl_parse_get_data )( struct vesl_parse_state *context );
+VESL_EMITTER_PROC( PNVDATALIST, vesl_parse_get_data )( struct vesl_parse_state *context );
 VESL_EMITTER_PROC( void, vesl_parse_dispose_state )( struct vesl_parse_state **context );
 // when an error occurs during streaming, use this to reset the parser and continue
 // using the existing parser.
@@ -59821,12 +62616,14 @@ static void vesl_state_init( struct vesl_parse_state *state )
 	if( !ppQueue[0] ) ppQueue[0] = CreateLinkQueue();
 // CreateLinkQueue();
 	state->inBuffers = ppQueue;
-	state->inBuffers[0]->Top = state->inBuffers[0]->Bottom = 0;
+	state->inBuffers[0]->Top = 0;
+	state->inBuffers[0]->Bottom = 0;
 	ppQueue = GetFromSet( PLINKQUEUE, &vpsd.linkQueues );
 	if( !ppQueue[0] ) ppQueue[0] = CreateLinkQueue();
 // CreateLinkQueue();
 	state->outQueue = ppQueue;
-	state->outQueue[0]->Top = state->outQueue[0]->Bottom = 0;
+	state->outQueue[0]->Top = 0;
+	state->outQueue[0]->Bottom = 0;
 	ppList = GetFromSet( PLIST, &vpsd.listSet );
 	if( ppList[0] ) ppList[0]->Cnt = 0;
 	state->outValBuffers = ppList;
@@ -59936,7 +62733,7 @@ static void vesl_dump_parse_level( PDATALIST *pdl, int level ) {
 			vesl_dump_parse_level( val->_contains, level + 1 );
 	}
 }
-static void vesl_dump_parse( PDATALIST pdl ) {
+static void vesl_dump_parse( PNVDATALIST pdl ) {
 	vesl_dump_parse_level( &pdl, 0 );
 }
 static int gatherString6v(struct vesl_parse_state *state, CTEXTSTR msg, CTEXTSTR *msg_input, size_t msglen, TEXTSTR *pmOut
@@ -60724,7 +63521,7 @@ struct vesl_parse_state * vesl_begin_parse( void )
 	vesl_state_init( state );
 	return state;
 }
-PDATALIST vesl_parse_get_data( struct vesl_parse_state *state ) {
+PNVDATALIST vesl_parse_get_data( struct vesl_parse_state *state ) {
 	PDATALIST *result = state->elements;
 // CreateDataList( sizeof( state->val ) );
 	state->elements = GetFromSet( PDATALIST, &vpsd.dataLists );
@@ -60754,13 +63551,13 @@ void _vesl_dispose_message( PDATALIST *msg_data )
 void vesl_parse_clear_state( struct vesl_parse_state* state ) {
 	if( state ) {
 		PVESL_PARSE_BUFFER buffer;
-		while( buffer = (PVESL_PARSE_BUFFER)PopLink( state->outBuffers ) ) {
+		while( ( buffer = (PVESL_PARSE_BUFFER)PopLink( state->outBuffers ) ) ) {
 			Deallocate( const char*, buffer->buf );
 			DeleteFromSet( VESL_PARSE_BUFFER, vpsd.parseBuffers, buffer );
 		}
-		while( buffer = (PVESL_PARSE_BUFFER)DequeLinkNL( state->inBuffers ) )
+		while( ( buffer = (PVESL_PARSE_BUFFER)DequeLinkNL( state->inBuffers ) ) )
 			DeleteFromSet( VESL_PARSE_BUFFER, vpsd.parseBuffers, buffer );
-		while( buffer = (PVESL_PARSE_BUFFER)DequeLinkNL( state->outQueue ) ) {
+		while( ( buffer = (PVESL_PARSE_BUFFER)DequeLinkNL( state->outQueue ) ) ) {
 			Deallocate( const char*, buffer->buf );
 			DeleteFromSet( VESL_PARSE_BUFFER, vpsd.parseBuffers, buffer );
 		}
@@ -60804,7 +63601,7 @@ void vesl_parse_dispose_state( struct vesl_parse_state **ppState ) {
 	PVESL_PARSE_BUFFER buffer;
 	_vesl_dispose_message( state->elements );
 	//DeleteDataList( &state->elements );
-	while( buffer = (PVESL_PARSE_BUFFER)PopLink( state->outBuffers ) ) {
+	while( ( buffer = (PVESL_PARSE_BUFFER)PopLink( state->outBuffers ) ) ) {
 		Deallocate( const char *, buffer->buf );
 		DeleteFromSet( VESL_PARSE_BUFFER, vpsd.parseBuffers, buffer );
 	}
@@ -60817,9 +63614,9 @@ void vesl_parse_dispose_state( struct vesl_parse_state **ppState ) {
 		DeleteFromSet( PLIST, vpsd.listSet, state->outValBuffers );
 		//DeleteList( &state->outValBuffers );
 	}
-	while( buffer = (PVESL_PARSE_BUFFER)DequeLinkNL( state->inBuffers ) )
+	while( ( buffer = (PVESL_PARSE_BUFFER)DequeLinkNL( state->inBuffers ) ) )
 		DeleteFromSet( VESL_PARSE_BUFFER, vpsd.parseBuffers, buffer );
-	while( buffer = (PVESL_PARSE_BUFFER)DequeLinkNL( state->outQueue ) ) {
+	while( ( buffer = (PVESL_PARSE_BUFFER)DequeLinkNL( state->outQueue ) ) ) {
 		Deallocate( const char*, buffer->buf );
 		DeleteFromSet( VESL_PARSE_BUFFER, vpsd.parseBuffers, buffer );
 	}
@@ -63056,7 +65853,7 @@ FILE* sack_fopenEx( INDEX group, CTEXTSTR filename, CTEXTSTR opts, struct file_s
 			tmpname = ExpandPathVariable( filename );
 			filename = tmpname;
 		}
-		if( !StrChr( opts, 'n' ) && ( filename[0] == '@' ) || ( filename[0] == '*' ) || ( filename[0] == '~' ) ) {
+		if( (!StrChr( opts, 'n' ) && ( filename[0] == '@' )) || ( filename[0] == '*' ) || ( filename[0] == '~' ) ) {
 			tmpname = ExpandPathEx( filename, NULL );
 			filename = tmpname;
 		}
@@ -63064,31 +65861,34 @@ FILE* sack_fopenEx( INDEX group, CTEXTSTR filename, CTEXTSTR opts, struct file_s
 		file->files = NULL;
 		file->name = StrDup( filename );
 		file->mount = mount;
-		if( ( !file->mount || !file->mount->fsi ) && !IsAbsolutePath( filename ) ) {
-			tmpname = ExpandPath( filename );
-			file->fullname = PrependBasePath( group, filegroup, tmpname );
-			Deallocate( TEXTCHAR*, tmpname );
-		}
-		else {
-			if( mount && group == 0 ) {
-				file->fullname = ExpandPath( file->name );
+		if(!StrChr(opts, 'n')) {
+			if( ( !file->mount || !file->mount->fsi ) && !IsAbsolutePath( filename ) ) {
+				tmpname = ExpandPath( filename );
+				file->fullname = PrependBasePath( group, filegroup, tmpname );
+				Deallocate( TEXTCHAR*, tmpname );
+			}
+			else {
+				if( mount && group == 0 ) {
+					file->fullname = ExpandPath( file->name );
 #if !defined( __FILESYS_NO_FILE_LOGGING__ )
 //				if( ( *winfile_local ).flags.bLogOpenClose )
 //					lprintf( "full is %s", file->fullname );
 #endif
-			}
-			else {
-				TEXTSTR tmp;
-				tmp = PrependBasePathEx( group, filegroup, file->name, !mount );
-				file->fullname = ExpandPath( tmp );
+				}
+				else {
+					TEXTSTR tmp;
+					tmp = PrependBasePathEx( group, filegroup, file->name, !mount );
+					file->fullname = ExpandPath( tmp );
 #if !defined( __FILESYS_NO_FILE_LOGGING__ )
 //				if( ( *winfile_local ).flags.bLogOpenClose )
 //					lprintf( "full is %s %d", file->fullname, (int)group );
 #endif
-				Deallocate( TEXTSTR, tmp );
-			}
+					Deallocate( TEXTSTR, tmp );
+				}
 			//file->fullname = file->name;
-		}
+			}
+		} else
+			file->fullname = NULL;
 		file->group = group;
 		if( !StrChr( opts, 'n' ) && StrChr( file->fullname, '%' ) ) {
 			if( allocedIndex != INVALID_INDEX )
@@ -63110,6 +65910,7 @@ FILE* sack_fopenEx( INDEX group, CTEXTSTR filename, CTEXTSTR opts, struct file_s
 				if( name[0] == '/' ) name[0] = SYSPATHCHAR[0];
 			}
 		}
+		if (file->fullname)
 		{
 			char* name;
 			for( name = file->fullname; name[0]; name++ ) {
@@ -63128,20 +65929,20 @@ FILE* sack_fopenEx( INDEX group, CTEXTSTR filename, CTEXTSTR opts, struct file_s
 	}
 #if !defined( __FILESYS_NO_FILE_LOGGING__ )
 	if( ( *winfile_local ).flags.bLogOpenClose )
-		lprintf( "Open File: [%s]", file->fullname );
+		lprintf( "Open File: [%s]", file->fullname ? file->fullname : file->name );
 #endif
 	if( mount && mount->fsi ) {
-		if( StrChr( opts, 'r' ) && !StrChr( opts, '+' ) || !StrChr( opts, 'w' ) ) {
+		if( ( StrChr( opts, 'r' ) && !StrChr( opts, '+' ) ) || !StrChr( opts, 'w' ) ) {
 			struct file_system_mounted_interface* test_mount = mount;
 			while( !handle && test_mount ) {
 				if( test_mount->fsi ) {
 					file->mount = test_mount;
 #if !defined( __FILESYS_NO_FILE_LOGGING__ )
 //					if( ( *winfile_local ).flags.bLogOpenClose )
-//						lprintf( "Call mount %s to check if file exists %s", test_mount->name, file->fullname );
+//						lprintf( "Call mount %s to check if file exists %s", test_mount->name, file->fullname ? file->fullname : file->name );
 #endif
-					if( test_mount->fsi->exists( test_mount->psvInstance, file->fullname ) ) {
-						handle = (FILE*)test_mount->fsi->open( test_mount->psvInstance, file->fullname, opts );
+					if( test_mount->fsi->exists( test_mount->psvInstance, file->fullname?file->fullname:file->name ) ) {
+						handle = (FILE*)test_mount->fsi->open( test_mount->psvInstance, file->fullname?file->fullname:file->name, opts );
 					}
 					else {
 						errno = ENOENT;
@@ -63164,9 +65965,9 @@ FILE* sack_fopenEx( INDEX group, CTEXTSTR filename, CTEXTSTR opts, struct file_s
 				if( test_mount->fsi && test_mount->writeable ) {
 #if !defined( __FILESYS_NO_FILE_LOGGING__ )
 //					if( ( *winfile_local ).flags.bLogOpenClose )
-//						lprintf( "Call mount %s to open file %s", test_mount->name, file->fullname );
+//						lprintf( "Call mount %s to open file %s", test_mount->name, file->fullname ? file->fullname : file->name );
 #endif
-					handle = (FILE*)test_mount->fsi->open( test_mount->psvInstance, file->fullname, opts );
+					handle = (FILE*)test_mount->fsi->open( test_mount->psvInstance, file->fullname?file->fullname:file->name, opts );
 				}
 				test_mount = test_mount->nextLayer;
 			}
@@ -63176,7 +65977,7 @@ FILE* sack_fopenEx( INDEX group, CTEXTSTR filename, CTEXTSTR opts, struct file_s
 	if( !GetLinkCount( file->files ) ) {
 #if !defined( __FILESYS_NO_FILE_LOGGING__ )
 		if( ( *winfile_local ).flags.bLogOpenClose )
-			lprintf( "Failed to open file [%s]=[%s]", file->name, file->fullname );
+			lprintf( "Failed to open file [%s]=[%s]", file->name, file->fullname ? file->fullname : file->name );
 #endif
 		DeleteLink( &( *winfile_local ).files, file );
 		Deallocate( TEXTCHAR*, file->name );
@@ -63246,7 +66047,7 @@ FILE* sack_fsopenEx( INDEX group
 		LeaveCriticalSec( &( *winfile_local ).cs_files );
 	}
 	if( mount && mount->fsi ) {
-		if( StrChr( opts, 'r' ) && !StrChr( opts, '+' ) || !StrChr( opts, 'w' ) ) {
+		if( ( StrChr( opts, 'r' ) && !StrChr( opts, '+' ) ) || !StrChr( opts, 'w' ) ) {
 			struct file_system_mounted_interface* test_mount = mount;
 			while( !handle && test_mount && test_mount->fsi ) {
 				file->mount = test_mount;
@@ -63430,17 +66231,20 @@ size_t  sack_fread( POINTER buffer, size_t size, int count, FILE* file_file )
 size_t  sack_fwrite( CPOINTER buffer, size_t size, int count, FILE* file_file )
 {
 	struct file* file;
+	if( count <= 0 || size > (SIZE_MAX - 3) / (size_t)count )
+ // overflow
+	    return 0;
 	file = FindFileByFILE( file_file );
 	if( file && file->mount && file->mount->fsi ) {
 		size_t result;
 		if( file->mount->fsi->copy_write_buffer && file->mount->fsi->copy_write_buffer() ) {
-			POINTER dupbuf = malloc( size * count + 3 );
+			POINTER dupbuf = NewArray( char, size * count + 3 );
 #ifdef _MSC_VER
 #  pragma warning( disable: 6387 )
 #endif
 			memcpy( dupbuf, buffer, size * count );
 			result = file->mount->fsi->_write( file_file, (const char*)dupbuf, size * count );
-			free( dupbuf );
+			Deallocate( POINTER, dupbuf );
 		}
 		else
 			result = file->mount->fsi->_write( file_file, (const char*)buffer, size * count );
@@ -63947,7 +66751,7 @@ static	struct find_cursor* CPROC sack_filesys_find_create_cursor( uintptr_t psvI
 	char maskbuf[512];
 	MemSet( cursor, 0, sizeof( *cursor ) );
 	//snprintf( maskbuf, 512, "%s/%s", root ? root : ".", filemask?filemask:"*" );
-	snprintf( maskbuf, 512, "%s" SYS_PATHCHAR "%s", root ? root : ".", "*" );
+	snprintf( maskbuf, 512, "%s" SYS_PATHCHAR "%s", root ? root : ".", filemask?filemask:"*" );
 	cursor->mask = StrDup( filemask );
 	cursor->root = StrDup( root ? root : "." );
 	{
@@ -64280,7 +67084,7 @@ LOGICAL CPROC sack_filesys_rename( uintptr_t psvInstance, const char* original_n
 static void link_mount( struct file_system_mounted_interface* mount ) {
 	struct file_system_mounted_interface* root = FileSysThreadInfo.mounted_file_systems;
 	if( !root || ( root->priority >= mount->priority ) ) {
-		if( mount->nextLayer = FileSysThreadInfo.mounted_file_systems )
+		if( ( mount->nextLayer = FileSysThreadInfo.mounted_file_systems ) )
 			root->meLayer = &mount->nextLayer;
 		mount->meLayer = &FileSysThreadInfo.mounted_file_systems;
 		if( !root )
@@ -64764,7 +67568,7 @@ struct find_cursor *GetScanFileCursor( void *pInfo ) {
 		pData = (PMFD)(*pInfo);
 		if( !pData )
 		{
-			*pInfo = Allocate( sizeof( MFD ) );
+			*pInfo = NewArray( MFD, 1 );
 			pData = (PMFD)(*pInfo);
 			if( !( pData->scanning_mount = mount ) )
 			{
@@ -64780,7 +67584,7 @@ struct find_cursor *GetScanFileCursor( void *pInfo ) {
 			{
 				Deallocate( PMFD, pData );
 				if( tmp_base )
-					Release( tmp_base );
+					Deallocate( TEXTSTR, tmp_base );
 				return 0;
 			}
 			if( pData->scanning_mount->fsi && pData->scanning_mount->fsi->find_create_cursor )
@@ -65424,6 +68228,10 @@ typedef struct monitor_tag
 	HANDLE hChange;
 #else
 	int fdMon;
+#endif
+#ifdef __MAC__
+ // FSEventStreamRef for this monitored directory
+	void *fsStream;
 #endif
  // other monitors being tracked if SUBCURSE was used
 	PLIST monitors;
@@ -66274,7 +69082,7 @@ PMONITOR CreateMonitor( int fdMon, char *directory )
     PMONITOR monitor = (PMONITOR)Allocate( sizeof( MONITOR ) );
     MemSet( monitor, 0, sizeof( MONITOR ) );
     monitor->fdMon = fdMon;
-	 strcpy( monitor->directory, directory );
+	StrCpyEx( monitor->directory, directory, sizeof( monitor->directory ) );
     monitor->flags.bLogFilesFound  = 0;
     monitor->flags.bIntelligentUpdates = 1;
  //   strcpy( monitor->mask, mask );
@@ -67794,6 +70602,15 @@ int GetTimeZone( void ){
 		return sign * (((seconds / 60 / 60) * 100) + ((seconds / 60) % 60));
 	}
 }
+// The timezone is split so that zhr carries the sign and zmn is always a magnitude
+// (0-59); consumers must normalize before combining them -- see ConvertTimeToTick(),
+// and scrollable_chat_list.c AbsoluteSeconds() for what happens if you don't.
+//
+// Consequence: a negative offset of less than an hour cannot be represented, because
+// the sign has nowhere to live once zhr rounds to 0 -- -00:30 stores as zhr 0/zmn 30
+// and reads back as +00:30.  Unreachable with any zone in current use (the last was
+// Liberia's -00:44:30, dropped in 1972).  Giving zmn the sign too would fix that and
+// the AbsoluteSeconds() case both, at the cost of every consumer that prints it.
 void ConvertTickToTime( int64_t tick, PSACK_TIME st ) {
 	int8_t tz = (int8_t)tick;
 	int sign = (tz < 0) ? -1 : 1;
@@ -68555,6 +71372,7 @@ void SystemLogFL( const TEXTCHAR *message FILELINE_PASS )
 		return;
 	if( !(*syslog_local).flags.group_ok && openLock )
 		return;
+	cannot_log = 1;
 	while( LockedExchange( &lowLevelLock, 1 ) ) Relinquish();
 	logtime = GetLogTime();
 	if( (*syslog_local).flags.bLogSourceFile && pFile )
@@ -68597,6 +71415,7 @@ void SystemLogFL( const TEXTCHAR *message FILELINE_PASS )
 				  , message );
 	DoSystemLog( buffer );
 	lowLevelLock = 0;
+	cannot_log = 0;
 }
 void BinaryToString( PVARTEXT pvt, const uint8_t* buffer, size_t size DBG_PASS ) {
 	size_t nOut = size;
@@ -68679,12 +71498,13 @@ void  LogBinaryFL ( const uint8_t* buffer, size_t size FILELINE_PASS )
 }
 void  SetSystemLog ( enum syslog_types type, const void *data )
 {
-	if( (*syslog_local).file && ( logtype != SYSLOG_FILE ) )
+	if( (*syslog_local).file )
 	{
 		FILE *close_file = (*syslog_local).file;
   // reset this first, in case logging closing.
 		(*syslog_local).file = NULL;
-      if( !( close_file == stderr || close_file == stdout ) )
+		// don't close file handles that came in from outside....
+		if( !( close_file == stderr || close_file == stdout ) && ( logtype == SYSLOG_AUTO_FILE ) )
 			sack_fclose( close_file );
 	}
 	if( type == SYSLOG_FILE )
@@ -70796,7 +73616,7 @@ int IsSingleWordVar( PCONFIG_ELEMENT pce, PTEXT *start )
 		Release( pce->data[0].singleword.pWord );
 		pce->data[0].singleword.pWord = NULL;
 	}
-	LIST_FORALL( pce->data[0].multiword.pEnds, idx, struct config_element_tag *, pEnd ) {
+	LIST_FORALL( pce->data[0].singleword.pEnds, idx, struct config_element_tag *, pEnd ) {
 		pEnd->flags.matched = FALSE;
 	}
 	while( *start )
@@ -70813,7 +73633,7 @@ int IsSingleWordVar( PCONFIG_ELEMENT pce, PTEXT *start )
 					lprintf( "next word has spaces... [%s](%d)", GetText( *start ), (*start)->format.position.offset.spaces );
 				break;
 			}
-			LIST_FORALL( pce->data[0].multiword.pEnds, idx, struct config_element_tag *, pEnd ){
+			LIST_FORALL( pce->data[0].singleword.pEnds, idx, struct config_element_tag *, pEnd ){
 				PTEXT _start = *start;
 				if( ( matched = IsAnyVar( pEnd, start ) ) != 0 )
 				{
@@ -70848,11 +73668,28 @@ int IsSingleWordVar( PCONFIG_ELEMENT pce, PTEXT *start )
 	}
 	if( (!*start) )
 	{
+		// End of line.  The per-token terminator scan above only runs while
+		// input remains, so a single word that *ends* the line never selected
+		// its end-of-line (CONFIG_NOTHING) terminator - meaning pce->next was
+		// left at this element's own (empty) next test and the registered
+		// procedure (attached to the terminator's next) was never reached.
+		// Resolve the CONFIG_NOTHING end here so pce->next advances correctly.
+		if( pWords && !default_EOL )
+		{
+			LIST_FORALL( pce->data[0].singleword.pEnds, idx, struct config_element_tag *, pEnd ){
+				if( pEnd->type == CONFIG_NOTHING ){
+					pce->data[0].singleword.pWhichEnd = pEnd;
+					pce->next = pEnd->next;
+					default_EOL = pce;
+					break;
+				}
+			}
+		}
 		if( !matched && !default_EOL )
 		{
 			LineRelease( pWords );
 			pWords = NULL;
-			// multiword ended - end of line, and no match on the next tag...
+			// single word ended - end of line, and no terminator/match...
 			return FALSE;
 		}
 		else if( g.flags.bLogTrace )
@@ -71369,7 +74206,8 @@ void ProcessConfigurationLine( PCONFIG_HANDLER pch, PTEXT line )
 					// keep this_word to reset the word for the variable check vs constant check
 					this_word = word = this_check->word;
 					if( !word ) {
-						//lprintf( "Could have just matched to end of line and all is well..." );
+						if( g.flags.bLogTrace )
+							lprintf( "Could have just matched to end of line and all is well..." );
 						processed = TRUE;
 						DoProcedure( &pch->psvUser, Check, line );
 					} else {
@@ -71441,6 +74279,8 @@ void ProcessConfigurationLine( PCONFIG_HANDLER pch, PTEXT line )
 												tmp_check.word = word;
 												tmp_check.Check = pce->next;
 												AddDataItem( &pch->possible_checks, &tmp_check );
+												if( g.flags.bLogTrace )
+													lprintf( "Added path as a possible check" );
 											}
 										        word = this_word;
 										}
@@ -72176,11 +75016,17 @@ PCONFIG_ELEMENT _AddConfigurationEx( PCONFIG_HANDLER pch, CTEXTSTR format, USER_
 		pceNew->type = CONFIG_NOTHING;
 		pceNew->Check = NULL;
 		pceNew->word_element = pcePrior;
-		AddLink( &pcePrior->data[0].multiword.pEnds, pceNew );
-		if( flags.also_store_as_end )
+		// Add to the list matching the word kind: single words terminate via
+		// singleword.pEnds, multi words via multiword.pEnds.  (These alias in
+		// the union today, but the matcher reads them by their own name, so keep
+		// build and match consistent rather than relying on the overlap.)
+		if( flags.also_store_as_end ) {
+			AddLink( &pcePrior->data[0].singleword.pEnds, pceNew );
 			pceNew->flags.singleword_terminator = 1;
-		else
+		} else {
+			AddLink( &pcePrior->data[0].multiword.pEnds, pceNew );
 			pceNew->flags.multiword_terminator = 1;
+		}
 		pceNew->prior = pcePrior;
 		pct = pceNew->next = pceNew->built_next = NewConfigTest( pch );
 		if( g.flags.bLogTraceBuild )
@@ -72750,10 +75596,12 @@ struct task_info_tag {
 	HANDLE hReadOut, hWriteOut;
 	HANDLE hReadErr, hWriteErr;
 	HANDLE hReadIn, hWriteIn;
-	STARTUPINFO si;
+	STARTUPINFOEX si;
 	PROCESS_INFORMATION pi;
-   DWORD exitcode;
+	DWORD exitcode;
 	HWND taskWindow;
+ // windows pty handle
+	HPCON hPty;
 #elif defined( __LINUX__ )
    int hReadOut, hWriteOut;
    int hReadErr, hWriteErr;
@@ -72917,7 +75765,7 @@ CTEXTSTR OSALOT_GetEnvironmentVariable(CTEXTSTR name)
 	static char* lastResult;
 	wchar_t* wName = CharWConvert( name );
 	int size;
-	if( size = GetEnvironmentVariableW( wName, NULL, 0 ) )
+	if( ( size = GetEnvironmentVariableW( wName, NULL, 0 ) ) )
 	{
 		if( size > env_size )
 		{
@@ -73217,7 +76065,7 @@ static uintptr_t KillEventThread( PTHREAD thread ) {
 }
 void EnableExitEvent( void ) {
 	char eventName[256];
-	snprintf( eventName, 256, "Global\\%s:exit", GetProgramName() );
+	snprintf( eventName, 256, "Global\\%s(%d):exit", GetProgramName(), GetCurrentProcessId() );
 	//lprintf( "Starting exit event thread... %s", eventName );
 	ThreadTo( KillEventThread, (uintptr_t)eventName );
 	while( eventName[0] ) Relinquish();
@@ -73272,7 +76120,7 @@ else lprintf( "Failure %d", status );
 }
 void EnableExitEvent( void ) {
 	char eventName[ 256 ];
-	snprintf( eventName, 256, "Global\\%s:exit", GetProgramName() );
+	snprintf( eventName, 256, "Global\\%s(%d):exit", GetProgramName(), GetCurrentProcessId() );
 	// lprintf( "Starting exit event thread... %s", eventName );
 	ThreadTo( KillEventThread, (uintptr_t)eventName );
 	while( eventName[ 0 ] )
@@ -73573,10 +76421,11 @@ static void CPROC SetupSystemServices( POINTER mem, uintptr_t size )
 			oldpath = getenv( "LD_LIBRARY_PATH" );
 			if( oldpath )
 			{
-				newpath = NewArray( char, (uint32_t)((oldpath?StrLen( oldpath ):0) + 2 + StrLen((*init_l).library_path)) );
-				sprintf( newpath, "%s:%s", (*init_l).library_path
+				const uint32_t n = (uint32_t)((oldpath?StrLen( oldpath ):0) + 2 + StrLen((*init_l).library_path));
+				newpath = NewArray( char, n );
+				snprintf( newpath, n, "%s:%s", (*init_l).library_path
 						 , oldpath );
-				setenv( "LD_LIBRARY_PATH", newpath, 1 );
+				setenv( "LD_LIBRARY_PATH", newpath, n );
 				ReleaseEx( newpath DBG_SRC );
 			}
 		}
@@ -73586,10 +76435,11 @@ static void CPROC SetupSystemServices( POINTER mem, uintptr_t size )
 			oldpath = getenv( "PATH" );
 			if( oldpath )
 			{
-				newpath = NewArray( char, (uint32_t)((oldpath?StrLen( oldpath ):0) + 2 + StrLen((*init_l).load_path)) );
-				sprintf( newpath, "%s:%s", (*init_l).load_path
+				const uint32_t n = (uint32_t)((oldpath?StrLen( oldpath ):0) + 2 + StrLen((*init_l).load_path));
+				newpath = NewArray( char, n );
+				snprintf( newpath, n, "%s:%s", (*init_l).load_path
 						 , oldpath );
-				setenv( "PATH", newpath, 1 );
+				setenv( "PATH", newpath, n );
 				ReleaseEx( newpath DBG_SRC );
 			}
 		}
@@ -73764,7 +76614,7 @@ struct handle_data {
 	unsigned long process_id;
 	HWND window_handle;
 };
-PDATALIST GetProcessTree( PTASK_INFO task ){
+PNVDATALIST GetProcessTree( PTASK_INFO task ){
 	INDEX idx;
 	INDEX idx2;
 	struct process_id_pair* pair;
@@ -74153,7 +77003,7 @@ LOGICAL CPROC StopProgram( PTASK_INFO task )
 		if( hWndMain ) {
 			TEXTCHAR title[256];
 			GetWindowText( hWndMain, title, 256 );
-			lprintf( "Sending WM_CLOSE to %p %s %s", hWndMain, task->name, title );
+			//lprintf( "Sending WM_CLOSE to %p %s %s", hWndMain, task->name, title );
 			SendMessage( hWndMain, WM_CLOSE, 0, 0 );
 		}
 		else if( !task->flags.useEventSignal ) {
@@ -74191,7 +77041,7 @@ LOGICAL CPROC StopProgram( PTASK_INFO task )
 		{
 			char eventName[256];
 			HANDLE hEvent;
-			snprintf( eventName, 256, "Global\\%s:exit", task->name );
+			snprintf( eventName, 256, "Global\\%s(%d):exit", task->name, task->pi.dwProcessId );
 			hEvent = OpenEvent( EVENT_MODIFY_STATE, FALSE, eventName );
 			//lprintf( "Signal process event: %s", eventName );
 			if( hEvent != NULL ) {
@@ -74205,7 +77055,7 @@ LOGICAL CPROC StopProgram( PTASK_INFO task )
 //#endif
 	}
 	// try and copy some code to it..
-	if( !exited )
+	if( !exited ) {
 #if 0
 		// this is bad, and just causes the remote to crash; left for reference.
 		if( task->pi.hProcess && FALSE )
@@ -74238,6 +77088,7 @@ LOGICAL CPROC StopProgram( PTASK_INFO task )
 			}
 		}
 #endif
+	}
 #endif
 	if( (!task->pi.hProcess) || WaitForSingleObject( task->pi.hProcess, 1 ) != WAIT_OBJECT_0 ) {
 		//lprintf( "don't think it exited" );
@@ -74272,7 +77123,7 @@ uintptr_t TerminateProgramEx( PTASK_INFO task, int options ) {
 					PushLink( &stack, pair );
 					//dwKillId = pair->child;
 				}
-				while( pair = (struct process_id_pair*)PopLink( &stack ) ) {
+				while( ( pair = (struct process_id_pair*)PopLink( &stack ) ) ) {
 					HANDLE hChild = OpenProcess( PROCESS_ALL_ACCESS, FALSE, pair->child );
 					if( hChild != INVALID_HANDLE_VALUE ) {
 						TerminateProcess( hChild, 0xdead );
@@ -74309,6 +77160,21 @@ SYSTEM_PROC( void, SetProgramUserData )( PTASK_INFO task, uintptr_t psv )
 {
 	if( task )
 		task->psvEnd = psv;
+}
+//--------------------------------------------------------------------------
+#if WIN32
+uint32_t
+#elif defined( __LINUX__ )
+pid_t
+#endif
+	GetTaskProcessId( PTASK_INFO task ) {
+#if WIN32
+	if( task ) return task->pi.dwProcessId;
+#endif
+#if __LINUX__
+	if( task ) return task->pid;
+#endif
+	return 0;
 }
 //--------------------------------------------------------------------------
 uint32_t GetTaskExitCode( PTASK_INFO task )
@@ -74782,7 +77648,7 @@ SYSTEM_PROC( PTASK_INFO, LaunchProgram )( CTEXTSTR program, CTEXTSTR path, PCTEX
 	return LaunchProgramEx( program, path, args, NULL, 0 );
 }
 //--------------------------------------------------------------------------
-void InvokeLibraryLoad( void )
+static void InvokeLibraryLoad( void )
 {
 	void (CPROC *f)(void);
 	PCLASSROOT data = NULL;
@@ -74792,13 +77658,17 @@ void InvokeLibraryLoad( void )
 		 name;
 		  name = GetNextRegisteredName( &data ) )
 	{
-		f = GetRegisteredProcedureExx( data,(CTEXTSTR)NULL,void,name,(void));
-		if( f )
-		{
-			f();
+		if( !GetRegisteredIntValue( data, "ran" ) ) {
+			f = GetRegisteredProcedureExx( data, (CTEXTSTR)NULL, void, name, (void));
+			if( f ) {
+				f();
+			}
+			RegisterIntValue( (CTEXTSTR)data, "ran", 1 );
 		}
 	}
 }
+// dispatch late scheduled preloaded scheduled library loads.
+PRIORITY_PRELOAD( checkLibraryLoads, 1000 ) { InvokeLibraryLoad(); }
 // look for all the libraries that are currently already loaded (so we know to just load them the normal way)
 #define Seek(a,b) (((uintptr_t)a)+(b))
 static void LoadExistingLibraries( void )
@@ -75823,18 +78693,35 @@ void sack_system_disallow_spawn( void ) {
 }
 #undef Seek
 SACK_SYSTEM_NAMESPACE_END
+#define DEFINE_DEFAULT_RENDER_INTERFACE
 #define NO_UNICODE_C
 #define TASK_INFO_DEFINED
 #ifndef __NO_IDLE__
 #endif
+#ifdef _WIN32
+#include <WinCon.h>
+#endif
 #ifdef __LINUX__
 #include <poll.h>
-#include <pty.h>
+#  ifdef __MAC__
+     // macOS/BSD has no <pty.h>; forkpty/openpty are declared in <util.h>
+     // (and link from libSystem, so no -lutil is required).  <pty.h> also
+     // pulled in ioctl()/TIOCSWINSZ/struct winsize transitively on linux,
+     // so include <sys/ioctl.h> explicitly here.
+#    include <util.h>
+#  else
+#    include <pty.h>
+#  endif
 extern char **environ;
 #endif
 //--------------------------------------------------------------------------
 SACK_SYSTEM_NAMESPACE
 typedef struct task_info_tag TASK_INFO;
+#ifndef _HRESULT_DEFINED
+#define _HRESULT_DEFINED
+typedef long HRESULT;
+#define WINAPI
+#endif
 //--------------------------------------------------------------------------
 #ifdef WIN32
 static int DumpErrorEx( DBG_VOIDPASS )
@@ -76226,7 +79113,7 @@ static BOOL _CreateProcess(
 	DWORD dwCreationFlags,
 	LPVOID lpEnvironment,
 	LPCSTR lpCurrentDirectory,
-	LPSTARTUPINFOA lpStartupInfo,
+	LPSTARTUPINFOEXA lpStartupInfo,
 	LPPROCESS_INFORMATION lpProcessInformation
 ) {
 	wchar_t* wAppName = lpApplicationName?CharWConvert( lpApplicationName ):NULL;
@@ -76234,16 +79121,17 @@ static BOOL _CreateProcess(
 	wchar_t* wWorkDir = lpCurrentDirectory ? CharWConvert( lpCurrentDirectory ) : NULL;
 	wchar_t* envBlock = lpEnvironment?ConvertEnvironment((char*)lpEnvironment):NULL;
 	DWORD dwLastError;
-	STARTUPINFOW si;
-	si.cb = sizeof( si );
-	convertStartupInfo( lpStartupInfo, &si );
+	STARTUPINFOEXW si;
+	si.StartupInfo.cb = sizeof( si );
+	convertStartupInfo( &lpStartupInfo->StartupInfo, &si.StartupInfo );
+	si.lpAttributeList = lpStartupInfo->lpAttributeList;
 	BOOL status = CreateProcessW( wAppName, wCmdLine
 		, lpProcessAttributes, lpThreadAttributes
 		, bInheritHandles, dwCreationFlags
-		, lpEnvironment, wWorkDir, &si, lpProcessInformation );
+		, lpEnvironment, wWorkDir, &si.StartupInfo, lpProcessInformation );
 	dwLastError = GetLastError();
-	if( si.lpDesktop ) Deallocate( LPWSTR, si.lpDesktop );
-	if( si.lpTitle ) Deallocate( LPWSTR, si.lpTitle );
+	if( si.StartupInfo.lpDesktop ) Deallocate( LPWSTR, si.StartupInfo.lpDesktop );
+	if( si.StartupInfo.lpTitle ) Deallocate( LPWSTR, si.StartupInfo.lpTitle );
 	if( wAppName ) Deallocate( wchar_t*, wAppName );
 	if( wCmdLine ) Deallocate( wchar_t*, wCmdLine );
 	if( wWorkDir ) Deallocate( wchar_t*, wWorkDir );
@@ -76281,6 +79169,39 @@ SYSTEM_PROC( PTASK_INFO, MonitorTaskEx )( int pid, int flags, TaskEnd EndNotice,
 #endif
 	return task;
 }
+#if 0
+// experimental code that would resolve junctions to nearest points.
+#ifdef WIN32
+if (expanded_working_path) {
+	// Open a handle to the directory to inspect its true nature
+	HANDLE hDir = CreateFile(expanded_working_path,
+		GENERIC_READ,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		NULL,
+		OPEN_EXISTING,
+ // Required for folders
+		FILE_FLAG_BACKUP_SEMANTICS,
+		NULL);
+	if (hDir != INVALID_HANDLE_VALUE) {
+		wchar_t realPath[MAX_PATH];
+		// Bypasses junctions/symlinks and fetches the actual absolute target
+		DWORD len = GetFinalPathNameByHandleW(hDir, realPath, MAX_PATH, VOLUME_NAME_DOS);
+		CloseHandle(hDir);
+		if (len > 0 && len < MAX_PATH) {
+			// Strip the potential local device prefix "\\?\" if returned
+			wchar_t* cleanPath = realPath;
+			if (wcsncmp(realPath, L"\\\\?\\", 4) == 0) {
+				cleanPath += 4;
+			}
+			// Release your old path and convert cleanPath back to your frame's internal text type
+			Release(expanded_working_path);
+ // Or your framework's string clone equivalent
+			expanded_working_path = CharWConvert(cleanPath);
+		}
+	}
+}
+#endif
+#endif
 // Run a program completely detached from the current process
 // it runs independantly.  Program does not suspend until it completes.
 // No way at all to know if the program works or fails.
@@ -76290,7 +79211,7 @@ SYSTEM_PROC( PTASK_INFO, LaunchPeerProgram_v2 )( CTEXTSTR program, CTEXTSTR path
 															  , TaskOutput OutputHandler2
 															  , TaskEnd EndNotice
 															  , uintptr_t psv
-															  , PLIST list
+															  , PNVLIST list
 																DBG_PASS
 															  )
 {
@@ -76323,6 +79244,10 @@ SYSTEM_PROC( PTASK_INFO, LaunchPeerProgram_v2 )( CTEXTSTR program, CTEXTSTR path
 	if( program && program[0] )
 	{
 #ifdef WIN32
+		HRESULT (WINAPI *createPseudoConsole)(COORD size, HANDLE hInput, HANDLE hOutput, DWORD dwFlags, HPCON * phPC)
+		     = ( HRESULT (WINAPI*)( COORD size, HANDLE hInput, HANDLE hOutput, DWORD dwFlags,
+		                             HPCON *phPC ))
+			LoadFunction( "kernel32.dll", "CreatePseudoConsole" );
 		int launch_flags = ( ( flags & LPP_OPTION_NEW_CONSOLE ) ? CREATE_NEW_CONSOLE : 0 )
 		                 | ( ( flags & LPP_OPTION_DETACH ) ? DETACHED_PROCESS : 0 )
 		                 | ( ( flags & LPP_OPTION_NEW_GROUP ) ? CREATE_NEW_PROCESS_GROUP : 0 )
@@ -76429,8 +79354,9 @@ SYSTEM_PROC( PTASK_INFO, LaunchPeerProgram_v2 )( CTEXTSTR program, CTEXTSTR path
 		vtprintf( pvt, "cmd.exe /c %s", GetText( cmdline ) );
 		final_cmdline = VarTextGet( pvt );
 		VarTextDestroy( &pvt );
-		MemSet( &task->si, 0, sizeof( STARTUPINFO ) );
-		task->si.cb = sizeof( STARTUPINFO );
+		MemSet( &task->si, 0, sizeof( STARTUPINFOEX ) );
+		task->si.StartupInfo.cb = sizeof( STARTUPINFOEX );
+		launch_flags |= EXTENDED_STARTUPINFO_PRESENT;
 #ifdef _DEBUG
 		//xlprintf(LOG_NOISE)( "quotes?%s path [%s] program [%s]  [cmd.exe (%s)]", needs_quotes?"yes":"no", expanded_working_path, expanded_path, GetText( final_cmdline ) );
 #endif
@@ -76455,29 +79381,62 @@ SYSTEM_PROC( PTASK_INFO, LaunchPeerProgram_v2 )( CTEXTSTR program, CTEXTSTR path
 			if( OutputHandler2 )
 				CreatePipe( &task->hReadErr, &task->hWriteErr, &sa, 0 );
 			CreatePipe( &task->hReadIn, &task->hWriteIn, &sa, 0 );
-			task->si.hStdInput = task->hReadIn;
-			if( OutputHandler2 )
-				task->si.hStdError = task->hWriteErr;
-			if( OutputHandler )
-				task->si.hStdOutput = task->hWriteOut;
-			if( OutputHandler && !OutputHandler2 ) {
+			// For an interactive pseudoconsole the child's console I/O is provided by the pty
+			// (PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE below); it must NOT also be given redirected
+			// std handles, or cmd treats stdin as a non-interactive pipe (no echo / no line input)
+			// and hReadIn ends up double-consumed by both conpty and the child.  Only wire the std
+			// handles for the plain-pipe (non-pty) case.
+			if( !( flags & LPP_OPTION_INTERACTIVE ) ) {
+				task->si.StartupInfo.hStdInput = task->hReadIn;
+				if( OutputHandler2 )
+					task->si.StartupInfo.hStdError = task->hWriteErr;
+				if( OutputHandler )
+					task->si.StartupInfo.hStdOutput = task->hWriteOut;
+				if( OutputHandler && !OutputHandler2 ) {
  // if this is not set, then stderr gets inherited.
-				task->si.hStdError = task->hWriteOut;
+					task->si.StartupInfo.hStdError = task->hWriteOut;
+				}
+				task->si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
 			}
-			task->si.dwFlags |= STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+			task->si.StartupInfo.dwFlags |= STARTF_USESHOWWINDOW;
 			if( !( flags & LPP_OPTION_DO_NOT_HIDE ) )
-				task->si.wShowWindow = SW_HIDE;
+				task->si.StartupInfo.wShowWindow = SW_HIDE;
 			else
-				task->si.wShowWindow = SW_SHOW;
+				task->si.StartupInfo.wShowWindow = SW_SHOW;
+#ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
+#   define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE 0x20016
+#endif
+			if( flags & LPP_OPTION_INTERACTIVE ) {
+				COORD size  = { 80, 300 };
+				if( createPseudoConsole )
+					createPseudoConsole( size, task->hReadIn, task->hWriteOut, 0, &task->hPty );
+				//_WIN32_WINNT_WIN10_RS5 NTDDI_WIN10_RS5
+				size_t bytesRequired;
+				InitializeProcThreadAttributeList( NULL, 1, 0, &bytesRequired );
+				// Allocate memory to represent the list
+				task->si.lpAttributeList = (PPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc( GetProcessHeap(), 0, bytesRequired );
+				if( task->si.lpAttributeList ) {
+					InitializeProcThreadAttributeList( task->si.lpAttributeList, 1, 0, &bytesRequired );
+					if( !UpdateProcThreadAttribute( task->si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+					                                task->hPty, sizeof( task->hPty ), NULL, NULL ) ) {
+						DWORD dwErr = GetLastError();
+						lprintf( "Error setting attributes on starup info:%d", dwErr );
+					}
+				}
+			}
 		}
 		else
 		{
 			//lprintf( "Not setting IO handles." );
-			task->si.dwFlags |= STARTF_USESHOWWINDOW;
+			task->si.StartupInfo.dwFlags |= STARTF_USESHOWWINDOW;
 			if( !( flags & LPP_OPTION_DO_NOT_HIDE ) )
-				task->si.wShowWindow = SW_HIDE;
+				task->si.StartupInfo.wShowWindow = SW_HIDE;
 			else
-				task->si.wShowWindow = SW_SHOW;
+				task->si.StartupInfo.wShowWindow = SW_SHOW;
+			if( flags & LPP_OPTION_MINIMIZED )
+				task->si.StartupInfo.wShowWindow = SW_HIDE;
+			else if( flags & LPP_OPTION_MAXIMIZED )
+				task->si.StartupInfo.wShowWindow = SW_SHOW;
 		}
 		{
 			if( flags & LPP_OPTION_IMPERSONATE_EXPLORER )
@@ -76490,7 +79449,7 @@ SYSTEM_PROC( PTASK_INFO, LaunchPeerProgram_v2 )( CTEXTSTR program, CTEXTSTR path
 												 , launch_flags | CREATE_NEW_PROCESS_GROUP
 												 , NULL
 												 , expanded_working_path
-												 , &task->si
+												 , &task->si.StartupInfo
 												 , &task->pi ) || FixHandles(task) || DumpError() ) ||
 					( CreateProcessAsUser( hExplorer, program
 												, GetText( cmdline )
@@ -76498,7 +79457,7 @@ SYSTEM_PROC( PTASK_INFO, LaunchPeerProgram_v2 )( CTEXTSTR program, CTEXTSTR path
 												, launch_flags | CREATE_NEW_PROCESS_GROUP
 												, NULL
 												, expanded_working_path
-												, &task->si
+												, &task->si.StartupInfo
 												, &task->pi ) || FixHandles(task) || DumpError() ) ||
 					( CreateProcessAsUser( hExplorer, program
  // GetText( cmdline )
@@ -76507,7 +79466,7 @@ SYSTEM_PROC( PTASK_INFO, LaunchPeerProgram_v2 )( CTEXTSTR program, CTEXTSTR path
 												, launch_flags | CREATE_NEW_PROCESS_GROUP
 												, NULL
 												, expanded_working_path
-												, &task->si
+												, &task->si.StartupInfo
 												, &task->pi ) || FixHandles(task) || DumpError() ) ||
 					( CreateProcessAsUser( hExplorer, "cmd.exe"
 												, GetText( final_cmdline )
@@ -76515,7 +79474,7 @@ SYSTEM_PROC( PTASK_INFO, LaunchPeerProgram_v2 )( CTEXTSTR program, CTEXTSTR path
 												, launch_flags | CREATE_NEW_PROCESS_GROUP
 												, NULL
 												, expanded_working_path
-												, &task->si
+												, &task->si.StartupInfo
 												, &task->pi ) || FixHandles(task) || DumpError() )
 				  )
 				{
@@ -76525,7 +79484,7 @@ SYSTEM_PROC( PTASK_INFO, LaunchPeerProgram_v2 )( CTEXTSTR program, CTEXTSTR path
 			}
 			else
 			{
-				//lprintf( "Using launch flags; %s %08x", task->name, launch_flags );
+				//lprintf( "Using launch flags; %s %08x  %d", task->name, launch_flags, !!(flags&LPP_OPTION_INTERACTIVE) );
 				if( ( (!task->flags.runas_root) && ( _CreateProcess( program
 										, GetText( cmdline )
 										, NULL, NULL, TRUE
@@ -76582,6 +79541,14 @@ SYSTEM_PROC( PTASK_INFO, LaunchPeerProgram_v2 )( CTEXTSTR program, CTEXTSTR path
 					//task->hStdIn.pdp		 = pdp;
 					task->hStdIn.hThread  = 0;
 					task->hStdIn.bNextNew = TRUE;
+					// NOTE: win32-input-mode ( ESC[?9001h ) was tried to let SendPTYKeyEvent deliver
+					// full-fidelity key records, but ConPTY did not consume those sequences here even
+					// when the mode enabled successfully, so SendPTYKeyEvent now writes raw characters
+					// and we leave ConPTY in its default VT-input mode.
+					//if( task->hPty ) {
+					//	DWORD dwEnable = 0;
+					//	WriteFile( task->hStdIn.handle, "\x1b[?9001h", 8, &dwEnable, NULL );
+					//}
 					if( task->OutputEvent ) {
 						task->hStdOut.handle   = task->hReadOut;
 						task->hStdOut.pLine	   = NULL;
@@ -77000,7 +79967,7 @@ int vpprintf( PTASK_INFO task, CTEXTSTR format, va_list args )
 	VarTextDestroy( &pvt );
 	return written;
 }
-//----------------------- Utility to send to launched task's stdin ----------------------------
+//----------------------- Utility to send to launched task's stdin -----d-----------------------
 size_t task_send( PTASK_INFO task, const uint8_t*buffer, size_t buflen )
 {
 	size_t written = 0;
@@ -77037,6 +80004,84 @@ size_t task_send( PTASK_INFO task, const uint8_t*buffer, size_t buflen )
 		//lprintf( "Task has ended, write  aborted." );
 	}
 	return written;
+}
+int SetProcessConsoleSize( PTASK_INFO task, int cols, int rows, int width, int height ) {
+#ifdef _WIN32
+	HRESULT (WINAPI *resizePseudoConsole)( HPCON hPC, COORD size )
+		 = ( HRESULT (WINAPI*)( HPCON hPC, COORD size ))LoadFunction( "kernel32.dll", "ResizePseudoConsole" );
+	if( resizePseudoConsole && task->si.lpAttributeList ) {
+		COORD size;
+		size.X = (SHORT)cols;
+		size.Y = (SHORT)rows;
+		return (int)resizePseudoConsole( task->hPty, size );
+	}
+	return (int)E_NOTIMPL;
+#endif
+#ifdef __LINUX__
+	struct winsize size;
+	int pty = task->pty;
+	if( !rows )
+		rows = 24;
+	if( !cols )
+		cols = 80;
+	// lprintf( "Set PTY size: %d %d %d", pty, rows, cols);
+	size.ws_row    = rows;
+	size.ws_col    = cols;
+	size.ws_xpixel = width;
+	size.ws_ypixel = height;
+	return ioctl( pty, TIOCSWINSZ, &size );
+#endif
+}
+int SendPTYKeyEvent( PTASK_INFO task, uint32_t key ) {
+	// lprintf( "key event: %08lx", key );
+	CTEXTSTR text   = GetKeyText( key );
+	/*
+	*
+	*  from
+	https://github.com/microsoft/terminal/blob/main/doc/specs/%234999%20-%20Improved%20keyboard%20handling%20in%20Conpty.md#cons-4
+	2026-01-06
+	   ^[ [ Vk ; Sc ; Uc ; Kd ; Cs ; Rc _
+	    Vk: the value of wVirtualKeyCode - any number. If omitted, defaults to '0'.
+	    Sc: the value of wVirtualScanCode - any number. If omitted, defaults to '0'.
+	    Uc: the decimal value of UnicodeChar - for example, NUL is "0", LF is
+	        "10", the character 'A' is "65". If omitted, defaults to '0'.
+	    Kd: the value of bKeyDown - either a '0' or '1'. If omitted, defaults to '0'.
+	    Cs: the value of dwControlKeyState - any number. If omitted, defaults to '0'.
+	    Rc: the value of wRepeatCount - any number. If omitted, defaults to '1'.
+	*/
+	// ConPTY win32-input-mode ( ESC[Vk;Sc;Uc;Kd;Cs;Rc_ ) was not being consumed here even with
+	// ?9001h enabled, so send raw character input instead - the input path cmd.exe/ConPTY always
+	// accept.  The key dispatch currently delivers each transition twice, and we get both key-down
+	// and key-up; track per-VK pressed state so each physical press transmits its character exactly
+	// once (on the first key-down), and clear it on key-up.
+	// NOTE: KEY_MOD() (key bits 28-30) is not populated by the Win32 key packing in vidlib.c, so
+	// modifiers/Ctrl-combos do not reach here yet; and keys with no character (arrows, F-keys) are
+	// not yet mapped to VT sequences.
+	{
+		static uint8_t s_down[256];
+		int vk = KEY_CODE( key );
+		int uc = text ? GetUtfChar( &text ) : 0;
+		int kd = IsKeyPressed( key ) ? 1 : 0;
+		int vkIdx = vk & 0xFF;
+		//lprintf( "WTX: PTYKey key=%08x vk=%d uc=%d kd=%d held=%d", key, vk, uc, kd, s_down[vkIdx] );
+		if( kd ) {
+			if( !s_down[vkIdx] ) {
+				s_down[vkIdx] = 1;
+				if( uc ) {
+					uint8_t buf[8]; int n = 0;
+					if( uc < 0x80 ) buf[n++] = (uint8_t)uc;
+					else if( uc < 0x800 ) { buf[n++] = (uint8_t)(0xC0|(uc>>6)); buf[n++] = (uint8_t)(0x80|(uc&0x3F)); }
+					else if( uc < 0x10000 ) { buf[n++] = (uint8_t)(0xE0|(uc>>12)); buf[n++] = (uint8_t)(0x80|((uc>>6)&0x3F)); buf[n++] = (uint8_t)(0x80|(uc&0x3F)); }
+					else { buf[n++] = (uint8_t)(0xF0|(uc>>18)); buf[n++] = (uint8_t)(0x80|((uc>>12)&0x3F)); buf[n++] = (uint8_t)(0x80|((uc>>6)&0x3F)); buf[n++] = (uint8_t)(0x80|(uc&0x3F)); }
+					task_send( task, buf, n );
+				}
+			}
+		}
+		else {
+			s_down[vkIdx] = 0;
+		}
+	}
+	return 0;
 }
 int pprintf( PTASK_INFO task, CTEXTSTR format, ... )
 {
@@ -79209,6 +82254,36 @@ static uintptr_t CPROC TestOption( uintptr_t psv, arg_list args )
 #endif
 	return psv;
 }
+static uintptr_t CPROC TestOptionBool( uintptr_t psv, arg_list args )
+{
+	PARAM( args, CTEXTSTR, key );
+	if( l.flags.bTraceInterfaceLoading )
+		lprintf( "found bool test %s...", key );
+	if( StrCaseCmp( key, "windows") == 0 ) {
+#   ifdef _WIN32
+		return psv;
+#   endif
+	}
+	else if( StrCaseCmp( key, "linux") == 0 ) {
+#   ifdef __LINUX__
+		return psv;
+#   endif
+	}
+	else if( StrCaseCmp( key, "posix") == 0 ) {
+#   ifdef __LINUX__
+		return psv;
+#   endif
+	} else if( StrCaseCmp( key, "apple" ) == 0 ) {
+#   ifdef __MAC__
+		return psv;
+#   endif
+	} else {
+		lprintf( "Warning: Unknown boolean option: %s", key );
+	}
+	l.flags.bFindEndif++;
+	l.flags.bFindElse = 1;
+	return psv;
+}
 static uintptr_t CPROC EndTestOption( uintptr_t psv, arg_list args )
 {
 	if( l.flags.bTraceInterfaceLoading )
@@ -79284,6 +82359,7 @@ void ReadConfiguration( void )
 		AddConfigurationMethod( pch, "set option %m=%m", SetOptionSet );
 		AddConfigurationMethod( pch, "start directory \"%m\"", SetDefaultDirectory );
 		AddConfigurationMethod( pch, "include \"%m\"", IncludeAdditional );
+		AddConfigurationMethod( pch, "if ?%w", TestOptionBool );
 		AddConfigurationMethod( pch, "if %m==%m", TestOption );
 		AddConfigurationMethod( pch, "endif", EndTestOption );
 		AddConfigurationMethod( pch, "else", ElseTestOption );
@@ -79312,6 +82388,9 @@ void ReadConfiguration( void )
 				success = ProcessConfigurationFile( pch, l.config_filename, 0 );
 				if( !success )
 					lprintf( "Failed to open custom interface configuration file:%s", l.config_filename );
+				else
+					l.flags.bInterfacesLoaded = 1;
+				DestroyConfigurationHandler( pch );
 				return;
 			}
 			if( !success )
@@ -79460,12 +82539,12 @@ POINTER GetInterfaceEx( CTEXTSTR pServiceName, LOGICAL ReadConfig )
 }
 POINTER GetInterfaceDbg( CTEXTSTR pServiceName DBG_PASS )
 {
-	POINTER result = GetInterfaceExx( pServiceName, FALSE DBG_RELAY );
+	POINTER result = GetInterface_v4( pServiceName, FALSE, TRUE DBG_RELAY );
 	if( !result )
 	{
 		// don't force the issue too much
-		if( l.flags.bReadConfiguration )
-			result = GetInterfaceExx( pServiceName, TRUE DBG_RELAY );
+		//if( !l.flags.bReadConfiguration )
+		//	result = GetInterfaceExx( pServiceName, TRUE DBG_RELAY );
 	}
 	return result;
 }
@@ -79763,6 +82842,16 @@ PROCREG_NAMESPACE_END
 // assembly support is NOT currently...
 // #define MSVC_ASSEMBLE
 //----------------------------------------------------------------
+// x86 SIMD intrinsics header - only valid on x86/x64.  Nothing in this file
+// actually uses the intrinsics yet, so simply skip it on other architectures
+// (e.g. arm64/Apple Silicon) where <immintrin.h> is a hard #error.
+#if defined( __x86_64__ ) || defined( __i386__ ) || defined( _M_X64 ) || defined( _M_IX86 )
+#include <immintrin.h>
+#endif
+// double...
+// __m256d
+// single...
+// __m128f
 VECTOR_NAMESPACE
 struct motion_frame_tag
 {
@@ -79973,6 +83062,15 @@ INLINEFUNC( P_POINT, scale, ( P_POINT pr, PC_POINT pv1, RCOORD k ) )
    return pr;
 }
 REALFUNCT( P_POINT, scale, ( PVECTOR pr, PCVECTOR pv1, RCOORD k ), (pr, pv1, k ) )
+INLINEFUNC( P_POINT4, scale4, ( P_POINT4 pr, PC_POINT4 pv1, RCOORD k ) )
+{
+   pr[0] = pv1[0] * k;
+   pr[1] = pv1[1] * k;
+   pr[2] = pv1[2] * k;
+   pr[3] = pv1[3] * k;
+   return pr;
+}
+REALFUNCT( P_POINT4, scale4, ( PVECTOR4 pr, PCVECTOR4 pv1, RCOORD k ), (pr, pv1, k ) )
 INLINEFUNC( P_POINT, Invert, ( P_POINT a ) )
 {
 	a[0] = -a[0];
@@ -80000,6 +83098,14 @@ INLINEFUNC( RCOORD, Length, ( PC_POINT v ) )
                 _4D( + v[3] * v[3] ) );
 }
 REALFUNCT( RCOORD, Length, ( PCVECTOR pv ), (pv) )
+INLINEFUNC( RCOORD, Length4, ( PC_POINT v ) )
+{
+   return sqrt( v[0] * v[0] +
+                v[1] * v[1]
+                + v[2] * v[2]
+                + v[3] * v[3] );
+}
+REALFUNCT( RCOORD, Length4, ( PCVECTOR pv ), (pv) )
 //----------------------------------------------------------------
 RCOORD EXTERNAL_NAME(Distance)( PC_POINT v1, PC_POINT v2 )
 {
@@ -80008,15 +83114,24 @@ RCOORD EXTERNAL_NAME(Distance)( PC_POINT v1, PC_POINT v2 )
    return DOFUNC(Length)( v );
 }
 //----------------------------------------------------------------
- INLINEFUNC( void, normalize, ( P_POINT pv ) )
+ INLINEFUNC( P_POINT, normalize, ( P_POINT pv ) )
 {
 	RCOORD k = DOFUNC(Length)( pv );
    if( k != 0 )
 		DOFUNC(scale)( pv, pv, ONE / k );
+   return pv;
 }
- REALVOIDFUNCT( void,  normalize, ( P_POINT pv ), (pv) )
+ REALFUNCT( P_POINT,  normalize, ( P_POINT pv ), (pv) )
+ INLINEFUNC( P_POINT4, normalize4, ( P_POINT4 pv ) )
+{
+	RCOORD k = DOFUNC(Length4)( pv );
+   if( k != 0 )
+		DOFUNC(scale4)( pv, pv, ONE / k );
+   return pv;
+}
+ REALFUNCT( P_POINT4,  normalize4, ( P_POINT pv ), (pv) )
 //----------------------------------------------------------------
- INLINEFUNC( void, crossproduct, ( P_POINT pr, PC_POINT pv1, PC_POINT pv2 ) )
+ INLINEFUNC( P_POINT, crossproduct, ( P_POINT pr, PC_POINT pv1, PC_POINT pv2 ) )
 {
    // this must be limited to 3D only, huh???
    // what if we are 4D?  how does this change??
@@ -80027,8 +83142,9 @@ RCOORD EXTERNAL_NAME(Distance)( PC_POINT v1, PC_POINT v2 )
   pr[1] = pv2[0] * pv1[2] - pv2[2] * pv1[0];
  //b2a1-a2b1
   pr[2] = pv2[1] * pv1[0] - pv2[0] * pv1[1];
+  return pr;
 }
-REALVOIDFUNCT( void, crossproduct, ( P_POINT pr, PC_POINT pv1, PC_POINT pv2 ), (pr,pv1,pv2) )
+REALFUNCT( P_POINT, crossproduct, ( P_POINT pr, PC_POINT pv1, PC_POINT pv2 ), (pr,pv1,pv2) )
 // hmmm
 // 2 4 dimensional vectors would be insufficient to determine
 // a single perpendicular vector... as it could lay  in a perpendular
@@ -80107,6 +83223,7 @@ static void CPROC transform_created( void *data, uintptr_t size )
 PTRANSFORM EXTERNAL_NAME(CreateNamedTransform)( CTEXTSTR name  )
 {
 	PTRANSFORM pt;
+#ifndef __NO_VECTOR_NAMED_TRANSFORM__
 	if( name )
 	{
 		if( !l.flags.bRegisteredTransform )
@@ -80123,6 +83240,7 @@ PTRANSFORM EXTERNAL_NAME(CreateNamedTransform)( CTEXTSTR name  )
 		pt = (PTRANSFORM)CreateRegisteredDataType( "SACK/vectlib", TYPENAME, name );
 	}
 	else
+#endif
 	{
 		pt = New( struct transform_tag );
 		pt->motions = NULL;
@@ -80500,6 +83618,34 @@ void EXTERNAL_NAME(ApplyT)( PCTRANSFORM pt, PTRANSFORM ptd, PCTRANSFORM pts )
 		lprintf( "blah" );
 #endif
 	MemCpy( ptd->m, t.m, sizeof( t.m ) );
+}
+//----------------------------------------------------------------
+void EXTERNAL_NAME(ApplyM)( PMatrix pt, PMatrix ptd, PMatrix pts )
+{
+	int i,k;
+	for( k = 0; k < 4; k++ ) {
+		for( i = 0; i < 4; i++ ) {
+			ptd[0][i][k] = pt[0][0][k] * pts[0][i][0]
+			             + pt[0][1][k] * pts[0][i][1]
+			             + pt[0][2][k] * pts[0][i][2]
+			             + pt[0][3][k] * pts[0][i][3];
+		}
+	}
+}
+//----------------------------------------------------------------
+void EXTERNAL_NAME(ApplyMcm)( PMatrix pt, PMatrix ptd, PMatrix pts )
+{
+	RCOORD tmp;
+	int i,j, k;
+	for( k = 0; k < 4; k++ ) {
+		for( i = 0; i < 4; i++ ) {
+			tmp = 0;
+			for( j = 0; j < 4; j++ ) {
+				tmp += pt[0][j][k] * pts[0][i][j];
+			}
+			ptd[0][k][i] = tmp;
+		}
+	}
 }
 //----------------------------------------------------------------
 void EXTERNAL_NAME(ApplyCameraT)( PCTRANSFORM pt, PTRANSFORM ptd, PCTRANSFORM pts )
@@ -81441,6 +84587,7 @@ void EXTERNAL_NAME(showstd)( PTRANSFORM pt, const char *header )
 }
 #undef F4
 #undef F
+#ifdef VECTLIB_FILEIO_SUPPORTED
 void EXTERNAL_NAME(SaveTransform)( PTRANSFORM pt, CTEXTSTR filename )
 {
 	FILE *file;
@@ -81463,6 +84610,7 @@ void EXTERNAL_NAME(LoadTransform)( PTRANSFORM pt, CTEXTSTR filename )
 		sack_fclose( file );
 	}
 }
+#endif
 void EXTERNAL_NAME(GetPointOnPlane)( PRAY plane, PCVECTOR up, PCVECTOR size, PCVECTOR point )
 {
 	// plane is origin-normal specificatio of plane.
@@ -81485,8 +84633,8 @@ RCOORD EXTERNAL_NAME(IntersectLineWithPlane)( PCVECTOR Slope, PCVECTOR Origin,
  // time of intersection
 	RCOORD a,b,c,cosPhi, t;
 	// intersect a line with a plane.
-//   v € w = (1/2)(|v + w|2 - |v|2 - |w|2)
-//  (v € w)/(|v| |w|) = cos ß
+//   v ï¿½ w = (1/2)(|v + w|2 - |v|2 - |w|2)
+//  (v ï¿½ w)/(|v| |w|) = cos ï¿½
 	//cosPhi = CosAngle( Slope, n );
 	a = ( Slope[0] * n[0] +
 			Slope[1] * n[1] +
@@ -81538,6 +84686,537 @@ RCOORD EXTERNAL_NAME( PointToPlaneT )( PCVECTOR n, PCVECTOR o, PCVECTOR p ) {
 	EXTERNAL_NAME( Invert)( i );
 	EXTERNAL_NAME( IntersectLineWithPlane)( i, p, n, o, &t );
 	return t;
+}
+static RCOORD acos2( RCOORD x) {
+	RCOORD tmp = floor((x + 1) / 2.0);
+	return acos(x - tmp * 2.0) - tmp * M_PI;
+}
+void EXTERNAL_NAME(basis_lq)( PVECTOR4 v4, PMatrix basis ) {
+	// tr(M)=2cos(theta)+1 .
+	const RCOORD t = ( ( (*basis)[0][0] + (*basis)[1][1] + (*basis)[2][2] ) - 1 )/2;
+	//console.log( "FB t is:", t, basis.right.x, basis.up.y, basis.forward.z );
+	//	if( t > 1 || t < -1 )
+	//  1,1,1 -1 = 2;/2 = 1
+	// -1-1-1 -1 = -4 /2 = -2;
+	/// okay; but a rotation matrix never gets back to the full rotation? so 0-1 is enough?  is that why evertyhing is biased?
+	//  I thought it was more that sine() - 0->pi is one full positive wave... where the end is the same as the start
+	//  and then pi to 2pi is all negative, so it's like the inverse of the rotation (and is only applied as an inverse? which reverses the negative limit?)
+	//  So maybe it seems a lot of this is just biasing math anyway?
+	const double angle = acos2(t);
+	if( !angle ) {
+		//console.log( "primary rotation is '0'", t, angle, this.Î¸, basis.right.x, basis.up.y, basis.forward.z );
+		v4[0] = 0;
+		v4[1] = 1;
+		v4[2] = 0;
+		v4[3] = 0;
+		return;
+	}
+	/*
+	https://stackoverflow.com/a/12472591/4619267
+	x = (R21 - R12)/sqrt((R21 - R12)^2+(R02 - R20)^2+(R10 - R01)^2);
+	y = (R02 - R20)/sqrt((R21 - R12)^2+(R02 - R20)^2+(R10 - R01)^2);
+	z = (R10 - R01)/sqrt((R21 - R12)^2+(R02 - R20)^2+(R10 - R01)^2);
+	*/
+	RCOORD yz = (*basis)[1][2] - (*basis)[2][1];
+	RCOORD xz = (*basis)[2][0] - (*basis)[0][2];
+	RCOORD xy = (*basis)[0][1] - (*basis)[1][0];
+	double tmp = 1 /sqrt(yz*yz + xz*xz + xy*xy );
+	v4[3] = angle;
+	v4[0] = yz *tmp;
+	v4[1] = xz *tmp;
+	v4[2] = xy *tmp;
+}
+void EXTERNAL_NAME(lq_exp)( PVECTOR4 q, PCVECTOR4 v) {
+	RCOORD c = cos( v[3]/2 );
+	RCOORD s = sin( v[3]/2 );
+	q[0] = c;
+	q[1] = v[0] * s;
+	q[2] = v[1] * s;
+	q[3] = v[2] * s;
+}
+PMatrix EXTERNAL_NAME(lq_basis)(PMatrix matrix, PCVECTOR4 v ) {
+	const RCOORD nt = v[3];
+ // sin/cos are the function of exp()
+	const RCOORD s  = sin( nt );
+ // sin/cos are the function of exp()
+	const RCOORD c1 = cos( nt );
+ // sin/cos are the function of exp()
+	const RCOORD c = 1- c1;
+  // x * y / (xx+yy+zz) * (1 - cos(2t))
+	const RCOORD xy = c*v[0]*v[1];
+  // y * z / (xx+yy+zz) * (1 - cos(2t))
+	const RCOORD yz = c*v[1]*v[2];
+  // x * z / (xx+yy+zz) * (1 - cos(2t))
+	const RCOORD xz = c*v[0]*v[2];
+     // x / sqrt(xx+yy+zz) * sin(2t)
+	const RCOORD wx = s*v[0];
+     // y / sqrt(xx+yy+zz) * sin(2t)
+	const RCOORD wy = s*v[1];
+     // z / sqrt(xx+yy+zz) * sin(2t)
+	const RCOORD wz = s*v[2];
+	(*matrix)[0][0] = c1 + c*v[0]*v[0];
+	(*matrix)[0][1] =     ( xy + wz );
+	(*matrix)[0][2] =     ( xz - wy );
+	(*matrix)[1][0] =     ( xy - wz );
+	(*matrix)[1][1] = c1 + c*v[1]*v[1];
+	(*matrix)[1][2] =     ( wx + yz );
+	(*matrix)[2][0] =     ( wy + xz );
+	(*matrix)[2][1] =     ( yz - wx );
+	(*matrix)[2][2] = c1 + c*v[2]*v[2];
+	return matrix;
+}
+PMatrix EXTERNAL_NAME(lq_matrix)(PMatrix matrix, PCVECTOR4 v, PCVECTOR position ) {
+	RCOORD nt = v[3];
+ // sin/cos are the function of exp()
+	RCOORD s  = sin( nt );
+ // sin/cos are the function of exp()
+	RCOORD c1 = cos( nt );
+ // sin/cos are the function of exp()
+	RCOORD c = 1- c1;
+  // x * y / (xx+yy+zz) * (1 - cos(2t))
+	RCOORD xy = c*v[0]*v[1];
+  // y * z / (xx+yy+zz) * (1 - cos(2t))
+	RCOORD yz = c*v[1]*v[2];
+  // x * z / (xx+yy+zz) * (1 - cos(2t))
+	RCOORD xz = c*v[0]*v[2];
+     // x / sqrt(xx+yy+zz) * sin(2t)
+	RCOORD wx = s*v[0];
+     // y / sqrt(xx+yy+zz) * sin(2t)
+	RCOORD wy = s*v[1];
+     // z / sqrt(xx+yy+zz) * sin(2t)
+	RCOORD wz = s*v[2];
+	(*matrix)[0][0] = c1 + c*v[0]*v[0];
+	(*matrix)[0][1] =     ( xy + wz );
+	(*matrix)[0][2] =     ( xz - wy );
+	(*matrix)[1][0] =     ( xy - wz );
+	(*matrix)[1][1] = c1 + c*v[1]*v[1];
+	(*matrix)[1][2] =     ( wx + yz );
+	(*matrix)[2][0] =     ( wy + xz );
+	(*matrix)[2][1] =     ( yz - wx );
+	(*matrix)[2][2] = c1 + c*v[2]*v[2];
+	(*matrix)[3][0] = position[0] * (*matrix)[0][0] + position[1] * (*matrix)[1][0] + position[2] * (*matrix)[2][0];
+	(*matrix)[3][1] = position[0] * (*matrix)[0][1] + position[1] * (*matrix)[1][1] + position[2] * (*matrix)[2][1];
+	(*matrix)[3][2] = position[0] * (*matrix)[0][2] + position[1] * (*matrix)[1][2] + position[2] * (*matrix)[2][2];
+	(*matrix)[0][3] = (*matrix)[1][3] = (*matrix)[2][3] = 0;
+	(*matrix)[3][3] = 1;
+	return matrix;
+}
+PMatrix EXTERNAL_NAME( lq_gl_basis )( PMatrix matrix, PCVECTOR4 v ) {
+	RCOORD nt = v[3];
+ // sin/cos are the function of exp()
+	RCOORD s  = sin( nt );
+ // sin/cos are the function of exp()
+	RCOORD c1 = cos( nt );
+ // sin/cos are the function of exp()
+	RCOORD c = 1- c1;
+  // x * y / (xx+yy+zz) * (1 - cos(2t))
+	RCOORD xy = c*v[0]*v[1];
+  // y * z / (xx+yy+zz) * (1 - cos(2t))
+	RCOORD yz = c*v[1]*v[2];
+  // x * z / (xx+yy+zz) * (1 - cos(2t))
+	RCOORD xz = c*v[0]*v[2];
+     // x / sqrt(xx+yy+zz) * sin(2t)
+	RCOORD wx = s*v[0];
+     // y / sqrt(xx+yy+zz) * sin(2t)
+	RCOORD wy = s*v[1];
+     // z / sqrt(xx+yy+zz) * sin(2t)
+	RCOORD wz = s*v[2];
+	(*matrix)[0][0] = c1 + c*v[0]*v[0];
+	(*matrix)[1][0] =     ( xy + wz );
+	(*matrix)[2][0] =     ( xz - wy );
+	(*matrix)[0][1] =     ( xy - wz );
+	(*matrix)[1][1] = c1 + c*v[1]*v[1];
+	(*matrix)[2][1] =     ( wx + yz );
+	(*matrix)[0][2] =     ( wy + xz );
+	(*matrix)[1][2] =     ( yz - wx );
+	(*matrix)[2][2] = c1 + c*v[2]*v[2];
+	return matrix;
+}
+VECTOR_METHOD( PVECTOR, lq_up, ( PVECTOR out, PCVECTOR4 r ) ) {
+ // double angle sin
+	const RCOORD s  = sin( r[ 3 ] );
+ // sin/cos are the function of exp()
+	const RCOORD c1 = cos( r[ 3 ] );
+	const RCOORD c  = 1 - c1;
+	const RCOORD cn = c * r[ 1 ];
+	out[ 0 ]        = -s * r[ 2 ] + cn * r[ 0 ];
+	out[ 1 ]        = c1 + cn * r[ 1 ];
+	out[ 2 ]        = s * r[ 0 ] + cn * r[ 2 ];
+	return out;
+}
+VECTOR_METHOD( PVECTOR, lq_right, ( PVECTOR out, PCVECTOR4 r ) ) {
+ // double angle sin
+	const RCOORD s  = sin( r[ 3 ] );
+ // sin/cos are the function of exp()
+	const RCOORD c1 = cos( r[ 3 ] );
+	const RCOORD c  = 1 - c1;
+	const RCOORD cn = c * r[ 0 ];
+	out[ 0 ]        = c1 + cn * r[ 0 ];
+	out[ 1 ]        = s * r[ 2 ] + cn * r[ 1 ];
+	out[ 2 ]        = -s * r[ 1 ] + cn * r[ 2 ];
+	return out;
+}
+VECTOR_METHOD( PVECTOR, lq_forward, ( PVECTOR out, PCVECTOR4 r ) ) {
+ // double angle sin
+	const RCOORD s  = sin( r[ 3 ] );
+ // sin/cos are the function of exp()
+	const RCOORD c1 = cos( r[ 3 ] );
+	const RCOORD c  = 1 - c1;
+	const RCOORD cn = c * r[ 2 ];
+	out[ 0 ]        = s * r[ 1 ] + cn * r[ 0 ];
+	out[ 1 ]        = -s * r[ 0 ] + cn * r[ 1 ];
+	out[ 2 ]        = c1 + cn * r[ 2 ];
+	return out;
+}
+RCOORD EXTERNAL_NAME(lq_roll)( PCVECTOR4 r ) {
+	// this is the inverse of the y coordinate of the x axis.
+   // if x is not flat, then it has some position change in the y direction
+	return asin( ( (1 - cos( r[ 3 ] )) * r[ 0 ] ) * r[ 1 ] - sin( r[ 3 ] ) * r[ 2 ] );
+}
+RCOORD EXTERNAL_NAME(lq_yaw)( PCVECTOR4 r ) {
+ // double angle sin
+	const RCOORD s         = sin( r[ 3 ] );
+ // sin/cos are the function of exp()
+	const RCOORD c1        = cos( r[ 3 ] );
+	const RCOORD c         = 1 - c1;
+	// this is the inverse  x coordinate of the Z axis.
+	// if x is not 0 then there is a yaw.
+	const RCOORD principal = -asin( -s * r[1] + ( 1 - c1 ) * r[0] * r[2] );
+	// then we can look at the x of the x axis, and if it is negative
+	const RCOORD rx        = c1 + c * r[ 0 ] * r[ 0 ];
+	if( rx > 0 )
+		return principal;
+	return ( principal < 0 ) ? ( -M_PI - principal ) : ( M_PI - principal );
+}
+RCOORD EXTERNAL_NAME(lq_pitch)( PCVECTOR4 r ) {
+	// this is the inverse coordinate for the z coordinate of the y axis
+	// for the forward axis.
+	// the negative is distributed, the way this works is inverted to
+   // what a UI would want to see.
+	return asin( sin( r[3] ) * r[ 0 ] - ( cos( r[3] ) - 1 ) * r[ 2 ] * r[ 1 ] );
+}
+VECTOR_METHOD( void, lq_apply, ( PVECTOR out, PCVECTOR4 r, PCVECTOR v ) ) {
+	// rodrigues full angle multiply
+	const RCOORD c = cos( r[ 3 ] );
+	const RCOORD s = sin( r[ 3 ] );
+	const RCOORD dot = ( 1 - c ) * ( ( r[ 0 ] * v[ 0 ] ) + ( r[ 1 ] * v[ 1 ] ) + ( r[ 2 ] * v[ 2 ] ) );
+	// v *cos(theta) + sin(theta)*cross + q * dot * (1-c)
+	out[ 0 ]  = v[ 0 ] * c + s * ( r[ 1 ] * v[ 2 ] - r[ 2 ] * v[ 1 ] ) + r[ 0 ] * dot;
+	out[ 1 ]  = v[ 1 ] * c + s * ( r[ 2 ] * v[ 0 ] - r[ 0 ] * v[ 2 ] ) + r[ 1 ] * dot;
+	out[ 2 ]  = v[ 2 ] * c + s * ( r[ 0 ] * v[ 1 ] - r[ 1 ] * v[ 0 ] ) + r[ 2 ] * dot;
+}
+VECTOR_METHOD( PVECTOR4, lq_applyRotation, ( PVECTOR4 out, PCVECTOR4 r, PCVECTOR4 a ) ) {
+	// RCOORD oct         = oct || floor( r[3]ï¿½ ( M_PI * 2 ) );
+	// A dot B   = cos( angle A->B )
+	// cos( C/2 )
+	//  cos(angle between the two rotation axii)
+	const RCOORD AdotB = ( r[ 0 ] * a[ 0 ] + r[ 1 ] * a[ 1 ] + r[ 2 ] * a[ 2 ] );
+	/*
+	// orbital hopping mechanic...
+	// hypothetical relation mass to orbital
+	if( AdotB > 0.99 ) {
+	   if( q.Î¸ + th > M_PI*4 )
+	      oct++;
+	} else if( cosCo2 < -0.99 ){
+	   if( q.Î¸ - th < -M_PI*4 )
+	      oct--;
+	}
+	*/
+	// using sin(x+y)+sin(x-y)  expressions replaces multiplications with additions...
+	// same sin/cos lookups sin(x),cos(x),sin(y),cos(y)
+	//   or sin(x+y),cos(x+y),sin(x-y),cos(x-y)
+ // X - Y  ('x' 'm'inus 'y')
+	const RCOORD xmy   = ( a[ 3 ] - r[ 3 ] ) / 2;
+ // X + Y  ('x' 'p'lus 'y' )
+	const RCOORD xpy   = ( a[ 3 ] + r[ 3 ] ) / 2;
+	const RCOORD cxmy  = cos( xmy );
+	const RCOORD cxpy  = cos( xpy );
+	// cos(angle result)
+	// const cosCo2 = ( ( 1-AdotB )*cxmy + (1+AdotB)*cxpy )/2;
+	// ( 2 cos(x) cos(y) - 2 A sin(x) sin(y) ) / 2
+	const RCOORD cosCo2 = ( ( AdotB ) * ( cxpy - cxmy ) + cxmy + cxpy ) / 2;
+	//   (1-cos(A))cos(x-y)+(1+cos(A))cos(x+y)
+	//    cos(A) (cos(x + y) - cos(x - y)) + cos(x - y) + cos(x + y)
+	// octive should have some sort of computation that gets there...s
+	// would have to be a small change
+/* + oct * ( M_PI * 2 )*/
+	const RCOORD ang  = acos2( cosCo2 ) * 2;
+	if( ang ) {
+		const RCOORD sxmy = sin( xmy );
+		const RCOORD sxpy = sin( xpy );
+		// vector rotation is just...
+		// when both are large, cross product is dominant (pi/2)
+ // 2 cos(y) sin(x)
+		const RCOORD ss1  = sxmy + sxpy;
+ // 2 cos(x) sin(y)
+		const RCOORD ss2  = sxpy - sxmy;
+ // 2 sin(x) sin(y)
+		const RCOORD cc1  = cxmy - cxpy;
+		// 1/2 (B sin(a/2) cos(b/2) - A sin^2(b/2) + A cos^2(b/2))
+		//  the following expression is /2 (has to be normalized anywa[1] keep 1 bit)
+		//  and is not normalized with sin of angle/2.
+		const RCOORD crsX = ( a[ 1 ] * r[ 2 ] - a[ 2 ] * r[ 1 ] );
+		const RCOORD crsY = ( a[ 2 ] * r[ 0 ] - a[ 0 ] * r[ 2 ] );
+		const RCOORD crsZ = ( a[ 0 ] * r[ 1 ] - a[ 1 ] * r[ 0 ] );
+		const RCOORD Cx   = ( crsX * cc1 + a[ 0 ] * ss1 + r[ 0 ] * ss2 );
+		const RCOORD Cy   = ( crsY * cc1 + a[ 1 ] * ss1 + r[ 1 ] * ss2 );
+		const RCOORD Cz   = ( crsZ * cc1 + a[ 2 ] * ss1 + r[ 2 ] * ss2 );
+		// this is NOT /sin(theta);  it is, but only in some ranges...
+		const RCOORD lensq = Cx * Cx + Cy * Cy + Cz * Cz;
+		if( lensq > 0.0000000000000001 ) {
+ /*( lnQuat.sinNormal ) ? ( 1 / ( 2 * sin( ang / 2 ) ) ) :*/
+			const RCOORD Clx = 1 / sqrt(lensq);
+			//RCOORD qrn       = Clx; // I'd like to save this to see what the normal actually was
+			out[ 3 ]   = ang;
+			out[ 0 ]   = Cx * Clx;
+			out[ 1 ]   = Cy * Clx;
+			out[ 2 ]   = Cz * Clx;
+		} else {
+			// result angle is 0
+			out[ 0 ] = r[ 0 ];
+			out[ 1 ] = r[ 1 ];
+			out[ 2 ] = r[ 2 ];
+			if( AdotB > 0 ) {
+				out[ 3 ] = r[ 3 ] + a[3];
+			} else {
+				out[ 3 ] = r[ 3 ] - a[3];
+			}
+		}
+	}
+	return out;
+}
+PVECTOR4 EXTERNAL_NAME(lq_set4)( PVECTOR4 out, RCOORD x, RCOORD y, RCOORD z, RCOORD angle ) {
+	const RCOORD len = sqrt( x * x + y * y + z * z );
+	if( len > 0.00000001 ) {
+		const RCOORD ilen = 1 / len;
+		out[ 0 ]         = x * ilen;
+		out[ 1 ]         = y * ilen;
+		out[ 2 ]         = z * ilen;
+	} else {
+		out[ 0 ] = 0;
+		out[ 1 ] = 1;
+		out[ 2 ] = 0;
+	}
+	out[ 3 ] = angle;
+	return out;
+}
+PVECTOR4 EXTERNAL_NAME(lq_set3)( PVECTOR4 out, RCOORD x, RCOORD y, RCOORD z ) {
+	const RCOORD len = sqrt( x * x + y * y + z * z );
+	if( len > 0.00000001 ) {
+		const RCOORD ilen = 1 / len;
+		out[ 0 ]          = x * ilen;
+		out[ 1 ]          = y * ilen;
+		out[ 2 ]          = z * ilen;
+	} else {
+		out[ 0 ] = 0;
+		out[ 1 ] = 1;
+		out[ 2 ] = 0;
+	}
+	out[ 3 ] = len;
+	return out;
+}
+static PVECTOR4 alignZero( PVECTOR4 q ) {
+	// const fN = 1/Math.sqrt( tz*tz+tx*tx );
+	MATRIX b;
+	EXTERNAL_NAME( lq_basis )( &b, q );
+	const RCOORD ty       = b[ 1 ][ 1 ];
+ // 1->-1 (angle from pole around this circle.
+	const RCOORD cosTheta = acos2( ty );
+	const RCOORD txn = -q[ 2 ];
+	const RCOORD tzn = q[ 0 ];
+     // double angle substituted
+	const RCOORD s = sin( cosTheta );
+ // double angle substituted
+	const RCOORD c = 1 - cos( cosTheta );
+	// determinant coordinates
+	const RCOORD angle = txn == 1 ? cosTheta : acos2( ( ty + 1 ) * ( 1 - txn ) / 2 - 1 );
+	// compute the axis
+	const RCOORD yz           = s * q[0];
+	const RCOORD xz       = ( 2 - c * ( q[0] * q[0] + q[2] * q[2] ) ) * tzn;
+	const RCOORD xy = txn == 1 ? ( s * q[0] * tzn + s * q[2] * ( 1 ) ) : ( s * q[0] * tzn + s * q[2] * ( 1 - txn ) );
+	// if( txn === 1 ) angle += M_PI*2;
+	const RCOORD newlen       = sqrt( yz * yz + xz * xz + xy * xy );
+	if( newlen > 0.00000001 ) {
+		const RCOORD tmp = 1 / newlen;
+		q[0]      = yz * tmp;
+		q[1]      = xz * tmp;
+		q[2]      = xy * tmp;
+	} else {
+		q[0] = 0;
+		q[1] = 1;
+		q[2] = 0;
+	}
+	q[ 3 ]             = angle;
+	return q;
+}
+PVECTOR4 EXTERNAL_NAME( lq_set_xy )( PVECTOR4 out, RCOORD x, RCOORD y ) {
+	out[ 0 ] = x;
+	out[ 1 ] = 0;
+	out[ 2 ] = y;
+	return alignZero( EXTERNAL_NAME( lq_normalize )( out ) );
+}
+PVECTOR4 EXTERNAL_NAME(lq_normalize)( PVECTOR4 out ) {
+	RCOORD len = out[ 0 ] * out[ 0 ] + out[ 1 ] * out[ 1 ] + out[ 2 ] * out[ 2 ];
+	if( len > 0.00000001 ) {
+		const RCOORD angle = sqrt( len );
+		const RCOORD ilen  = 1 / angle;
+		out[ 0 ]           = out[ 0 ] * ilen;
+		out[ 1 ]           = out[ 1 ] * ilen;
+		out[ 2 ]           = out[ 2 ] * ilen;
+		out[ 3 ]           = angle;
+	} else {
+		out[ 0 ] = 0;
+		out[ 1 ] = 1;
+		out[ 2 ] = 0;
+		out[ 3 ] = 0;
+	}
+	return out;
+}
+#define p2 (2*M_PI)
+ //            0-1 1-2 2-3 3-4
+static
+     const RCOORD grid[ 4 ][ 4 ]
+ //>0 - 1
+     = { { 0, p2, p2, 0 }
+ // 1-2
+       , { p2, 0, 0, p2 }
+ // 2-3
+       , { p2, 0, 0, p2 }
+ // 3-4
+       , { 0, p2, p2, 0 }
+};
+// it's hard to see this because they're all in the same plane...
+// not sure this is really needed, because the twist is just around this
+// same axis.
+static const RCOORD grid2[ 4 ][ 4 ] = {
+ //>0 - 1
+     { 0, p2, 0, 0 }
+ // 1-2
+   , { p2, 0, 0, p2 }
+ // 2-3
+   , { 0, 0, 0, p2 * 2 }
+ // 3-4
+   , { 0, 0, 0, p2 * 2 }
+};
+#undef p2
+PVECTOR4 EXTERNAL_NAME( lq_set_latlong )( PVECTOR4 out, RCOORD lat, RCOORD lng ) {
+	if( !lat ) {
+		out[ 0 ] = 0;
+		out[ 2 ] = 0;
+ // + twistDelta;
+		out[ 1 ] = lng;
+		return EXTERNAL_NAME(lq_normalize)( out );
+	}
+	const int d          = 0;
+	const int gridlat    = floor( fabs( lat ) / M_PI );
+	const int gridlng    = floor( fabs( lng ) / M_PI );
+	const int gridlatoct = gridlat >> 2;
+	const int gridlngoct = gridlng >> 2;
+	const RCOORD spin
+	     = ( ( d ) ? grid : grid2 )[ gridlat % 4 ][ gridlng % 4 ] + ( ( gridlatoct + gridlngoct ) * M_PI * 4 );
+ //(!d)?gridn[gridlat%4][gridlng%4]:1;
+	const RCOORD latmul = 1;
+	const RCOORD x      = sin( lng );
+	const RCOORD z      = cos( lng );
+	out[ 3 ]            = ( latmul * lat + spin );
+	out[ 0 ]            = x;
+	out[ 1 ]            = 0;
+	out[ 2 ]            = z;
+	return out;
+}
+PVECTOR4 EXTERNAL_NAME(lq_cross)( PVECTOR4 out, PCVECTOR a, PCVECTOR b ) {
+	const RCOORD alen         = sqrt( a[ 0 ] * a[ 0 ] + a[ 1 ] * a[ 1 ] + a[ 2 ] * a[ 2 ] );
+	const RCOORD blen  = sqrt( b[ 0 ] * b[ 0 ] + b[ 1 ] * b[ 1 ] + b[ 2 ] * b[ 2 ] );
+	const RCOORD dot   = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2])/(alen*blen);
+ // returns 0 to pi; 0 to 1/2 turn.
+	const RCOORD angle = acos2( dot );
+	const RCOORD norm  = sin( angle );
+	const RCOORD crsX  = -( a[1] * b[2] - a[2] * b[1] );
+	const RCOORD crsY  = -( a[2] * b[0] - a[0] * b[2] );
+	const RCOORD crsZ  = -( a[0] * b[1] - a[1] * b[0] );
+	if( norm ) {
+		out[3] = angle;
+		out[0] = crsX / norm;
+		out[1] = crsY / norm;
+		out[2] = crsZ / norm;
+	} else {
+		if( angle > M_PI ) {
+			out[ 3 ]  = angle;
+			out[ 0 ]  = a[0];
+			out[ 1 ]  = a[1];
+			out[ 2 ] = a[2];
+		} else {
+			out[ 3 ]  = angle;
+			out[ 0 ]  = a[0];
+			out[ 1 ]  = a[1];
+			out[ 2 ]  = a[2];
+		}
+	}
+	return out;
+}
+PVECTOR4 EXTERNAL_NAME( lq_free_look )( PVECTOR4 out, PCVECTOR4 orientation, RCOORD pitch, RCOORD yaw, RCOORD roll ) {
+	VECTOR4 rotation;
+	const RCOORD len2 = pitch*pitch + yaw*yaw + roll*roll;
+	if( len2 < 0.00000000001 ) {
+		if( out != orientation ) {
+			out[0]=orientation[0];
+			out[1]=orientation[1];
+			out[2]=orientation[2];
+			out[3]=orientation[3];
+		}
+		return out;
+	}
+	const RCOORD scalar = sqrt(len2);
+	rotation[ 0 ] = pitch / scalar;
+	rotation[ 1 ] = yaw   / scalar;
+	rotation[ 2 ] = roll  / scalar;
+	rotation[ 3 ] = scalar;
+	EXTERNAL_NAME(lq_applyRotation)( out, orientation, rotation );
+	return out;
+}
+PVECTOR4 EXTERNAL_NAME( lq_level_look )( PVECTOR4 out, PCVECTOR4 orientation, RCOORD pitch, RCOORD yaw, RCOORD k ) {
+	VECTOR4 rotation;
+	const RCOORD len2 = pitch*pitch + yaw*yaw;
+	if( len2 < 0.00000000001 ) {
+		const RCOORD orientation_roll = asin( ( 1 - cos( orientation[ 3 ] ) ) * orientation[ 0 ] * orientation[ 1 ] - sin( orientation[ 3 ] ) * orientation[ 2 ] ) * k;
+		const int bigroll = fabs( orientation_roll ) > 0.000000001;
+		if( out != orientation || bigroll ) {
+			if( bigroll ) {
+				rotation[0] = 0;
+				rotation[1] = 0;
+				rotation[2] = 1;
+				rotation[3] = orientation_roll;
+				// get inverse-x-axis y coordinate for roll
+				//rotation[3] = asin( ( 1 - cos( out[ 3 ] ) ) * out[ 0 ] * out[ 1 ] - sin( out[ 3 ] ) * out[ 2 ] ) * k;
+				EXTERNAL_NAME(lq_applyRotation)( out, orientation, rotation );
+			} else {
+				// not a big roll, and isn't same vector, copy
+				out[0]=orientation[0];
+				out[1]=orientation[1];
+				out[2]=orientation[2];
+				out[3]=orientation[3];
+			}
+		} else if( out != orientation ) {
+			out[0]=orientation[0];
+			out[1]=orientation[1];
+			out[2]=orientation[2];
+			out[3]=orientation[3];
+		}
+		return out;
+	}
+	const RCOORD scalar = sqrt(len2);
+	rotation[ 0 ] = pitch / scalar;
+	rotation[ 1 ] = yaw   / scalar;
+	rotation[ 2 ] = 0;
+	rotation[ 3 ] = scalar;
+	EXTERNAL_NAME(lq_applyRotation)( out, orientation, rotation );
+	rotation[0] = 0;
+	rotation[1] = 0;
+	rotation[2] = 1;
+	// get inverse-x-axis y coordinate for roll
+	rotation[3] = asin( ( 1 - cos( out[ 3 ] ) ) * out[ 0 ] * out[ 1 ] - sin( out[ 3 ] ) * out[ 2 ] ) * k;
+	EXTERNAL_NAME(lq_applyRotation)( out, out, rotation );
+	return out;
 }
 #undef l
 VECTOR_NAMESPACE_END
@@ -83357,15 +87036,12 @@ namespace fs {
 }
 #endif
 #ifdef __cplusplus
-/* Object storage system, uses a optimized hash map to index unique identifiers and data associated with them.
-Timeline exists, Multi-versioning support possible using the same file and different timestamps with associated data.
-*/
+/* Object storage system, uses a optimized hash map to index unique identifiers and data associated with them. */
 namespace objStore {
 #endif
 	struct sack_vfs_os_volume;
 	struct sack_vfs_os_file;
 	struct sack_vfs_os_find_info;
-	struct sack_vfs_os_time_cursor;
 	/* thse should probably be moved to sack_vfs_os.h being file system specific extensions. */
 	enum sack_object_store_file_system_file_ioctl_ops {
   // psvInstance should be a file handle pass (char*, size_t length )
@@ -83513,10 +87189,10 @@ namespace objStore {
 #define sack_vfs_os_ioctl_patch_sealed_object( vol, objId,objIdLen, obj,objlen, seal,seallen, result, resultlen ) sack_fs_ioctl( vol, SOSFSSIO_PATCH_OBJECT, FALSE, FALSE, objId, objIdLen, authId, authIdLen, obj, objlen, seal, seallen, result, resultlen )
 #define sack_vfs_os_ioctl_create_index( file, indexName ) sack_vfs_os_file_ioctl( file, SOSFSFIO_CREATE_INDEX, indexName )
 #define sack_vfs_os_ioctl_get_times( file, timeArray,tzArray,timeCount ) sack_vfs_os_file_ioctl( file, SOSFSFIO_GET_TIMES, timeArray,tzArray,timeCount )
-// get the last write timeline index of a file
+// get the last write time of a file
 //     sack_vfs_os_ioctl_get_time( file )
 #define sack_vfs_os_ioctl_get_time( file ) sack_vfs_os_file_ioctl( file, SOSFSFIO_GET_TIME )
-#define sack_vfs_os_ioctl_set_time( file, timestamp,tz )            sack_vfs_os_file_ioctl( file, SOSFSFIO_SETTIME, timestamp,tz )
+#define sack_vfs_os_ioctl_set_time( file, timestamp,tz )            sack_vfs_os_file_ioctl( file, SOSFSFIO_SET_TIME, timestamp,tz )
 // open a volume at the specified pathname.
 // if the volume does not exist, will create it.
 // if the volume does exist, a quick validity check is made on it, and then the result is opened
@@ -83605,8 +87281,6 @@ SACK_VFS_PROC size_t sack_vfs_os_find_get_size( struct sack_vfs_os_find_info *in
 SACK_VFS_PROC LOGICAL sack_vfs_os_get_times( struct sack_vfs_os_file* file, uint64_t** timeArray, int8_t**tzArray, size_t* timeCount );
 // set last time for object in storage. (overwrites current tick used to update on write)
 SACK_VFS_PROC LOGICAL sack_vfs_os_set_time( struct sack_vfs_os_file* file, uint64_t time, int8_t tz );
-SACK_VFS_PROC struct sack_vfs_os_time_cursor* sack_vfs_os_get_time_cursor( struct sack_vfs_os_volume* vol );
-SACK_VFS_PROC LOGICAL sack_vfs_os_read_time_cursor( struct sack_vfs_os_time_cursor* cursor, int step, uint64_t time_, uint64_t* entry, const char** filename, uint64_t* result_timestamp, int8_t* result_tz, const char** buffer, size_t* size );
 // force disabling any further writes to the volue; for unit-testing journal recovery.
 SACK_VFS_PROC LOGICAL sack_vfs_os_halt( struct sack_vfs_os_volume* volume );
 // generate a report about the internal structure of the volue...
@@ -83743,7 +87417,6 @@ SACK_VFS_NAMESPACE
 #define BAT_BLOCK_SIZE      4096
 #define NAME_BLOCK_SIZE     4096
 #define KEY_SIZE            1024
-#define TIME_BLOCK_SIZE     4096
 #define ROLLBACK_BLOCK_SIZE 4096
 #define FILE_NAME_MAXLEN    4096
 #define BLOCK_MASK (BLOCK_SIZE-1)
@@ -83838,10 +87511,6 @@ enum block_cache_entries
 	, BC(DATAKEY)
 	, BC(FILE)
 	, BC(FILE_LAST) = BC(FILE) + 32
-#ifdef VIRTUAL_OBJECT_STORE
-	, BC( TIMELINE )
-	, BC( TIMELINE_LAST ) = BC( TIMELINE ) + 48
-#endif
 #if defined( VIRTUAL_OBJECT_STORE )
 	// really shouldn't need more than one of these...
 	// record
@@ -83856,26 +87525,11 @@ enum block_cache_entries
 	, BC( ROLLBACK )
 	, BC( ROLLBACK_LAST ) = BC( ROLLBACK ) + 6
 #endif
-#if defined( VIRTUAL_OBJECT_STORE ) && defined( DEBUG_VALIDATE_TREE )
-	// debug timeline, keep a mirror for comparisons, when links were lost, etc...
-	// can be factored out at some point.
-	, BC( TIMELINE_RO )
-	, BC( TIMELINE_RO_LAST ) = BC( TIMELINE_RO ) + 48
-#endif
 	, BC(COUNT)
 };
 // could effecitvely be fewer than this
 // 82 dirents * 512 byte names = 40000
 #define DIRENT_NAME_OFFSET_OFFSET             0x0001FFFF
-// (sealant length / 4)  (mulitply by 4 to get real length)
-#define DIRENT_NAME_OFFSET_FLAG_SEALANT       0x003E0000
-#define DIRENT_NAME_OFFSET_FLAG_SEALANT_SHIFT 17
-#define DIRENT_NAME_OFFSET_FLAG_OWNED         0x00400000
-#define DIRENT_NAME_OFFSET_FLAG_READ_KEYED    0x00800000
-// unused flag; previous indicated versioning.
-#define DIRENT_NAME_OFFSET_UNUSED_0         0x01000000
-#define DIRENT_NAME_OFFSET_VERSION_SHIFT      25
-#define DIRENT_NAME_OFFSET_VERSIONS           0x1E000000
 #define DIRENT_NAME_OFFSET_UNUSED             0xFE000000
 #  ifdef _MSC_VER
 #    pragma pack (push, 1)
@@ -83889,8 +87543,9 @@ PREFIX_PACKED struct directory_entry
   // how big the file is
 	VFS_DISK_DATATYPE filesize;
 #ifdef VIRTUAL_OBJECT_STORE
-  // when the file was created/last written
-	uint64_t timelineEntry;
+  // UTC update/create time in nanoseconds; no timezone is
+	uint64_t update_time;
+	                       // stored, conversion to local time is the UI's business.
 #endif
 } PACKED;
 #  ifdef _MSC_VER
@@ -84030,16 +87685,6 @@ struct sack_vfs_volume {
 	BLOCKINDEX lastBlock;
 	PDATALIST pdl_BAT_information;
 	PLIST pending_rollback;
-	//PDATASTACK pdsCTimeStack;// = CreateDataStack( sizeof( struct memoryTimelineNode ) );
-	//PDATASTACK pdsWTimeStack;// = CreateDataStack( sizeof( struct memoryTimelineNode ) );
- // timeline root
-	struct storageTimeline *timeline;
-	enum block_cache_entries timelineCache;
- // timeline root key
-	struct storageTimeline *timelineKey;
-	struct sack_vfs_os_file *timeline_file;
-	struct sack_vfs_os_file* timeline_index_file;
-	//struct storageTimelineCursor *timeline_cache;
   // segment is locked into cache.
 	MASKSET_( seglock, BC( COUNT ), 4 );
 	unsigned int sector_size[BC( COUNT )];
@@ -84048,7 +87693,6 @@ struct sack_vfs_volume {
 #ifdef VIRTUAL_OBJECT_STORE
 	uint8_t dirHashCacheAge[BC(DIRECTORY_LAST) - BC(DIRECTORY)];
 	uint8_t batHashCacheAge[BC(BAT_LAST) - BC(BAT)];
-	uint8_t timelineCacheAge[BC( TIMELINE_LAST ) - BC( TIMELINE )];
 	uint8_t rollbackCacheAge[BC( ROLLBACK_LAST ) - BC( ROLLBACK )];
 #endif
 	uint8_t nameCacheAge[BC(NAMES_LAST) - BC(NAMES)];
@@ -84126,14 +87770,6 @@ struct sack_vfs_file
 	FPI entry_fpi;
 #    ifdef VIRTUAL_OBJECT_STORE
 	enum block_cache_entries cache;
-	struct memoryTimelineNode *timeline;
-	uint8_t *seal;
-	uint8_t *sealant;
-	uint8_t *readKey;
-	uint16_t readKeyLen;
-	uint8_t sealantLen;
- // boolean, on read, validates seal.  Defaults to FALSE.
-	uint8_t sealed;
 	char *filename;
 #    endif
   // has file size within
@@ -84240,11 +87876,12 @@ static int MaskStrCmp( struct sack_vfs_volume *vol, CTEXTSTR filename, FPI name_
 		if( path_match ) {
 			size_t l;
 			int r = PathCaseCmpEx( filename, (CTEXTSTR)(((uint8_t*)vol->disk) + name_offset), l = strlen( filename ) );
-			if( !r )
+			if( !r ) {
 				if( ((const char *)(((uint8_t*)vol->disk) + name_offset))[l] == '/' || ((const char *)(((uint8_t*)vol->disk) + name_offset))[l] == '\\' )
 					return 0;
 				else
 					return 1;
+			}
 			return r;
 		}
 		else
@@ -84413,7 +88050,7 @@ static LOGICAL ValidateBAT( struct sack_vfs_volume *vol ) {
 					vol->lastBatBlock = (BLOCKINDEX)((sector*BLOCKS_PER_BAT) + m);
 					break;
 				}
-				if( block )
+				if( block ) {
 					if( !TESTFLAG( usedSectors, blockIndex ) ) {
 						if( block == EOFBLOCK )
 							SETFLAG( usedSectors, blockIndex );
@@ -84493,6 +88130,7 @@ static LOGICAL ValidateBAT( struct sack_vfs_volume *vol ) {
 					}
 					else {
 						// block was already found in a previous file chain.
+					}
 					}
 				if( block == EOFBLOCK ) continue;
 				if( block >= last_block ) return FALSE;
@@ -84836,7 +88474,7 @@ static BLOCKINDEX GetFreeBlock( struct sack_vfs_volume *vol, int init )
 		check_val = 0;
 		b = newblock / BLOCKS_PER_BAT;
 		n = newblock % BLOCKS_PER_BAT;
-		vol->pdlFreeBlocks->Cnt--;
+		vol->pdlFreeBlocks->Cnt = vol->pdlFreeBlocks->Cnt - 1;
 	}
 	else {
 		check_val = EOBBLOCK;
@@ -84852,7 +88490,7 @@ static BLOCKINDEX GetFreeBlock( struct sack_vfs_volume *vol, int init )
 	if( !current_BAT ) return 0;
 	current_BAT[0] = EOFBLOCK ^ blockKey[0];
 	LoGB( "Write to BAT: EOF at %d  %d", (int)n, result );
-	if( (check_val == EOBBLOCK) ) {
+	if( check_val == EOBBLOCK ) {
 		if( n < (BLOCKS_PER_BAT - 1) ) {
 			current_BAT[1] = EOBBLOCK ^ blockKey[1];
 			LoGB( "Write to BAT: EOB at %d  %d", (int)n+1, result + 1 );
@@ -86102,7 +89740,6 @@ SACK_VFS_NAMESPACE
 #define BAT_BLOCK_SIZE      4096
 #define NAME_BLOCK_SIZE     4096
 #define KEY_SIZE            1024
-#define TIME_BLOCK_SIZE     4096
 #define ROLLBACK_BLOCK_SIZE 4096
 #define FILE_NAME_MAXLEN    4096
 #define BLOCK_MASK (BLOCK_SIZE-1)
@@ -86197,10 +89834,6 @@ enum block_cache_entries
 	, BC(DATAKEY)
 	, BC(FILE)
 	, BC(FILE_LAST) = BC(FILE) + 32
-#ifdef VIRTUAL_OBJECT_STORE
-	, BC( TIMELINE )
-	, BC( TIMELINE_LAST ) = BC( TIMELINE ) + 48
-#endif
 #if defined( VIRTUAL_OBJECT_STORE )
 	// really shouldn't need more than one of these...
 	// record
@@ -86215,26 +89848,11 @@ enum block_cache_entries
 	, BC( ROLLBACK )
 	, BC( ROLLBACK_LAST ) = BC( ROLLBACK ) + 6
 #endif
-#if defined( VIRTUAL_OBJECT_STORE ) && defined( DEBUG_VALIDATE_TREE )
-	// debug timeline, keep a mirror for comparisons, when links were lost, etc...
-	// can be factored out at some point.
-	, BC( TIMELINE_RO )
-	, BC( TIMELINE_RO_LAST ) = BC( TIMELINE_RO ) + 48
-#endif
 	, BC(COUNT)
 };
 // could effecitvely be fewer than this
 // 82 dirents * 512 byte names = 40000
 #define DIRENT_NAME_OFFSET_OFFSET             0x0001FFFF
-// (sealant length / 4)  (mulitply by 4 to get real length)
-#define DIRENT_NAME_OFFSET_FLAG_SEALANT       0x003E0000
-#define DIRENT_NAME_OFFSET_FLAG_SEALANT_SHIFT 17
-#define DIRENT_NAME_OFFSET_FLAG_OWNED         0x00400000
-#define DIRENT_NAME_OFFSET_FLAG_READ_KEYED    0x00800000
-// unused flag; previous indicated versioning.
-#define DIRENT_NAME_OFFSET_UNUSED_0         0x01000000
-#define DIRENT_NAME_OFFSET_VERSION_SHIFT      25
-#define DIRENT_NAME_OFFSET_VERSIONS           0x1E000000
 #define DIRENT_NAME_OFFSET_UNUSED             0xFE000000
 #  ifdef _MSC_VER
 #    pragma pack (push, 1)
@@ -86248,8 +89866,9 @@ PREFIX_PACKED struct directory_entry
   // how big the file is
 	VFS_DISK_DATATYPE filesize;
 #ifdef VIRTUAL_OBJECT_STORE
-  // when the file was created/last written
-	uint64_t timelineEntry;
+  // UTC update/create time in nanoseconds; no timezone is
+	uint64_t update_time;
+	                       // stored, conversion to local time is the UI's business.
 #endif
 } PACKED;
 #  ifdef _MSC_VER
@@ -86389,16 +90008,6 @@ struct sack_vfs_volume {
 	BLOCKINDEX lastBlock;
 	PDATALIST pdl_BAT_information;
 	PLIST pending_rollback;
-	//PDATASTACK pdsCTimeStack;// = CreateDataStack( sizeof( struct memoryTimelineNode ) );
-	//PDATASTACK pdsWTimeStack;// = CreateDataStack( sizeof( struct memoryTimelineNode ) );
- // timeline root
-	struct storageTimeline *timeline;
-	enum block_cache_entries timelineCache;
- // timeline root key
-	struct storageTimeline *timelineKey;
-	struct sack_vfs_os_file *timeline_file;
-	struct sack_vfs_os_file* timeline_index_file;
-	//struct storageTimelineCursor *timeline_cache;
   // segment is locked into cache.
 	MASKSET_( seglock, BC( COUNT ), 4 );
 	unsigned int sector_size[BC( COUNT )];
@@ -86407,7 +90016,6 @@ struct sack_vfs_volume {
 #ifdef VIRTUAL_OBJECT_STORE
 	uint8_t dirHashCacheAge[BC(DIRECTORY_LAST) - BC(DIRECTORY)];
 	uint8_t batHashCacheAge[BC(BAT_LAST) - BC(BAT)];
-	uint8_t timelineCacheAge[BC( TIMELINE_LAST ) - BC( TIMELINE )];
 	uint8_t rollbackCacheAge[BC( ROLLBACK_LAST ) - BC( ROLLBACK )];
 #endif
 	uint8_t nameCacheAge[BC(NAMES_LAST) - BC(NAMES)];
@@ -86485,14 +90093,6 @@ struct sack_vfs_file
 	FPI entry_fpi;
 #    ifdef VIRTUAL_OBJECT_STORE
 	enum block_cache_entries cache;
-	struct memoryTimelineNode *timeline;
-	uint8_t *seal;
-	uint8_t *sealant;
-	uint8_t *readKey;
-	uint16_t readKeyLen;
-	uint8_t sealantLen;
- // boolean, on read, validates seal.  Defaults to FALSE.
-	uint8_t sealed;
 	char *filename;
 #    endif
   // has file size within
@@ -86612,11 +90212,12 @@ static int _fs_MaskStrCmp( struct sack_vfs_fs_volume *vol, CTEXTSTR filename, FP
 		if( path_match ) {
 			size_t l;
 			int r = _fs_PathCaseCmpEx( filename, dirname + name_offset, l = strlen( filename ) );
-			if( !r )
+			if( !r ) {
 				if( (dirname + name_offset)[l] == '/' || (dirname + name_offset)[l] == '\\' )
 					return 0;
 				else
 					return 1;
+			}
 			return r;
 		}
 		else
@@ -86994,7 +90595,7 @@ static BLOCKINDEX _fs_GetFreeBlock( struct sack_vfs_fs_volume *vol, int init )
 					//	memcpy( ((uint8_t*)vol->disk) + (vol->segment[cache]-1) * BLOCK_SIZE, vol->usekey[cache], BLOCK_SIZE );
 				}
 				SETFLAG( vol->dirty, cache );
-				if( (check_val == EOBBLOCK) )
+				if( check_val == EOBBLOCK ) {
 					if( n < (BLOCKS_PER_BAT - 1) ) {
 						LoG( "Write EOB to %d", b * BLOCKS_PER_BAT +n + 1 );
 						current_BAT[1] = EOBBLOCK ^ blockKey[1];
@@ -87007,6 +90608,7 @@ static BLOCKINDEX _fs_GetFreeBlock( struct sack_vfs_fs_volume *vol, int init )
 						current_BAT[0] = EOBBLOCK ^ blockKey[0];
 						SETFLAG( vol->dirty, cache );
 					}
+				}
 				LoG( "Return new block:%d", b * BLOCKS_PER_BAT + n );
 				return b * BLOCKS_PER_BAT + n;
 			}
@@ -87705,7 +91307,7 @@ size_t CPROC sack_vfs_fs_read( struct sack_vfs_fs_file *file, void * data_, size
 		else
 			length = (size_t)(( file->entry->filesize  ^ file->dirent_key.filesize ) - file->fpi);
 	}
-	if( !length ) { errno = file->vol->lock = 0; LoG( "No Data to write..." );  return 0; }
+	if( !length ) { errno = 0; file->vol->lock = 0; LoG( "No Data to write..." );  return 0; }
 	if( ofs ) {
 		enum block_cache_entries cache = BC(FILE);
 		uint8_t* block = (uint8_t*)vfs_fs_BSEEK( file->vol, file->block, &cache );
@@ -88069,7 +91671,6 @@ SACK_VFS_NAMESPACE_END
 	   references - a reference to a blockchain that contains the references to this object.
 	        In the reference data block is FPI which is the directory entry ( converted directories? )
 	   Sealant - length stored in NAME_OFFSET field of directory entry
-	   patches - a sealed object has the ability to be modified with other signed and sealed patches.
 			 A reference to the patch FileData is stored for each patch object.
 			 (The patch object has a unique object identifier?  Or does it only exist for this object?)
 */
@@ -88175,7 +91776,6 @@ SACK_VFS_NAMESPACE
 #define BAT_BLOCK_SIZE      4096
 #define NAME_BLOCK_SIZE     4096
 #define KEY_SIZE            1024
-#define TIME_BLOCK_SIZE     4096
 #define ROLLBACK_BLOCK_SIZE 4096
 #define FILE_NAME_MAXLEN    4096
 #define BLOCK_MASK (BLOCK_SIZE-1)
@@ -88270,10 +91870,6 @@ enum block_cache_entries
 	, BC(DATAKEY)
 	, BC(FILE)
 	, BC(FILE_LAST) = BC(FILE) + 32
-#ifdef VIRTUAL_OBJECT_STORE
-	, BC( TIMELINE )
-	, BC( TIMELINE_LAST ) = BC( TIMELINE ) + 48
-#endif
 #if defined( VIRTUAL_OBJECT_STORE )
 	// really shouldn't need more than one of these...
 	// record
@@ -88288,26 +91884,11 @@ enum block_cache_entries
 	, BC( ROLLBACK )
 	, BC( ROLLBACK_LAST ) = BC( ROLLBACK ) + 6
 #endif
-#if defined( VIRTUAL_OBJECT_STORE ) && defined( DEBUG_VALIDATE_TREE )
-	// debug timeline, keep a mirror for comparisons, when links were lost, etc...
-	// can be factored out at some point.
-	, BC( TIMELINE_RO )
-	, BC( TIMELINE_RO_LAST ) = BC( TIMELINE_RO ) + 48
-#endif
 	, BC(COUNT)
 };
 // could effecitvely be fewer than this
 // 82 dirents * 512 byte names = 40000
 #define DIRENT_NAME_OFFSET_OFFSET             0x0001FFFF
-// (sealant length / 4)  (mulitply by 4 to get real length)
-#define DIRENT_NAME_OFFSET_FLAG_SEALANT       0x003E0000
-#define DIRENT_NAME_OFFSET_FLAG_SEALANT_SHIFT 17
-#define DIRENT_NAME_OFFSET_FLAG_OWNED         0x00400000
-#define DIRENT_NAME_OFFSET_FLAG_READ_KEYED    0x00800000
-// unused flag; previous indicated versioning.
-#define DIRENT_NAME_OFFSET_UNUSED_0         0x01000000
-#define DIRENT_NAME_OFFSET_VERSION_SHIFT      25
-#define DIRENT_NAME_OFFSET_VERSIONS           0x1E000000
 #define DIRENT_NAME_OFFSET_UNUSED             0xFE000000
 #  ifdef _MSC_VER
 #    pragma pack (push, 1)
@@ -88321,8 +91902,9 @@ PREFIX_PACKED struct directory_entry
   // how big the file is
 	VFS_DISK_DATATYPE filesize;
 #ifdef VIRTUAL_OBJECT_STORE
-  // when the file was created/last written
-	uint64_t timelineEntry;
+  // UTC update/create time in nanoseconds; no timezone is
+	uint64_t update_time;
+	                       // stored, conversion to local time is the UI's business.
 #endif
 } PACKED;
 #  ifdef _MSC_VER
@@ -88462,16 +92044,6 @@ struct sack_vfs_volume {
 	BLOCKINDEX lastBlock;
 	PDATALIST pdl_BAT_information;
 	PLIST pending_rollback;
-	//PDATASTACK pdsCTimeStack;// = CreateDataStack( sizeof( struct memoryTimelineNode ) );
-	//PDATASTACK pdsWTimeStack;// = CreateDataStack( sizeof( struct memoryTimelineNode ) );
- // timeline root
-	struct storageTimeline *timeline;
-	enum block_cache_entries timelineCache;
- // timeline root key
-	struct storageTimeline *timelineKey;
-	struct sack_vfs_os_file *timeline_file;
-	struct sack_vfs_os_file* timeline_index_file;
-	//struct storageTimelineCursor *timeline_cache;
   // segment is locked into cache.
 	MASKSET_( seglock, BC( COUNT ), 4 );
 	unsigned int sector_size[BC( COUNT )];
@@ -88480,7 +92052,6 @@ struct sack_vfs_volume {
 #ifdef VIRTUAL_OBJECT_STORE
 	uint8_t dirHashCacheAge[BC(DIRECTORY_LAST) - BC(DIRECTORY)];
 	uint8_t batHashCacheAge[BC(BAT_LAST) - BC(BAT)];
-	uint8_t timelineCacheAge[BC( TIMELINE_LAST ) - BC( TIMELINE )];
 	uint8_t rollbackCacheAge[BC( ROLLBACK_LAST ) - BC( ROLLBACK )];
 #endif
 	uint8_t nameCacheAge[BC(NAMES_LAST) - BC(NAMES)];
@@ -88558,14 +92129,6 @@ struct sack_vfs_file
 	FPI entry_fpi;
 #    ifdef VIRTUAL_OBJECT_STORE
 	enum block_cache_entries cache;
-	struct memoryTimelineNode *timeline;
-	uint8_t *seal;
-	uint8_t *sealant;
-	uint8_t *readKey;
-	uint16_t readKeyLen;
-	uint8_t sealantLen;
- // boolean, on read, validates seal.  Defaults to FALSE.
-	uint8_t sealed;
 	char *filename;
 #    endif
   // has file size within
@@ -88614,7 +92177,6 @@ using namespace sack::SACK_VFS;
 #define vfs_SEEK vfs_os_SEEK
 #define vfs_BSEEK vfs_os_BSEEK
 #define MAX_FILENAME_LEN 256
-struct memoryTimelineNode;
 #ifdef __cplusplus
 namespace objStore {
 #endif
@@ -88644,9 +92206,7 @@ enum getFreeBlockInit {
 	GFB_INIT_NONE       ,
 	GFB_INIT_DIRENT     ,
 	GFB_INIT_NAMES      ,
-	GFB_INIT_PATCHBLOCK ,
-	GFB_INIT_TIMELINE   ,
-	GFB_INIT_TIMELINE_MORE,
+	GFB_INIT_ZEROED     ,
 	GFB_INIT_ROLLBACK   ,
 };
 // End Of Text Block
@@ -88655,8 +92215,7 @@ enum getFreeBlockInit {
 #define UTF8_EOT 0xFE
 #define FIRST_DIR_BLOCK      0
 //#define FIRST_NAMES_BLOCK    1
-#define FIRST_TIMELINE_BLOCK 2
-#define FIRST_ROLLBACK_BLOCK 3
+#define FIRST_ROLLBACK_BLOCK 2
 // use this byte in hash as parent directory (block & char)
 // utf8 names never use 0xFF as a codeunit.
 #define DIRNAME_CHAR_PARENT 0xFF
@@ -88690,7 +92249,6 @@ struct sack_vfs_os_find_info {
 	PDATASTACK pds_directories;
 	uint64_t ctime;
 	uint64_t wtime;
-	struct memoryTimelineNode *time;
 #else
 	BLOCKINDEX this_dir_block;
 	size_t thisent;
@@ -88700,7 +92258,6 @@ static void sack_vfs_os_flush_block( struct sack_vfs_os_volume* vol, enum block_
 static void vfs_os_smudge_cache( struct sack_vfs_os_volume* vol, enum block_cache_entries n );
 static BLOCKINDEX _os_GetFreeBlock_( struct sack_vfs_os_volume *vol, enum block_cache_entries* cache, enum getFreeBlockInit init, int blocksize, LOGICAL flush_BAT_caches  DBG_PASS );
 #define _os_GetFreeBlock(v,c,i,s) _os_GetFreeBlock_(v,c,i,s,FALSE DBG_SRC )
-#define IS_OWNED(file)  ( (file->entry->name_offset) & DIRENT_NAME_OFFSET_FLAG_OWNED )
 LOGICAL _os_ScanDirectory_( struct sack_vfs_os_volume *vol, const char * filename
 	, BLOCKINDEX dirBlockSeg
 	, BLOCKINDEX *nameBlockStart
@@ -88714,7 +92271,6 @@ LOGICAL _os_ScanDirectory_( struct sack_vfs_os_volume *vol, const char * filenam
 static BLOCKINDEX vfs_os_GetNextBlock_v2( struct sack_vfs_os_volume* vol, BLOCKINDEX block, enum block_cache_entries* blockCache, enum getFreeBlockInit init, LOGICAL expand, int blockSize, int* realBlockSize, LOGICAL flush_BAT_caches );
 static BLOCKINDEX vfs_os_GetNextBlock( struct sack_vfs_os_volume *vol, BLOCKINDEX block, enum block_cache_entries *cache, enum getFreeBlockInit init, LOGICAL expand, int blockSize, int *realBlockSize );
 static LOGICAL _os_ExpandVolume( struct sack_vfs_os_volume *vol, BLOCKINDEX fromBlock, int size );
-//static void reloadTimeEntry( struct memoryTimelineNode *time, struct sack_vfs_os_volume *vol, uint64_t timeEntry DBG_PASS );
 #define vfs_os_BSEEK(v,b,s,c) vfs_os_BSEEK_(v,b,s,c DBG_SRC )
 uintptr_t vfs_os_BSEEK_( struct sack_vfs_os_volume *vol, BLOCKINDEX block, int blockSize, enum block_cache_entries *cache_index DBG_PASS );
 uint8_t* vfs_os_DSEEK_( struct sack_vfs_os_volume* vol, FPI dataFPI, int blockSize, enum block_cache_entries* cache_index DBG_PASS );
@@ -88741,902 +92297,9 @@ PREFIX_PACKED struct directory_hash_lookup_block
 	BLOCKINDEX names_first_block;
 	uint8_t used_names;
 } PACKED;
-PREFIX_PACKED struct directory_patch_block
-{
-	union direction_patch_block_entry_union {
-		struct direction_patch_block_entry {
-			BIT_FIELD index : 8;
-			BIT_FIELD hash_block : 24;
-		} dirIndex;
-		FPI raw;
-	}entries[(DIR_BLOCK_SIZE-sizeof(BLOCKINDEX))/sizeof(uint32_t)];
-	uint8_t usedEntries;
-	BLOCKINDEX morePatches;
-} PACKED;
-PREFIX_PACKED struct directory_patch_ref_block
-{
-	PREFIX_PACKED struct directory_patch_ref_entry {
-		BLOCKINDEX patchBlockStart;
- // first patch block
-		BLOCKINDEX dirBlock;
-		uint16_t patchNum;
- // which directory entry this patches
-		uint8_t dirEntry;
-	} entries[(DIR_BLOCK_SIZE)/sizeof( struct directory_patch_ref_entry )] PACKED;
-} PACKED;
 #  ifdef _MSC_VER
 #    pragma pack (pop)
 #  endif
-enum sack_vfs_os_seal_states {
-	SACK_VFS_OS_SEAL_NONE = 0,
-	SACK_VFS_OS_SEAL_LOAD,
-	SACK_VFS_OS_SEAL_VALID,
-	SACK_VFS_OS_SEAL_STORE,
-  // validate failed (read whole file check)
-	SACK_VFS_OS_SEAL_INVALID,
-  // stored patch is writeable
-	SACK_VFS_OS_SEAL_CLEARED,
-  // stored patch new sealant (after read valid, new write)
-	SACK_VFS_OS_SEAL_STORE_PATCH,
-};
-struct file_block_definition {
-	uint32_t avail;
-	uint32_t used;
-};
-struct file_block_small_definition {
-	uint16_t avail;
-	uint16_t used;
-};
-struct file_block_large_definition {
-	uint64_t avail;
-	uint64_t used;
-};
-struct file_header {
-	struct file_block_small_definition sealant;
-	struct file_block_definition references;
-	struct file_block_large_definition fileData;
-	struct file_block_small_definition indexes;
-	struct file_block_definition referencedBy;
-};
-#if 0
-static void flushFileSuffix( struct sack_vfs_os_file* file );
-static void WriteIntoBlock( struct sack_vfs_os_file* file, int blockType, FPI pos, CPOINTER data, FPI length );
-#endif
-//#define DEBUG_TEST_LOCKS
-//#define DEBUG_VALIDATE_TREE_ADD
-//#define DEBUG_LOG_LOCKS
-//#define INVERSE_TEST
-//#define DEBUG_DELETE_BALANCE
-//#define DEBUG_TIMELINE_REORDER_LOGGING
-//#define DEBUG_AVL_DETAIL
-int nodes;
-struct storageTimelineCache {
-	BLOCKINDEX timelineSector;
-	FPI dirEntry[BLOCK_SIZE / sizeof( FPI )];
-	struct dirent_cache caches[BLOCK_SIZE / sizeof( FPI )];
-	//	struct dirent_cache caches[BLOCK_SIZE / sizeof( FPI )];
-};
-#define timelineBlockIndexNull 0
-typedef union timelineBlockType {
-	// 0 is invalid; indexes must subtract 1 to get
-	// real timeline index.
-	uint64_t raw;
-	struct timelineBlockReference {
-		uint64_t index;
-	} ref;
-} TIMELINE_BLOCK_TYPE;
-#  ifdef _MSC_VER
-#    pragma pack (push, 1)
-#  endif
-PREFIX_PACKED struct timelineHeader {
-	TIMELINE_BLOCK_TYPE first_free_entry;
-	TIMELINE_BLOCK_TYPE crootNode_deleted;
-  // this index is 0 when initialized, and has a +1 to the entry number.
-	TIMELINE_BLOCK_TYPE srootNode;
-	TIMELINE_BLOCK_TYPE last_added_entry;
-	uint64_t unused[4];
-	//uint64_t unused2[8];
-} PACKED;
-// current size is 64 bytes.
-// me_fpi is the physical FPI in the timeline file of the TIMELINE_BLOCK_TYPE that references 'this' block.
-// structure defines little endian structure for storage.
-PREFIX_PACKED struct storageTimelineNode0 {
-	// if dirent_fpi == 0; it's free; and priorData will point at another free node
-	uint64_t dirent_fpi;
-	uint32_t priorTime;
-	uint16_t priorDataPad;
- // how much of the last block in the file is not used
-	uint8_t  filler8_1;
- // lesser least significant byte of time... sometimes can read time including timezone offset with time - 1 byte
-	uint8_t  timeTz;
-	uint64_t time;
- // if not 0, references a start block version of data.
-	uint64_t priorData;
-} PACKED;
-PREFIX_PACKED struct storageTimelineNode {
-	// if dirent_fpi == 0; it's free; and priorData will point at another free node
-	uint64_t dirent_fpi;
-	uint32_t priorTime;
-	uint16_t priorDataPad;
- // how much of the last block in the file is not used
-	uint8_t  filler8_1;
- // lesser least significant byte of time... sometimes can read time including timezone offset with time - 1 byte
-	uint8_t  timeTz;
-	uint64_t time;
- // if not 0, references a start block version of data.
-	uint64_t priorData;
- // if not 0, references a start block version of data.
-	uint64_t nextWrite;
- // if not 0, references a start block version of data.
-	uint64_t priorWrite;
- // This is the actual size of the data starting at block priorData
-	uint64_t priorDataSize;
- // if not 0, references a start block version of data.
-	uint64_t filler64_2;
-} PACKED;
-#  ifdef _MSC_VER
-#    pragma pack (pop)
-#  endif
-struct memoryTimelineNode {
-	// if dirent_fpi == 0; it's free.
-	FPI this_fpi;
-	uint64_t index;
-	// the end of this is the same as storage timeline.
-	struct storageTimelineNode* disk;
-	enum block_cache_entries diskCache;
-};
-struct storageTimelineCursor {
-  // save stack of parents in cursor
-	PDATASTACK parentNodes;
- // temp; needs work.
-	struct storageTimelineCache dirents;
-};
-struct sack_vfs_os_time_cursor {
-	struct sack_vfs_os_volume* vol;
-	uint64_t at;
-};
-#  ifdef _MSC_VER
-#    pragma pack (push, 1)
-#  endif
-#define NUM_ROOT_TIMELINE_NODES (TIME_BLOCK_SIZE - sizeof( struct timelineHeader )) / sizeof( struct storageTimelineNode )
-PREFIX_PACKED struct storageTimeline {
-	struct timelineHeader header;
-	struct storageTimelineNode entries[NUM_ROOT_TIMELINE_NODES];
-} PACKED;
-/*
-#define NUM_TIMELINE_NODES (TIME_BLOCK_SIZE) / sizeof( struct storageTimelineNode )
-PREFIX_PACKED struct storageTimelineBlock {
-	struct storageTimelineNode entries[(TIME_BLOCK_SIZE) / sizeof( struct storageTimelineNode )];
-} PACKED;
-*/
-#  ifdef _MSC_VER
-#    pragma pack (pop)
-#  endif
-#ifdef DEBUG_VALIDATE_TREE
-#define VTReadOnly  , TRUE
-#define VTReadWrite  , FALSE
-#else
-#define VTReadOnly
-#define VTReadWrite
-#endif
-#ifdef _DEBUG
-#define GRTENoLog ,0
-#define GRTELog ,1
-#else
-#define GRTENoLog
-#define GRTELog
-#endif
-#define convertMeToParentFPI(n) ((n)&~0x3f)
-#define convertMeToParentIndex(n) (((n)>sizeof(struct timelineHeader))?( ( convertMeToParentFPI((n)&~0x3f)- sizeof( struct timelineHeader ) ) / sizeof( struct storageTimelineNode ) + 1 ):0)
-struct storageTimelineNode* getRawTimeEntry( struct sack_vfs_os_volume* vol, uint64_t timeEntry, enum block_cache_entries *cache
-#if _DEBUG
-	, int log
-#endif
-	 DBG_PASS )
-{
-	int locks;
-	cache[0] = BC( TIMELINE );
-	FPI pos = sane_offsetof( struct storageTimeline, entries[timeEntry - 1] );
-/*no block*/
-	struct storageTimelineNode* node = ( struct storageTimelineNode* )vfs_os_FSEEK( vol, vol->timeline_file, 0, pos, cache, TIME_BLOCK_SIZE DBG_SRC );
-	//_lprintf(DBG_RELAY)( "Load Entry %d", (int)timeEntry );
-	locks = GETMASK_( vol->seglock, seglock, cache[0] );
-#ifdef DEBUG_TEST_LOCKS
-#  ifdef DEBUG_LOG_LOCKS
-#    ifdef _DEBUG
-	if( log )
-#    endif
-		_lprintf(DBG_RELAY)( "Lock %d %d %d", (int)timeEntry, cache[0], locks );
-#  endif
-	if( locks > 9 ) {
-		lprintf( "Lock OVERFLOW" );
-		DebugBreak();
-	}
-#endif
-	locks++;
-	SETMASK_( vol->seglock, seglock, cache[0], locks );
-	return node;
-}
-TIMELINE_BLOCK_TYPE* getRawTimePointer( struct sack_vfs_os_volume* vol, uint64_t fpi, enum block_cache_entries *cache ) {
-	cache[0] = BC( TIMELINE );
-/*no block*/
-	return (TIMELINE_BLOCK_TYPE*)vfs_os_FSEEK( vol, vol->timeline_file, 0, fpi, cache, TIME_BLOCK_SIZE DBG_SRC );
-}
-void dropRawTimeEntry( struct sack_vfs_os_volume* vol, enum block_cache_entries cache
-#if _DEBUG
-	, int log
-#endif
-	 DBG_PASS ) {
-	int locks;
-	locks = GETMASK_( vol->seglock, seglock, cache );
-#ifdef DEBUG_TEST_LOCKS
-#  ifdef DEBUG_LOG_LOCKS
-#    ifdef _DEBUG
-	if( log )
-#    endif
-	_lprintf(DBG_RELAY)( "UnLock %d %d", cache, locks );
-#  endif
-	if( !locks ) {
-		lprintf( "Lock UNDERFLOW" );
-		DebugBreak();
-	}
-#endif
-	locks--;
-	SETMASK_( vol->seglock, seglock, cache, locks );
-}
-void reloadTimeEntry( struct memoryTimelineNode* time, struct sack_vfs_os_volume* vol, uint64_t timeEntry
-#ifdef DEBUG_VALIDATE_TREE
-	, LOGICAL readOnly
-#endif
-#if _DEBUG
-	, int log
-#endif
-	 DBG_PASS )
-{
-	enum block_cache_entries cache =
-#ifdef DEBUG_VALIDATE_TREE
-		readOnly ?BC(TIMELINE_RO):
-#endif
-		BC( TIMELINE );
-	//uintptr_t vfs_os_FSEEK( struct sack_vfs_os_volume *vol, BLOCKINDEX firstblock, FPI offset, enum block_cache_entries *cache_index DBG_SRC ) {
-	//if( timeEntry > 62 )DebugBreak();
-	int locks;
-	FPI pos = sane_offsetof( struct storageTimeline, entries[timeEntry - 1] );
-	//lprintf( "Read Entry %d", (int)timeEntry );
-/*no block*/
-	struct storageTimelineNode* node = ( struct storageTimelineNode* )vfs_os_FSEEK( vol, vol->timeline_file, 0, pos, &cache, TIME_BLOCK_SIZE DBG_RELAY );
-	locks = GETMASK_( vol->seglock, seglock, cache );
-#ifdef DEBUG_TEST_LOCKS
-#ifdef DEBUG_LOG_LOCKS
-#ifdef _DEBUG
-	if( log )
-#endif
-		_lprintf(DBG_RELAY)( "Lock %d %d %d", (int)timeEntry, cache, locks );
-#endif
-	if( locks > 12 ) {
-		lprintf( "Lock OVERFLOW" );
-		DebugBreak();
-	}
-#endif
-	locks++;
-	SETMASK_( vol->seglock, seglock, cache, locks );
-	time->disk = node;
-	time->diskCache = cache;
-	time->index = timeEntry;
-	time->this_fpi = pos;
-}
-#ifdef DEBUG_TIMELINE_REORDER_LOGGING
-// didn't actually have to use this.
-static void dumpTimeline( struct sack_vfs_os_volume* vol ) {
-	lprintf( "--- Timeline ----" );
-	lprintf( "root %lld last %lld free %lld", vol->timeline->header.srootNode.raw, vol->timeline->header.last_added_entry.raw, vol->timeline->header.first_free_entry.raw );
-	int entry;
-	enum block_cache_entries_os cache = BC( TIMELINE );
-	struct storageTimelineNode* block;
-	for( entry = 1; entry != vol->timeline->header.first_free_entry.raw; entry++ ) {
-		block = getRawTimeEntry( vol, entry, &cache GRTENoLog DBG_SRC );
-		lprintf( "Entry %d  de:%lld prev:%lld next:%lld time:%lld tz:%d", entry, block->dirent_fpi, block->priorWrite, block->nextWrite, block->time, block->timeTz );
-		dropRawTimeEntry( vol, cache GRTENoLog DBG_SRC );
-	}
-}
-#endif
-//-----------------------------------------------------------------------------------
-// Timeline Support Functions
-//-----------------------------------------------------------------------------------
-static void reorderEntry( struct memoryTimelineNode* time, struct sack_vfs_os_volume* vol, int toEnd DBG_PASS ) {
-	if( time ) {
-		// time changed...(maybe?)
-		{
-			uint64_t myself = time->index;
-			struct storageTimelineNode* prev;
-			enum block_cache_entries_os cache, _cache = BC(ZERO);
-			if( time->disk->priorWrite ) {
-				prev = getRawTimeEntry( vol, time->disk->priorWrite, &cache GRTENoLog DBG_RELAY );
-			} else { prev = NULL; cache = BC(ZERO); }
-			enum block_cache_entries_os cache2, _cache2 = BC(ZERO);
-			struct storageTimelineNode* next;
-			if( time->disk->nextWrite ) {
-				next = getRawTimeEntry( vol, time->disk->nextWrite, &cache2 GRTENoLog DBG_RELAY );
-			} else { next = NULL; cache2 = BC(ZERO); }
-			if( toEnd ) {
-				enum block_cache_entries_os cache3;
-				struct storageTimelineNode* last;
-				last = getRawTimeEntry( vol, vol->timeline->header.last_added_entry.ref.index, &cache3 GRTENoLog DBG_SRC );
-				if( last && last->time <= time->disk->time ) {
-#ifdef DEBUG_TIMELINE_REORDER_LOGGING
-					dumpTimeline( vol );
-#endif
-					last->nextWrite = myself;
-					if( !time->disk->priorWrite ) {
-						if( next ) next->priorWrite = 0;
-						vol->timeline->header.srootNode.ref.index = time->disk->nextWrite;
-					} else if(next ) next->priorWrite = time->disk->priorWrite;
-					if( prev ) prev->nextWrite = time->disk->nextWrite;
-					time->disk->priorWrite = vol->timeline->header.last_added_entry.ref.index;
-					time->disk->nextWrite = 0;
-					// if this is the new end of the list, update the last entry....
-#ifdef DEBUG_TIMELINE_REORDER_LOGGING
-					lprintf( "new last block:%lld after %lld", myself, vol->timeline->header.last_added_entry.ref.index );
-#endif
-					vol->timeline->header.last_added_entry.ref.index = myself;
-					SMUDGECACHE( vol, vol->timelineCache );
-					if( prev ) dropRawTimeEntry( vol, cache GRTELog DBG_RELAY );
-					if( next ) dropRawTimeEntry( vol, cache2 GRTELog DBG_RELAY );
-					if( last ) dropRawTimeEntry( vol, cache3 GRTELog DBG_RELAY );
-#ifdef DEBUG_TIMELINE_REORDER_LOGGING
-					dumpTimeline( vol );
-#endif
-					return;
-				} else {
-					if( last ) dropRawTimeEntry( vol, cache3 GRTENoLog DBG_RELAY );
-				}
-			}
-			if( next && ( next->time < time->disk->time ) ) {
-				//myself = next->priorWrite;
-				if( prev )
-					prev->nextWrite = time->disk->nextWrite;
-				else {
-					vol->timeline->header.srootNode.ref.index = time->disk->nextWrite;
-					SMUDGECACHE( vol, vol->timelineCache );
-				}
-#ifdef DEBUG_TIMELINE_REORDER_LOGGING
-				lprintf( "Searching forward...." );
-#endif
-				next->priorWrite = time->disk->priorWrite;
-				while( ( prev = next ) && ( ( _cache ? dropRawTimeEntry( vol, _cache GRTENoLog DBG_RELAY ) : (void)0 ), ( _cache = cache ), ( cache = BC( TIMELINE ) ),
-					( next = getRawTimeEntry( vol, prev->nextWrite, &cache GRTENoLog DBG_SRC ) ) )
-					) {
-					if( !next->nextWrite ) {
-						if( !time->disk->priorWrite ) {
-							struct storageTimelineNode* next;
-							enum block_cache_entries_os cache = BC( TIMELINE );
-							next = getRawTimeEntry( vol, time->disk->nextWrite, &cache GRTENoLog DBG_RELAY );
-							if( next ) next->priorWrite = 0;
-							vol->timeline->header.srootNode.ref.index = time->disk->nextWrite;
-							dropRawTimeEntry( vol, cache GRTENoLog DBG_RELAY );
-						}
-						time->disk->priorWrite = prev->nextWrite;
-						time->disk->nextWrite = 0;
-						next->nextWrite = myself;
-						dropRawTimeEntry( vol, cache GRTELog DBG_RELAY );
-						if( cache2 ) dropRawTimeEntry( vol, cache2 GRTELog DBG_RELAY );
-						// if this is the new end of the list, update the last entry....
-						vol->timeline->header.last_added_entry.ref.index = myself;
-						SMUDGECACHE( vol, vol->timelineCache );
- // done. (at end anyway)
-						break;
-					}
-					if( next->time > time->disk->time ) {
-#ifdef DEBUG_TIMELINE_REORDER_LOGGING
-						lprintf( "found insertion point %lld  %lld %lld", myself, prev->nextWrite, next->priorWrite );
-#endif
-						if( !time->disk->priorWrite ) {
-							struct storageTimelineNode* next;
-							enum block_cache_entries_os cache = BC( TIMELINE );
-							next = getRawTimeEntry( vol, time->disk->nextWrite, &cache GRTENoLog DBG_RELAY );
-							if( next ) next->priorWrite = 0;
-							vol->timeline->header.srootNode.ref.index = time->disk->nextWrite;
-							dropRawTimeEntry( vol, cache GRTENoLog DBG_RELAY );
-						}
-						time->disk->nextWrite = prev->nextWrite;
-						time->disk->priorWrite = next->priorWrite;
-						prev->nextWrite = myself;
-						next->priorWrite = myself;
-						dropRawTimeEntry( vol, cache GRTELog DBG_RELAY );
-						if( cache2 ) dropRawTimeEntry( vol, cache2 GRTELog DBG_RELAY );
-						break;
-					}
-				}
-			} else if( prev && ( prev->time > time->disk->time ) ) {
-				//myself = prev->nextWrite;
-				if( !( prev->nextWrite = time->disk->nextWrite ) ) {
-					vol->timeline->header.last_added_entry.ref.index = time->disk->priorWrite;
-					SMUDGECACHE( vol, vol->timelineCache );
-				}
-				if( next )
-					next->priorWrite = time->disk->priorWrite;
-#ifdef DEBUG_TIMELINE_REORDER_LOGGING
-				lprintf( "Searching backward" );
-				dumpTimeline( vol );
-#endif
-				while( ( _cache2 ? dropRawTimeEntry( vol, _cache2 GRTENoLog DBG_RELAY ) : (void)0 ), ( _cache2 = cache2 ), ( cache2 = BC( TIMELINE ) )
-					, ( next = prev ) ) {
-#ifdef DEBUG_TIMELINE_REORDER_LOGGING
-					lprintf( "checking next record %lld", next->priorWrite );
-#endif
-					if( !next->priorWrite ) {
-						next->priorWrite = myself;
-						if( !time->disk->nextWrite ) {
-							struct storageTimelineNode* prev;
-							enum block_cache_entries_os cache = BC( TIMELINE );
-							prev = getRawTimeEntry( vol, time->disk->priorWrite, &cache GRTENoLog DBG_RELAY );
-							if( prev ) prev->nextWrite = 0;
-							vol->timeline->header.last_added_entry.ref.index = time->disk->priorWrite;
-							dropRawTimeEntry( vol, cache GRTENoLog DBG_RELAY );
-						}
-						time->disk->nextWrite = vol->timeline->header.srootNode.ref.index;
-						time->disk->priorWrite = 0;
-						vol->timeline->header.srootNode.ref.index = myself;
-						SMUDGECACHE( vol, vol->timelineCache );
-#ifdef DEBUG_TIMELINE_REORDER_LOGGING
-						lprintf( "Saving as first..." );
-#endif
-						if( cache ) dropRawTimeEntry( vol, cache GRTELog DBG_RELAY );
-						dropRawTimeEntry( vol, cache2 GRTELog DBG_RELAY );
-						break;
-					} else {
-						( prev = getRawTimeEntry( vol, next->priorWrite, &cache2 GRTENoLog DBG_SRC ) );
-					}
-					if( !prev->priorWrite ) {
-						// new root node...
-						vol->timeline->header.srootNode.ref.index = prev->priorWrite = myself;
-						SMUDGECACHE( vol, vol->timelineCache );
-						if( !time->disk->nextWrite ) {
-							struct storageTimelineNode* prev;
-							enum block_cache_entries_os cache = BC( TIMELINE );
-							prev = getRawTimeEntry( vol, time->disk->priorWrite, &cache GRTENoLog DBG_RELAY );
-							if( prev ) prev->nextWrite = 0;
-							vol->timeline->header.last_added_entry.ref.index = time->disk->priorWrite;
-							dropRawTimeEntry( vol, cache GRTENoLog DBG_RELAY );
-						}
-						time->disk->nextWrite = next->priorWrite;
-						time->disk->priorWrite = 0;
-#ifdef DEBUG_TIMELINE_REORDER_LOGGING
-						lprintf( "Saving as first(2)..." );
-#endif
-						if( cache ) dropRawTimeEntry( vol, cache GRTELog DBG_RELAY );
-						dropRawTimeEntry( vol, cache2 GRTELog DBG_RELAY );
- // done. (at end anyway)
-						break;
-					}
-					if( prev->time < time->disk->time ) {
-						if( !time->disk->nextWrite ) {
-							struct storageTimelineNode* prev;
-							enum block_cache_entries_os cache = BC( TIMELINE );
-							prev = getRawTimeEntry( vol, time->disk->priorWrite, &cache GRTENoLog DBG_RELAY );
-							if( prev ) prev->nextWrite = 0;
-							vol->timeline->header.last_added_entry.ref.index = time->disk->priorWrite;
-							dropRawTimeEntry( vol, cache GRTENoLog DBG_RELAY );
-						}
-						time->disk->nextWrite = prev->nextWrite;
-						time->disk->priorWrite = next->priorWrite;
-						prev->nextWrite = myself;
-						next->priorWrite = myself;
-#ifdef DEBUG_TIMELINE_REORDER_LOGGING
-						lprintf( "Saving in middle..." );
-#endif
-						if( cache ) dropRawTimeEntry( vol, cache GRTELog DBG_RELAY );
-						dropRawTimeEntry( vol, cache2 GRTELog DBG_RELAY );
-						break;
-					}
-				}
-			} else {
-				// didn't have to move anything... maybe it's time is still the same relative to everything?
-			}
-		}
-	}
-#ifdef DEBUG_TIMELINE_REORDER_LOGGING
-	dumpTimeline( vol );
-#endif
-}
-//-----------------------------------------------------------------------------------
-// Timeline Support Functions
-//-----------------------------------------------------------------------------------
-void updateTimeEntry( struct memoryTimelineNode* time, struct sack_vfs_os_volume* vol, LOGICAL drop DBG_PASS ) {
-	if( time ) {
-		SMUDGECACHE( vol, time->diskCache );
-		// time changed...(maybe?)
-	}
-	if( drop ) {
-		int locks;
-		int bit = time->diskCache;
-		locks = GETMASK_( vol->seglock, seglock, bit );
-#ifdef DEBUG_TEST_LOCKS
-#ifdef DEBUG_LOG_LOCKS
-		lprintf( "Unlock %d %d", time->diskCache, locks );
-#endif
-		if( !locks ) {
-			lprintf( "Lock UNDERFLOW" );
-			DebugBreak();
-		}
-#endif
-		locks--;
-		SETMASK_( vol->seglock, seglock, bit, locks );
-	}
-}
-//---------------------------------------------------------------------------
-void reloadDirectoryEntry( struct sack_vfs_os_volume* vol, struct memoryTimelineNode* time, struct sack_vfs_os_find_info* decoded_dirent DBG_PASS ) {
-	enum block_cache_entries cache = BC( DIRECTORY );
-// , * entkey;
-	struct directory_entry* dirent;
-	struct directory_hash_lookup_block* dirblock;
-	//struct directory_hash_lookup_block* dirblockkey;
-	PDATASTACK pdsChars = CreateDataStack( 1 );
-	BLOCKINDEX this_dir_block = (time->disk->dirent_fpi >> DIR_BLOCK_SIZE_BITS )-1;
-	BLOCKINDEX next_block;
-	dirblock = BTSEEK( struct directory_hash_lookup_block*, vol, this_dir_block, DIR_BLOCK_SIZE, cache );
-	//dirblockkey = (struct directory_hash_lookup_block*)vol->usekey[cache];
-	dirent = (struct directory_entry*)( ( (uintptr_t)dirblock ) + ( time->disk->dirent_fpi & ( DIR_BLOCK_SIZE - 1 ) ) );
-	//entkey = (struct directory_entry*)(((uintptr_t)dirblockkey) + (time->dirent_fpi & BLOCK_SIZE));
-	decoded_dirent->vol = vol;
-	// all of this regards the current state of a find cursor...
-	decoded_dirent->base = NULL;
-	decoded_dirent->base_len = 0;
-	decoded_dirent->mask = NULL;
-	decoded_dirent->pds_directories = NULL;
-	decoded_dirent->filesize = (size_t)( dirent->filesize );
-	if( time->disk->priorTime ) {
-		enum block_cache_entries cache;
-		struct storageTimelineNode* prior = getRawTimeEntry( vol, time->disk->priorTime, &cache GRTENoLog DBG_SRC );
-		while( prior->priorTime ) {
-			dropRawTimeEntry( vol, cache GRTENoLog DBG_RELAY );
-			prior = getRawTimeEntry( vol, prior->priorTime, &cache GRTENoLog DBG_RELAY );
-		}
-		decoded_dirent->ctime = prior->time;
-		dropRawTimeEntry( vol, cache GRTENoLog DBG_RELAY );
-	}
-	else
-		decoded_dirent->ctime = time->disk->time;
-	decoded_dirent->wtime = time->disk->time;
-	while( (next_block = dirblock->next_block[DIRNAME_CHAR_PARENT]) ) {
-		enum block_cache_entries back_cache = BC( DIRECTORY );
-		struct directory_hash_lookup_block* back_dirblock;
-		back_dirblock = BTSEEK( struct directory_hash_lookup_block*, vol, next_block, DIR_BLOCK_SIZE, back_cache );
-		//back_dirblockkey = (struct directory_hash_lookup_block*)vol->usekey[back_cache];
-		int i;
-		for( i = 0; i < DIRNAME_CHAR_PARENT; i++ ) {
-			if( (back_dirblock->next_block[i]) == this_dir_block ) {
-				PushData( &pdsChars, &i );
-				break;
-			}
-		}
-		if( i == DIRNAME_CHAR_PARENT ) {
-			// directory didn't have a forward link to it?
-			DebugBreak();
-		}
-		this_dir_block = next_block;
-		dirblock = back_dirblock;
-	}
-	char* c;
-	int n = 0;
-	// could fill leadin....
-	decoded_dirent->leadin[0] = 0;
-	decoded_dirent->leadinDepth = 0;
-	while( c = (char*)PopData( &pdsChars ) )
-		decoded_dirent->filename[n++] = c[0];
-	DeleteDataStack( &pdsChars );
-	{
-		BLOCKINDEX nameBlock;
-		nameBlock = dirblock->names_first_block;
-		FPI name_offset = (dirent[n].name_offset ) & DIRENT_NAME_OFFSET_OFFSET;
-		enum block_cache_entries cache = BC( NAMES );
-		const char* dirname = (const char*)vfs_os_FSEEK( vol, NULL, nameBlock, name_offset, &cache, NAME_BLOCK_SIZE DBG_SRC );
-		const char* dirname_ = dirname;
-		//const char* dirkey = (const char*)(vol->usekey[cache]) + (name_offset & BLOCK_MASK);
-		const char* prior_dirname = dirname;
-		int c;
-		do {
-			while( (((unsigned char)(c = (dirname[0] )) != UTF8_EOT))
-				&& ((((uintptr_t)prior_dirname) & ~BLOCK_MASK) == (((uintptr_t)dirname) & ~BLOCK_MASK))
-				) {
-				decoded_dirent->filename[n++] = c;
-				dirname++;
-				//dirkey++;
-			}
-			if( ((((uintptr_t)prior_dirname) & ~BLOCK_MASK) != (((uintptr_t)dirname) & ~BLOCK_MASK)) ) {
-				int partial = (int)(dirname - dirname_);
-				cache = BC( NAMES );
-				dirname = (const char*)vfs_os_FSEEK( vol, NULL, nameBlock, name_offset + partial, &cache, NAME_BLOCK_SIZE DBG_SRC );
-				//dirkey = (const char*)(vol->usekey[cache]) + ((name_offset + partial) & BLOCK_MASK);
-				dirname_ = dirname - partial;
-				prior_dirname = dirname;
-				continue;
-			}
-			// didn't stop because it exceeded a sector boundary
-			break;
-		} while( 1 );
-	}
-	decoded_dirent->filename[n] = 0;
-	decoded_dirent->filenamelen = n;
-	//time->dirent_fpi
-}
-//---------------------------------------------------------------------------
-static void deleteTimelineIndex( struct sack_vfs_os_volume* vol, BLOCKINDEX index ) {
-	BLOCKINDEX next;
-	do {
-		struct storageTimelineNode* time;
-		enum block_cache_entries cache = BC( TIMELINE );
-		//lprintf( "Delete start... %d", index );
-		time = getRawTimeEntry( vol, index, &cache GRTELog DBG_SRC );
- // this type is larger than index in some configurations
-		next = (BLOCKINDEX)time->priorTime;
-		nodes--;
-		if( !next ) {
-			if( vol->timeline->header.srootNode.ref.index == index ) {
-				vol->timeline->header.srootNode.ref.index = time->nextWrite;
-			}
-		}
-		{
-			struct storageTimeline* timeline = vol->timeline;
-			time->priorTime = (uint32_t)timeline->header.first_free_entry.ref.index;
-			timeline->header.first_free_entry.ref.index = index;
-			SMUDGECACHE( vol, vol->timelineCache );
-			SMUDGECACHE( vol, cache );
-		}
-		dropRawTimeEntry( vol, cache GRTELog DBG_SRC );
-#ifdef DEBUG_VALIDATE_TREE
-		//ValidateTimelineTree( vol DBG_SRC );
-#endif
-		//lprintf( "Delete done... %d", index );
-	} while( index = next );
-#ifdef DEBUG_DELETE_LAST
-	checkRoot( vol );
-#endif
-	//lprintf( "Root is now %d %d", nodes, vol->timeline->header.srootNode.ref.index );
-}
-BLOCKINDEX getTimeEntry( struct memoryTimelineNode* time, struct sack_vfs_os_volume* vol, LOGICAL unused, void(*init)(uintptr_t, struct memoryTimelineNode*), uintptr_t psv DBG_PASS ) {
-	//enum block_cache_entries cache = BC( TIMELINE );
-	//enum block_cache_entries cache_last = BC( TIMELINE );
-	//enum block_cache_entries cache_free = BC( TIMELINE );
-	//enum block_cache_entries cache_new = BC( TIMELINE );
-	struct storageTimeline* timeline = vol->timeline;
-	TIMELINE_BLOCK_TYPE freeIndex;
-	BLOCKINDEX index;
-	//BLOCKINDEX priorIndex = (BLOCKINDEX)time->index; // ref.index type is larger than index in some configurations; but won't exceed those bounds
-	BLOCKINDEX lastIndex = timeline->header.last_added_entry.ref.index;
-	freeIndex.ref.index = timeline->header.first_free_entry.ref.index;
-	// update next free.
- // ref.index type is larger than index in some configurations; but won't exceed those bounds
-	reloadTimeEntry( time, vol, index = (BLOCKINDEX)freeIndex.ref.index VTReadWrite GRTELog DBG_RELAY );
-	if( !timeline->header.srootNode.ref.index )
-		timeline->header.srootNode.ref.index = 1;
-	timeline->header.first_free_entry.ref.index = timeline->header.first_free_entry.ref.index + 1;
-	// make sure the new entry is emptied.
-	//time->disk->me_fpi = 0;
-	time->disk->dirent_fpi = 0;
-	time->disk->priorTime = 0;
-	time->disk->priorData = 0;
-	time->disk->priorDataSize = 0;
-	if( lastIndex )
-	{
-		enum block_cache_entries cache_near = BC( TIMELINE );
-		struct storageTimelineNode* last = getRawTimeEntry( vol, lastIndex, &cache_near GRTENoLog DBG_RELAY );
-		if( !last->nextWrite ) {
-			last->nextWrite = index;
-			// updated a value here...
-			SMUDGECACHE( vol, cache_near );
-		} else {
-			lprintf( "Shouldn't have to find what the last node in the chain is...." );
-			/*
-			dropRawTimeEntry( vol, cache_near GRTENoLog DBG_RELAY );
-			while( last = getRawTimeEntry( vol, last->nextWrite, &cache_near GRTENoLog DBG_RELAY ) ) {
-				dropRawTimeEntry( vol, cache_near );
-				if( !last->nextWrite ) {
-					last->nextWrite = index;
-					break;
-				}
-			}
-			*/
-		}
-		dropRawTimeEntry( vol, cache_near GRTENoLog DBG_RELAY );
-	}
-	time->disk->priorWrite = lastIndex;
-	time->disk->nextWrite = 0;
- // there really shouldn't be any times after this one....
-	time->disk->time = timeGetTime64ns();
-	timeline->header.last_added_entry.ref.index = index;
-	SMUDGECACHE( vol, vol->timelineCache );
-	{
-		int tz = GetTimeZone();
-		if( tz < 0 )
- // -840/15 = -56
-			tz = -( ( ( -tz / 100 ) * 60 ) + ( -tz % 100 ) ) / 15;
-		else
- // -840/15 = -56  720/15 = 48
-			tz = ( ( ( tz / 100 ) * 60 ) + ( tz % 100 ) ) / 15;
-		//time->disk->time += (int64_t)tz * 900 * (int64_t)1000000000;
-		time->disk->timeTz = tz;
-	}
-	if( init ) init( psv, time );
-	//nodes++;
-	//lprintf( "Add start... %d", freeIndex.ref.index );
-#if defined( DEBUG_TIMELINE_DIR_TRACKING) || defined( DEBUG_TIMELINE_AVL )
-	LoG( "Return time entry:%d", time->index );
-#endif
- // don't drop; returning this one.
-	updateTimeEntry( time, vol, FALSE DBG_RELAY );
-	return index;
-}
-BLOCKINDEX updateTimeEntryTime( struct memoryTimelineNode* time
-			, struct sack_vfs_os_volume *vol, uint64_t index
-			, LOGICAL allocateNew
-			, void( *init )( uintptr_t, struct memoryTimelineNode* ), uintptr_t psv DBG_PASS ) {
-	if( allocateNew ) {
-		if( time ) {
-			uint64_t inputIndex = time ? time->index : index;
-			// gets a new timestamp.
-			//enum block_cache_entries inputCache = time ? time->diskCache : BC( ZERO );
-			BLOCKINDEX newIndex = getTimeEntry( time, vol, TRUE, init, psv DBG_RELAY );
-			time->disk->priorTime = (uint32_t)inputIndex;
-			updateTimeEntry( time, vol, FALSE DBG_RELAY );
-			//dropRawTimeEntry( vol, inputCache GRTELog DBG_RELAY );
-			return newIndex;
-		}
-		else {
-			struct memoryTimelineNode time_;
-			struct storageTimelineNode* timeold;
-			uint64_t inputIndex = index;
-			enum block_cache_entries inputCache;
-			FPI dirent_fpi;
-			timeold = getRawTimeEntry( vol, index, &inputCache GRTELog DBG_RELAY );
- // ref.index type is larger than index in some configurations; but won't exceed those bounds
-			dirent_fpi = (FPI)timeold->dirent_fpi;
-			dropRawTimeEntry( vol, inputCache GRTELog DBG_RELAY );
-			// gets a new timestamp.
-			time_.index = index;
-			BLOCKINDEX newIndex = getTimeEntry( &time_, vol, TRUE, init, psv DBG_RELAY );
-			time_.disk->priorTime = (uint32_t)inputIndex;
-			time_.disk->dirent_fpi = dirent_fpi;
-			updateTimeEntry( &time_, vol, TRUE DBG_RELAY );
-			return newIndex;
-		}
-	}
-	else {
-		struct memoryTimelineNode time_;
-		//LOGICAL existing = ( time ) ? 1 : 0;
-		if( !time ) time = &time_;
-		reloadTimeEntry( time, vol, index VTReadWrite GRTENoLog DBG_RELAY );
-		time->disk->time = timeGetTime64ns();
-		{
-			int tz = GetTimeZone();
-			if( tz < 0 )
- // -840/15 = -56
-				tz = -( ( ( -tz / 100 ) * 60 ) + ( -tz % 100 ) ) / 15;
-			else
- // -840/15 = -56  720/15 = 48
-				tz = ( ( ( tz / 100 ) * 60 ) + ( tz % 100 ) ) / 15;
-			//time->disk->time += (int64_t)tz * 900 * (int64_t)1000000000;
-			time->disk->timeTz = tz;
-		}
-		reorderEntry( time, vol, 1 DBG_RELAY );
-		updateTimeEntry( time, vol, TRUE DBG_RELAY );
- // index type is larger than index in some configurations; but won't exceed those bounds
-		return (BLOCKINDEX)index;
-	}
-}
-LOGICAL setTimeEntryTime( struct memoryTimelineNode* time
-			, struct sack_vfs_os_volume *vol
-			, uint64_t tick
-			, int tz ) {
-	if( !time ) {
-//time = &time_;
-		lprintf( "invalid time entry passed" );
-		return FALSE;
-	} else {
-		//reloadTimeEntry( time, vol, index VTReadWrite GRTENoLog DBG_RELAY );
-		time->disk->timeTz = tz;
-		time->disk->time = tick;
-		reorderEntry( time, vol, 0 DBG_SRC );
-		updateTimeEntry( time, vol, FALSE DBG_SRC );
-		return TRUE;
-	}
-}
-struct sack_vfs_os_time_cursor* sack_vfs_os_get_time_cursor( struct sack_vfs_os_volume *vol ) {
-	struct sack_vfs_os_time_cursor* cursor;
-	cursor = New( struct sack_vfs_os_time_cursor );
-	cursor->vol = vol;
-	cursor->at = 0;
-	return cursor;
-}
-//--------------------------------
-//  read TIme Cursor reads/steps the cursor...
-//    step==0 && time === 0 && at === 0 ; start at the start of timeline.
-//    step==0 && time === N ; seek to time N, update at to the found record
-//    step==1 && time === N ; seek to record N, update at to the time at the indexed record
-//
-LOGICAL sack_vfs_os_read_time_cursor( struct sack_vfs_os_time_cursor* cursor, int step, uint64_t time, uint64_t* result_entry, const char**filename
-	, uint64_t *result_timestamp, int8_t *result_tz, const char**buffer, size_t *size ) {
-	static char* dataBuffer;
-	static size_t bufsize;
-	//uint64_t time = (time_ >> 8) * 1000000;
- // last raw entry cache
-	enum block_cache_entries_os cache;
-	LOGICAL dropCache = FALSE;
- // used as the record found indicator.
-	uint64_t entry = 0;
-	if( step == 2 ) {
-		entry = cursor->at;
-	}
-	else if( step == 1 ) {
-		if( !time ) {
-			cursor->at = entry = cursor->vol->timeline->header.srootNode.ref.index;
-		}else
-			cursor->at = entry = time;
-	}
-	else if( step == 0 ) {
-		// if( !time_ )
-		struct storageTimelineNode* timeNode = getRawTimeEntry( cursor->vol, cursor->vol->timeline->header.srootNode.ref.index, &cache GRTENoLog DBG_SRC );
-		while( timeNode && timeNode->time < time ) {
-			uint64_t next = timeNode->nextWrite;
-			dropRawTimeEntry( cursor->vol, cache  GRTENoLog DBG_SRC );
-			if( next ) timeNode = getRawTimeEntry( cursor->vol, next, &cache GRTENoLog DBG_SRC );
-			else timeNode = NULL;
-			entry = next;
-		}
-		if( !timeNode )
-			return FALSE;
-		dropCache = TRUE;
-	}
-	if( entry )
-	{
-		LOGICAL retVal = TRUE;
-		{
-		struct memoryTimelineNode memEntry;
-		reloadTimeEntry( &memEntry, cursor->vol, entry GRTENoLog DBG_SRC );
-		if( memEntry.disk->dirent_fpi ) {
-			cursor->at = memEntry.disk->nextWrite;
-			struct sack_vfs_os_find_info decoded_dirent;
-			reloadDirectoryEntry( cursor->vol, &memEntry, &decoded_dirent DBG_SRC );
-			if( result_entry ) {
-				result_entry[0] = memEntry.index;
-			}
-			if( result_tz ) {
-				result_tz[0] = memEntry.disk->timeTz;
-			}
-			if( result_timestamp ) {
-				result_timestamp[0] = memEntry.disk->time;
-			}
-			if( filename ) {
-				filename[0] = StrDup( decoded_dirent.filename );
-			}
-			if( size ) {
-				size[0] = decoded_dirent.filesize;
-				if( buffer ) {
-					if( bufsize < size[0] ) {
-						dataBuffer = (char*)Reallocate( dataBuffer, size[0] );
-					}
-					buffer[0] = dataBuffer;
-					{
-						// there might be a more optimal method of doing this; but this is easy to read.
-						struct sack_vfs_file* file = sack_vfs_os_openfile( cursor->vol, decoded_dirent.filename );
-						sack_vfs_os_read( file, dataBuffer, size[0] );
-						sack_vfs_os_close( file );
-					}
-				}
-			}
-		} else
-			retVal = FALSE;
-		dropRawTimeEntry( cursor->vol, memEntry.diskCache GRTENoLog DBG_SRC );
-		if( dropCache )
-			dropRawTimeEntry( cursor->vol, cache  GRTENoLog DBG_SRC );
-		}
-		return retVal;
-		//cursor->at = time;
-	}
-	return FALSE;
-}
-//#include "vfs_os_timeline.c"
-//#define priorData prior.ref.index
 struct blockInfo {
 	BLOCKINDEX block;
 	FPI start;
@@ -89660,31 +92323,11 @@ struct sack_vfs_os_file
 	FPI entry_fpi;
  // delete also needs the block number
 	BLOCKINDEX dir_block;
-#    ifdef XX_VIRTUAL_OBJECT_STORE
-	/* extended internal file information that just makes it harder to recover in a crash.*/
-	int blockSize;
-	struct file_header diskHeader;
-  // in-memory size, so we can just do generic move op
-	struct file_header header;
-	//struct memoryTimelineNode timeline;
-	uint8_t* seal;
-	uint8_t* sealant;
-	uint8_t* readKey;
-	uint16_t readKeyLen;
-	//uint8_t sealantLen;
- // boolean, on read, validates seal.  Defaults to FALSE.
-	uint8_t sealed;
-	//char* filename;
-	LOGICAL fileName;
-#    endif
-	struct sack_vfs_os_file_flags {
-		BIT_FIELD versioned : 1;
-	}flags;
   // has file size within
 	struct directory_entry  entry_;
   // has file size within
 	struct directory_entry* entry;
-  // how big the file is (live - reflects size for files opened by version)
+  // live size for the open file handle
 	VFS_DISK_DATATYPE filesize_;
  // files without names use this as thier preferred cache target
 	enum block_cache_entries cache;
@@ -89703,7 +92346,6 @@ static struct {
 	uint16_t index[256][256];
 	char leadin[MAX_FILENAME_LEN];
 	int leadinDepth;
-	PLINKQUEUE plqCrypters;
 	PLIST volumes;
 	LOGICAL exited;
 	PVFS_OS_FILESET files;
@@ -89713,6 +92355,29 @@ static struct {
 	int fileCount_old;
 #endif
 } l;
+static int8_t _os_GetPackedTimeZone( void ) {
+	int tz = GetTimeZone();
+	if( tz < 0 )
+		tz = -( ( ( -tz / 100 ) * 60 ) + ( -tz % 100 ) ) / 15;
+	else
+		tz = ( ( ( tz / 100 ) * 60 ) + ( tz % 100 ) ) / 15;
+	return (int8_t)tz;
+}
+static uint64_t _os_PackLocalTime( uint64_t unix_msec, int8_t tz ) {
+	return ( unix_msec << 8 ) | (uint8_t)tz;
+}
+// entry->update_time is nanoseconds since the UNIX epoch, UTC.  There is only one
+// 'now'; rendering it in a local zone is the presentation layer's business, so no
+// timezone is stored alongside it.
+static uint64_t _os_GetCurrentTime( void ) {
+	return timeGetTime64ns();
+}
+// the legacy packed view (56 bits of milliseconds, 8 of timezone) that the generic
+// filesystem info interface and SOSFSFIO_GET_TIME still hand out.  Sub-millisecond
+// precision is only reachable through sack_vfs_os_get_times().
+static uint64_t _os_GetLocalTime( uint64_t utc_nsec ) {
+	return _os_PackLocalTime( utc_nsec / 1000000, _os_GetPackedTimeZone() );
+}
 //static void _os_UpdateFileBlocks( struct sack_vfs_os_file* file );
 static struct sack_vfs_os_file* _os_createFile( struct sack_vfs_os_volume* vol, BLOCKINDEX first_block, int blockSize );
 static int sack_vfs_os_close_internal( struct sack_vfs_os_file* file, int unlock );
@@ -89721,23 +92386,6 @@ static enum block_cache_entries _os_UpdateSegmentKey_( struct sack_vfs_os_volume
 static int _os_dumpDirectories( struct sack_vfs_os_volume *vol, BLOCKINDEX start, LOGICAL init );
 #endif
 //#include "vfs_os_index.c"
-#ifdef XX_VIRTUAL_OBJECT_STORE
-static void _os_SetSmallBlockUsage( struct file_block_small_definition* block, int more ) {
-	block->used = more;
-	while( block->avail < block->used )
-		block->avail += 128;
-}
-static uint32_t _os_AddSmallBlockUsage( struct file_block_small_definition* block, uint32_t more ) {
-	uint32_t oldval = block->used;
-	_os_SetSmallBlockUsage( block, block->used + more );
-	return oldval;
-}
-static void _os_SetFileBlockUsage( struct file_block_small_definition* block, uint32_t more ) {
-	block->used = more;
-	while( block->avail < block->used )
-		block->avail += 256;
-}
-#endif
 ATEXIT( flushVolumes ){
 	INDEX idx;
 	struct sack_vfs_os_volume* vol;
@@ -89750,42 +92398,6 @@ ATEXIT( flushVolumes ){
 #endif
 	}
 }
-#if 0
-#define FILE_BLOCK_SEALANT 0
-#define FILE_BLOCK_REFERENCES 1
-#define FILE_BLOCK_DATA 2
-#define FILE_BLOCK_INDEXES 3
-#define FILE_BLOCK_REFERENCED_BY 4
-static FPI GetBlockStart( struct sack_vfs_os_file* file, int blockType ) {
-	FPI blockStart = sizeof( struct file_header );
-	switch( blockType ) {
-		//case 5:
-		//	blockStart += file->header.fileData.avail; // end of file.
-	case FILE_BLOCK_REFERENCED_BY:
-		blockStart += file->header.indexes.avail;
-	case FILE_BLOCK_INDEXES:
-		blockStart += (FPI)file->header.fileData.avail;
-	case FILE_BLOCK_DATA:
-		blockStart += file->header.references.avail;
-	case FILE_BLOCK_REFERENCES:
-		blockStart += file->header.sealant.avail;
-	case FILE_BLOCK_SEALANT:
-		// starts at position 0.
-		break;
-	}
-	return blockStart;
-}
-void WriteIntoBlock( struct sack_vfs_os_file* file, int blockType, FPI pos, CPOINTER data, FPI length ) {
-	FPI blockStart = GetBlockStart( file, blockType );
-	sack_vfs_os_seek_internal( file, (size_t)blockStart, SEEK_SET );
-	sack_vfs_os_write_internal( file, data, (size_t)length, NULL );
-}
-static void _os_SetLargeBlockUsage( struct file_block_large_definition* block, uint64_t more ) {
-	block->used = more;
-	while( block->avail < block->used )
-		block->avail = ( block->used + BLOCK_SIZE ) & BLOCK_MASK;
-}
-#endif
 static void _os_ExtendBlockChain( struct sack_vfs_os_file* file ) {
 	int newSize = ( file->blockChainAvail ) * 2 + 1;
 	file->blockChain = ( struct blockInfo*)Reallocate( file->blockChain, newSize * sizeof( struct blockInfo ) );
@@ -89902,9 +92514,6 @@ uintptr_t vfs_os_FSEEK_v2( struct sack_vfs_os_volume *vol
 		int size;
 		enum block_cache_entries cache =
 				file ?
-#ifdef XX_VIRTUAL_OBJECT_STORE
-			file->fileName ? BC( FILE ) :
-#endif
 			file->cache: cacheRoot;
 #ifdef DEBUG_FILE_SEEK
 		LoG_( "Getting next block after %p %d %d", file, firstblock, blockSize );
@@ -89912,10 +92521,7 @@ uintptr_t vfs_os_FSEEK_v2( struct sack_vfs_os_volume *vol
 		firstblock = vfs_os_GetNextBlock_v2( vol, firstblock
 			, &cache
 			, file?
-#ifdef XX_VIRTUAL_OBJECT_STORE
-			file->fileName?GFB_INIT_NONE:
-#endif
-			GFB_INIT_TIMELINE_MORE:GFB_INIT_NAMES, 1, blockSize, &size, flush_BAT_caches );
+			GFB_INIT_ZEROED:GFB_INIT_NAMES, 1, blockSize, &size, flush_BAT_caches );
 		if( size != blockSize ) {
 			lprintf( "Tried to allocate %d got %d at %d (from %d)", blockSize, size, *cache_index, cacheRoot );
 			DebugBreak();
@@ -90398,11 +93004,12 @@ static int _os_MaskStrCmp( struct sack_vfs_os_volume *vol, CTEXTSTR filename, BL
 		if( path_match ) {
 			size_t l;
 			int r = _os_PathCaseCmpEx( filename, dirname, l = strlen( filename ) );
-			if( !r )
+			if( !r ) {
 				if( (dirname)[l] == '/' || (dirname)[l] == '\\' )
 					return 0;
 				else
 					return 1;
+			}
 			return r;
 		}
 		else
@@ -90523,9 +93130,6 @@ static void _os_updateCacheAge_( struct sack_vfs_os_volume *vol, enum block_cach
 	least = ageLength + 1;
 #ifdef DEBUG_CACHE_FAULTS
 	switch( cacheRoot ) {
-	case BC(TIMELINE):
-		vol->cacheRequests[0]++;
-		break;
 	case BC( DIRECTORY ):
 		vol->cacheRequests[1]++;
 		break;
@@ -90534,10 +93138,6 @@ static void _os_updateCacheAge_( struct sack_vfs_os_volume *vol, enum block_cach
 	for( n = 0; n < (ageLength); n++,test_segment++ ) {
 		if( test_segment[0] == segment ) {
 			//if( pFile ) LoG_( "Cache found existing segment already. %d at %d(%d)", (int)segment, (cache_idx[0]+n), (int)n );
-#ifdef DEBUG_VALIDATE_TREE
-			//if( cache_idx[0] < BC( TIMELINE_RO ) )
-			//	_lprintf( DBG_RELAY )( "FOUND segment in cache: %d   %d  %d   %d", segment, n, age[n], cache_idx[0] );
-#endif
 			cache_idx[0] = (enum block_cache_entries)((cache_idx[0]) + n);
 			for( m = 0; m < (ageLength); m++ ) {
 				if( !age[m] ) break;
@@ -90612,11 +93212,7 @@ static void _os_updateCacheAge_( struct sack_vfs_os_volume *vol, enum block_cach
 #ifdef DEBUG_CACHE_FLUSH
 			// if not dirty, then clean and buffer have to match; and this is clearing the dirty flag
 			memcpy( vol->usekey_buffer_clean[useCache], vol->usekey_buffer[useCache], BLOCK_SIZE );
-#  ifdef DEBUG_VALIDATE_TREE
- // timeline cache is noisy for readonly
-			if( useCache < BC( TIMELINE_RO ) )
-#  endif
-				_lprintf(DBG_RELAY)( "(usedto)Updated clean buffer %d", useCache );
+			_lprintf(DBG_RELAY)( "(usedto)Updated clean buffer %d", useCache );
 #endif
 			CLEANCACHE( vol, useCache );
 			RESETFLAG( vol->_dirty, useCache );
@@ -90624,27 +93220,17 @@ static void _os_updateCacheAge_( struct sack_vfs_os_volume *vol, enum block_cach
 #ifdef DEBUG_VALIDATE_TREE
 		else {
 #ifdef DEBUG_CACHE_FLUSH
-#  ifdef DEBUG_VALIDATE_TREE
-			if( cache_idx[0] < BC(TIMELINE_RO) )
-#  endif
-				if( memcmp( vol->usekey_buffer_clean[cache_idx[0]], vol->usekey_buffer[cache_idx[0]], BLOCK_SIZE ) ) {
-					lprintf( "Block was written to, but was not flagged as dirty, changes will be lost." );
-					DebugBreak();
-				}
+			if( memcmp( vol->usekey_buffer_clean[cache_idx[0]], vol->usekey_buffer[cache_idx[0]], BLOCK_SIZE ) ) {
+				lprintf( "Block was written to, but was not flagged as dirty, changes will be lost." );
+				DebugBreak();
+			}
 #endif
 		}
 #endif
 		vol->segment[useCache] = segment;
 	}
-#ifdef DEBUG_VALIDATE_TREE
-	//if( cache_idx[0] < BC(TIMELINE_RO) )
-	//	_lprintf(DBG_RELAY)( "Get segment into cache: %d   %d", segment, cache_idx[0] );
-#endif
 #ifdef DEBUG_CACHE_FAULTS
 	switch( cacheRoot ) {
-	case BC( TIMELINE ):
-		vol->cacheFaults[0]++;
-		break;
 	case BC( DIRECTORY ):
 		vol->cacheFaults[1]++;
 		break;
@@ -90678,10 +93264,7 @@ static void _os_updateCacheAge_( struct sack_vfs_os_volume *vol, enum block_cach
 			// modifications happen to usekey_buffer before SMUDGE is called.
 			memcpy( vol->usekey_buffer_clean[cache_idx[0]], vol->usekey_buffer[cache_idx[0]], vol->sector_size[cache_idx[0]] );
 #ifdef DEBUG_CACHE_FLUSH
-#  ifdef DEBUG_VALIDATE_TREE
-			if( cache_idx[0] < BC(TIMELINE_RO) )
-#  endif
-				_lprintf(DBG_RELAY)( "Updated clean buffer %d", cache_idx[0] );
+			_lprintf(DBG_RELAY)( "Updated clean buffer %d", cache_idx[0] );
 #endif
 		}
 #ifdef DEBUG_DISK_IO
@@ -90710,32 +93293,10 @@ enum block_cache_entries _os_UpdateSegmentKey_( struct sack_vfs_os_volume *vol, 
 	else if( cache_idx[0] == BC(DIRECTORY) ) {
 		_os_updateCacheAge_( vol, cache_idx, segment, vol->dirHashCacheAge, (BC(DIRECTORY_LAST) - BC(DIRECTORY)) DBG_RELAY );
 	}
-	else if( cache_idx[0] == BC( TIMELINE ) ) {
-		_os_updateCacheAge_( vol, cache_idx, segment, vol->timelineCacheAge, (BC( TIMELINE_LAST ) - BC( TIMELINE )) DBG_RELAY );
-	}
 	else if( cache_idx[0] == BC( ROLLBACK ) ) {
 		//lprintf( "Cache age rollback: %d", (int)segment );
 		_os_updateCacheAge_( vol, cache_idx, segment, vol->rollbackCacheAge, ( BC( ROLLBACK_LAST ) - BC( ROLLBACK ) ) DBG_RELAY );
 	}
-#ifdef DEBUG_VALIDATE_TREE
-	else if( cache_idx[0] == BC( TIMELINE_RO ) ) {
-		_os_updateCacheAge_( vol, cache_idx, segment, vol->timelineCacheAge, ( BC( TIMELINE_RO_LAST ) - BC( TIMELINE_RO ) ) DBG_RELAY );
-		{
-			int n;
-			for( n = BC( TIMELINE ); n < BC( TIMELINE_LAST ); n++ ) {
-				if( vol->segment[n] == segment ) {
-					if( TESTFLAG( vol->dirty, n ) || TESTFLAG( vol->_dirty, n ) ) {
-						// use the cached value instead of the disk value.
-						memcpy( vol->usekey_buffer[cache_idx[0]], vol->usekey_buffer[n], BLOCK_SIZE );
-						memcpy( vol->usekey_buffer_clean[cache_idx[0]], vol->usekey_buffer[n], BLOCK_SIZE );
-						//lprintf( "Updaed clean buffer %d", n );
-					}
-					break;
-				}
-			}
-		}
-	}
-#endif
 	else if( cache_idx[0] == BC( BAT ) ) {
 		_os_updateCacheAge_( vol, cache_idx, segment, vol->batHashCacheAge, (BC(BAT_LAST) - BC(BAT)) DBG_RELAY );
 	}
@@ -90982,12 +93543,12 @@ static LOGICAL _os_ValidateBAT( struct sack_vfs_os_volume *vol ) {
 			//if( m < BLOCKS_PER_BAT ) break;
 		}
 		// this ends up pusing 1 more so that compute can actually work on reload
-		vol->pdl_BAT_information->Cnt--;
+		vol->pdl_BAT_information->Cnt = vol->pdl_BAT_information->Cnt - 1;
 		priorInfo = (struct sack_vfs_os_BAT_info*)GetDataItem( &vol->pdl_BAT_information, vol->pdl_BAT_information->Cnt-1 );
 		if( priorInfo->sectorEnd > vol->dwSize )
 			vol->dwSize = priorInfo->sectorEnd;
 	}
-	// need to handle rollback before any timeline/directory loading
+	// need to handle rollback before directory loading
 	// otherwise they will cache sectors that are duplicated here.
 	if( !vol->journal.rollback_file ) {
 		struct sack_vfs_os_file* file;
@@ -91021,17 +93582,6 @@ static LOGICAL _os_ValidateBAT( struct sack_vfs_os_volume *vol ) {
 			}
 			DeleteList( &vol->pending_rollback );
 			sack_vfs_os_polish_volume( vol );
-		}
-	}
-	vol->timeline_file = _os_createFile( vol, FIRST_TIMELINE_BLOCK, TIME_BLOCK_SIZE );
-	vol->timeline_file->cache = BC( TIMELINE );
-	{
-		int locks;
-		vol->timelineCache = BC( TIMELINE );
-		vol->timeline = (struct storageTimeline *)vfs_os_BSEEK( vol, FIRST_TIMELINE_BLOCK, TIME_BLOCK_SIZE, &vol->timelineCache );
-		SETMASK_( vol->seglock, seglock, vol->timelineCache, locks = GETMASK_( vol->seglock, seglock, vol->timelineCache )+1 );
-		if( locks > 5 ) {
-			lprintf( "Lock is in danger of overflow" );
 		}
 	}
 	if( !_os_ScanDirectory( vol, NULL, FIRST_DIR_BLOCK, NULL, NULL, 0 ) ) return FALSE;
@@ -91077,7 +93627,7 @@ LOGICAL _os_ExpandVolume( struct sack_vfs_os_volume *vol, BLOCKINDEX fromBlock, 
 		char *iface;
 		char *tmp;
 #ifndef USE_STDIO
-		if( tmp =(char*)StrChr( vol->volname, '@' ) ) {
+		if( (tmp =(char*)StrChr( vol->volname, '@' ) ) ) {
 			if( tmp[1] == '@' ) {
 				strcpy( tmp, tmp + 1 );
 				goto defaultOpen;
@@ -91172,12 +93722,9 @@ defaultOpen:
 		((BLOCKINDEX*)vol->usekey_buffer[cache])[BLOCKS_PER_BAT] = (size== BLOCK_SMALL_SIZE )?1:(size==4096)?0:2;
 		if( created ) {
 			enum block_cache_entries dirCache = BC( DIRECTORY );
-			enum block_cache_entries timeCache = BC( TIMELINE );
 			enum block_cache_entries rollbackCache = BC( ROLLBACK );
 			//BLOCKINDEX dirblock =
 				_os_GetFreeBlock( vol, &dirCache, GFB_INIT_DIRENT, DIR_BLOCK_SIZE );
-			//BLOCKINDEX timeblock =
-				_os_GetFreeBlock( vol, &timeCache, GFB_INIT_TIMELINE, TIME_BLOCK_SIZE );
 			//BLOCKINDEX rollbackblock =
 				_os_GetFreeBlock( vol, &rollbackCache, GFB_INIT_ROLLBACK, ROLLBACK_BLOCK_SIZE );
 			vol->lastBatBlock = 0;
@@ -91204,7 +93751,7 @@ static BLOCKINDEX _os_GetFreeBlock_( struct sack_vfs_os_volume *vol, enum block_
 			check_val = 0;
 			b = (unsigned int)(newblock / BLOCKS_PER_BAT);
 			n = newblock % BLOCKS_PER_BAT;
-			vol->pdlFreeBlocks->Cnt--;
+			vol->pdlFreeBlocks->Cnt = vol->pdlFreeBlocks->Cnt - 1;
 		}
 		else {
 			check_val = EOBBLOCK;
@@ -91218,7 +93765,7 @@ static BLOCKINDEX _os_GetFreeBlock_( struct sack_vfs_os_volume *vol, enum block_
 			check_val = 0;
 			n = newblock % BLOCKS_PER_BAT;
 			b = (unsigned int)( newblock / BLOCKS_PER_BAT );
-			vol->pdlFreeSmallBlocks->Cnt--;
+			vol->pdlFreeSmallBlocks->Cnt = vol->pdlFreeSmallBlocks->Cnt - 1;
 		}
 		else {
 			check_val = EOBBLOCK;
@@ -91233,7 +93780,7 @@ static BLOCKINDEX _os_GetFreeBlock_( struct sack_vfs_os_volume *vol, enum block_
 	current_BAT =  (BLOCKINDEX*)vfs_os_block_index_SEEK( vol, b*BLOCKS_PER_SECTOR, blockSize, &cache ) + n;
 	if( !current_BAT ) return 0;
 	current_BAT[0] = EOFBLOCK;
-	if( (check_val == EOBBLOCK) ) {
+	if( check_val == EOBBLOCK ) {
 		if( n < (BLOCKS_PER_BAT - 1) ) {
 			current_BAT[1] = EOBBLOCK;
 			if( blockSize == 4096 )
@@ -91280,30 +93827,12 @@ static BLOCKINDEX _os_GetFreeBlock_( struct sack_vfs_os_volume *vol, enum block_
 			//memcpy( vol->usekey_buffer_clean[newcache], vol->usekey_buffer[newcache2], DIR_BLOCK_SIZE );
 			break;
 		}
-	case GFB_INIT_TIMELINE: {
-			struct storageTimeline *tl;
+	case GFB_INIT_ZEROED:
 #ifdef DEBUG_BLOCK_INIT
-			LoG( "new block, init as root timeline" );
-#endif
-			_os_UpdateSegmentKey_( vol, blockCache, b * (BLOCKS_PER_SECTOR)+n + 1 + 1 DBG_RELAY );
-			tl = (struct storageTimeline *)vol->usekey_buffer[blockCache[0]];
-			//tl->header.timeline_length  = 0;
-			//tl->header.crootNode.raw = 0;
-			tl->header.srootNode.raw = 0;
-			tl->header.first_free_entry.ref.index = 1;
-			//tl->header.first_free_entry.ref.depth = 0;
-			// update the clean buffer, so journal writes initialized data.
-			//memcpy( vol->usekey_buffer_clean[blockCache[0]], vol->usekey_buffer[blockCache[0]], TIME_BLOCK_SIZE );
-			break;
-		}
-	case GFB_INIT_TIMELINE_MORE:
-#ifdef DEBUG_BLOCK_INIT
-		LoG( "new block, init timeline more " );
+		LoG( "new block, init zeroed block" );
 #endif
 		_os_UpdateSegmentKey_( vol, blockCache, b * (BLOCKS_PER_SECTOR)+n + 1 + 1 DBG_RELAY );
 		memset( vol->usekey_buffer[blockCache[0]], 0, vol->sector_size[blockCache[0]] );
-		// update the clean buffer, so journal writes initialized data.
-		//memcpy( vol->usekey_buffer_clean[blockCache[0]],  vol->usekey_buffer[blockCache[0]], TIME_BLOCK_SIZE );
 		break;
 	case GFB_INIT_NAMES:
 #ifdef DEBUG_BLOCK_INIT
@@ -91637,10 +94166,6 @@ struct sack_vfs_os_volume *sack_vfs_os_load_volume( const char * filepath, struc
 	if( !mount )
 		mount = sack_get_default_mount();
 	vol->mount = mount;
-	// since time is morely forward going; keeping the stack for the avl
-	// balancer can reduce forward-scanning insertion time
-	// vol->pdsCTimeStack = CreateDataStack( sizeof( struct memoryTimelineNode ) );
-	// vol->pdsWTimeStack = CreateDataStack( sizeof( struct memoryTimelineNode ) );
 	vol->pdl_BAT_information = CreateDataList( sizeof( struct sack_vfs_os_BAT_info ) );
 	vol->pdlFreeBlocks = CreateDataList( sizeof( BLOCKINDEX ) );
 	vol->pdlFreeSmallBlocks = CreateDataList( sizeof( BLOCKINDEX ) );
@@ -91970,19 +94495,7 @@ LOGICAL _os_ScanDirectory_( struct sack_vfs_os_volume *vol, const char * filenam
 				l.fileCount++;
 #endif
 #ifdef DEBUG_TIMELINE_DIR_TRACKING
- // else we have a different issue.
-				if( entry->timelineEntry )
-				{
-					// make sure timeline and file entries reference each other.
-					struct memoryTimelineNode time;
-					reloadTimeEntry( &time, vol, entry->timelineEntry VTReadOnly GRTELog DBG_SRC );
-					FPI entry_fpi = vol->bufferFPI[cache] + sane_offsetof( struct directory_hash_lookup_block, entries[curName] );
-					if( entry_fpi != time.disk->dirent_fpi ) {
-						lprintf( "!!!! directory entry doesn't match: %d %d", entry_fpi, time.disk->dirent_fpi );
-						DebugBreak();
-					}
-					dropRawTimeEntry( vol, time.diskCache GRTELog DBG_SRC );
-				}
+				// update_time is now inline metadata, not a timeline node backlink.
 #endif
 				//if( filename && !name_ofs )	return FALSE; // done.
 				if( 0 ) {
@@ -92060,17 +94573,6 @@ LOGICAL _os_ScanDirectory_( struct sack_vfs_os_volume *vol, const char * filenam
  // done.;
 			return filename ? FALSE : (2);
 		}
-		// unreachable, and broken code.
-#if 0
-		BLOCKINDEX next_dir_block;
-		next_dir_block = vfs_os_GetNextBlock( vol, this_dir_block, GFB_INIT_TIMELINE_MORE, TRUE, DIR_BLOCK_SIZE, NULL );
-#ifdef _DEBUG
-		if( this_dir_block == next_dir_block ) DebugBreak();
-  // should have a last-entry before no more blocks....
-		if( next_dir_block == 0 ) { DebugBreak(); return FALSE; }
-#endif
-		this_dir_block = next_dir_block;
-#endif
 	}
 	while( 1 );
 }
@@ -92238,26 +94740,6 @@ static void deleteDirectoryEntryName( struct sack_vfs_os_volume* vol, struct sac
 			e = f;
 		}
 		else if( e >= 0 ) {
-			if( dirblock->entries[f].timelineEntry ) {
-				struct memoryTimelineNode time;
-				//enum block_cache_entries  timeCache = BC( TIMELINE );
-				reloadTimeEntry( &time, vol, ( dirblock->entries[f].timelineEntry ) VTReadWrite GRTENoLog DBG_SRC );
-				time.disk->dirent_fpi = vol->bufferFPI[nameCache] + sane_offsetof( struct directory_hash_lookup_block, entries[f - 1] );
-				{
-					uint64_t index = time.disk->priorTime;
-					while( index ) {
-						struct memoryTimelineNode time2;
-						reloadTimeEntry( &time2, vol, index GRTENoLog VTReadWrite DBG_SRC );
-						time2.disk->dirent_fpi = time.disk->dirent_fpi;
-						index = time2.disk->priorTime;
-						updateTimeEntry( &time2, vol, TRUE DBG_SRC );
-					}
-				}
-#ifdef DEBUG_TIMELINE_DIR_TRACKING
-				lprintf( "Set timeline %d to %d", (int)time.index, (int)time.disk->dirent_fpi );
-#endif
-				updateTimeEntry( &time, vol, TRUE DBG_SRC );
-			}
 			dirblock->entries[f - 1] = dirblock->entries[f];
 		}
 	}
@@ -92395,64 +94877,10 @@ static void ConvertDirectory( struct sack_vfs_os_volume *vol, const char *leadin
 							DebugBreak();
 						}
 						newEntry->filesize = entry->filesize;
-						{
-							struct memoryTimelineNode time;
-							FPI oldFPI;
-							//enum block_cache_entries  timeCache = BC( TIMELINE );
-							reloadTimeEntry( &time, vol, (entry->timelineEntry     ) VTReadWrite GRTENoLog DBG_SRC );
- // dirent_fpi type is larger than index in some configurations; but won't exceed those bounds
-							oldFPI = (FPI)time.disk->dirent_fpi;
-							// new entry is still the same timeline entry as the old entry.
-							newEntry->timelineEntry = (entry->timelineEntry     )     ;
-							// timeline points at new entry.
-							time.disk->dirent_fpi = vol->bufferFPI[newdir_cache] + sane_offsetof(struct directory_hash_lookup_block, entries[nf]);
-							{
-								uint64_t index = time.disk->priorTime;
-								while( index ) {
-									struct memoryTimelineNode time2;
-									reloadTimeEntry( &time2, vol, index VTReadWrite GRTENoLog DBG_SRC );
-									time2.disk->dirent_fpi = time.disk->dirent_fpi;
-									updateTimeEntry( &time2, vol, TRUE DBG_SRC );
-									index = time2.disk->priorTime;
-								}
-							}
+						newEntry->update_time = entry->update_time;
 #ifdef DEBUG_TIMELINE_DIR_TRACKING
-							lprintf( "Set timeline %d to %d", (int)time.index, (int)time.disk->dirent_fpi );
+						lprintf( "direntry at %d  %d has time %lld", (int)new_dir_block, (int)nf, (long long)newEntry->update_time );
 #endif
-							updateTimeEntry( &time, vol, TRUE DBG_SRC );
-#ifdef DEBUG_TIMELINE_DIR_TRACKING
-							lprintf( "direntry at %d  %d is time %d", (int)new_dir_block, (int)nf, (int)newEntry->timelineEntry );
-#endif
-							{
-								INDEX idx;
-								struct sack_vfs_file  * file;
-								LIST_FORALL( vol->files, idx, struct sack_vfs_file  *, file ) {
-									if( file->entry_fpi == oldFPI ) {
-										// unlock old directory
-										int locks = GETMASK_( vol->seglock, seglock, file->cache ) - 1;
-										if( locks < 0 ) {
-											lprintf( "File lock in convert underflow... " );
-											DebugBreak();
-										}
-										SETMASK_( vol->seglock, seglock, cache, locks );
-										// new entry_fpi.
- // dirent_fpi type is larger than index in some configurations; but won't exceed those bounds
-										file->entry_fpi = (FPI)time.disk->dirent_fpi;
-										//file->dir_block = time.disk->dir
-										lprintf( "File cache might have been wrong... (AND USED OLD ENTRY)" );
-										file->entry = newEntry;
-										file->cache = newdir_cache;
-										// lock new cache entry
-										locks = GETMASK_( vol->seglock, seglock, file->cache ) + 1;
-										if( locks < 0 ) {
-											lprintf( "File lock in convert underflow... " );
-											DebugBreak();
-										}
-										SETMASK_( vol->seglock, seglock, cache, locks );
-									}
-								}
-							}
-						}
 						newEntry->name_offset = name_ofs;
 						newEntry->first_block = (entry->first_block ) ;
 						//lprintf( "Convert File new block %d", entry->first_block );
@@ -92486,31 +94914,10 @@ static void ConvertDirectory( struct sack_vfs_os_volume *vol, const char *leadin
 						dirblock->entries[m].first_block = dirblock->entries[m + offset].first_block;
 						dirblock->entries[m].name_offset = dirblock->entries[m + offset].name_offset;
 						dirblock->entries[m].filesize = dirblock->entries[m + offset].filesize;
-						dirblock->entries[m].timelineEntry = dirblock->entries[m + offset].timelineEntry;
+						dirblock->entries[m].update_time = dirblock->entries[m + offset].update_time;
 #ifdef DEBUG_TIMELINE_DIR_TRACKING
-						lprintf( "direntry at %d  %d is time %d", (int)this_dir_block, (int)m, (int)dirblock->entries[m].timelineEntry );
+						lprintf( "direntry at %d  %d has time %lld", (int)this_dir_block, (int)m, (long long)dirblock->entries[m].update_time );
 #endif
-						{
-							struct memoryTimelineNode time;
-							//enum block_cache_entries  timeCache = BC( TIMELINE );
-							reloadTimeEntry( &time, vol, (dirblock->entries[m + offset].timelineEntry) VTReadWrite GRTENoLog DBG_SRC );
- /*vol->bufferFPI[cache]*/
-							time.disk->dirent_fpi = this_dir_block * BLOCK_SIZE + sane_offsetof( struct directory_hash_lookup_block, entries[m] );
-							{
-								uint64_t index = time.disk->priorTime;
-								while( index ) {
-									struct memoryTimelineNode time2;
-									reloadTimeEntry( &time2, vol, index VTReadWrite GRTENoLog DBG_SRC );
-									time2.disk->dirent_fpi = time.disk->dirent_fpi;
-									updateTimeEntry( &time2, vol, TRUE DBG_SRC );
-									index = time2.disk->priorTime;
-								}
-							}
-#ifdef DEBUG_TIMELINE_DIR_TRACKING
-							lprintf( "Set timeline %d to %d", (int)time.index, (int)time.disk->dirent_fpi );
-#endif
-							updateTimeEntry( &time, vol, TRUE DBG_SRC );
-						}
 #ifdef _DEBUG
 						if( !dirblock->names_first_block ) DebugBreak();
 #endif
@@ -92519,7 +94926,7 @@ static void ConvertDirectory( struct sack_vfs_os_volume *vol, const char *leadin
 						dirblock->entries[m].first_block = (0);
 						dirblock->entries[m].name_offset = (0);
 						dirblock->entries[m].filesize = (0);
-						dirblock->entries[m].timelineEntry = (0);
+						dirblock->entries[m].update_time = (0);
 #ifdef _DEBUG
 						if( !dirblock->names_first_block ) DebugBreak();
 #endif
@@ -92674,33 +95081,13 @@ static struct directory_entry * _os_GetNewDirectory( struct sack_vfs_os_volume *
 					LoG( "Insert new directory" );
 #endif
 					for( m = dirblock->used_names; SUS_GT( m, int, n, size_t ); m-- ) {
-						struct memoryTimelineNode node;
 						dirblock->entries[m].filesize      = dirblock->entries[m - 1].filesize      ;
 						dirblock->entries[m].first_block   = dirblock->entries[m - 1].first_block   ;
 						dirblock->entries[m].name_offset   = dirblock->entries[m - 1].name_offset   ;
-						reloadTimeEntry( &node, vol, dirblock->entries[m - 1].timelineEntry VTReadWrite GRTENoLog DBG_SRC );
-						dirblock->entries[m].timelineEntry = dirblock->entries[m - 1].timelineEntry;
+						dirblock->entries[m].update_time = dirblock->entries[m - 1].update_time;
 #ifdef DEBUG_TIMELINE_DIR_TRACKING
-						LoG( "direntry at %d  %d is time %d", (int)this_dir_block, (int)m, (int)dirblock->entries[m].timelineEntry );
+						LoG( "direntry at %d  %d has time %lld", (int)this_dir_block, (int)m, (long long)dirblock->entries[m].update_time );
 #endif
-						node.disk->dirent_fpi = dirblockFPI + sane_offsetof( struct directory_hash_lookup_block, entries[m] );
-						{
-							uint64_t index = node.disk->priorTime;
-							while( index ) {
-								struct memoryTimelineNode time2;
-								reloadTimeEntry( &time2, vol, index VTReadWrite GRTENoLog DBG_SRC );
-								time2.disk->dirent_fpi = node.disk->dirent_fpi;
-#ifdef DEBUG_TIMELINE_DIR_TRACKING
-								LoG( "(Move)Set timeline %d to %d", (int)time2.index, (int)time2.disk->dirent_fpi );
-#endif
-								updateTimeEntry( &time2, vol, TRUE DBG_SRC );
-								index = time2.disk->priorTime;
-							}
-						}
-#ifdef DEBUG_TIMELINE_DIR_TRACKING
-						lprintf( "Set timeline %d to %d", (int)node.index, (int)node.disk->dirent_fpi );
-#endif
-						updateTimeEntry( &node, vol, TRUE DBG_SRC );
 					}
 					dirblock->used_names++;
 					break;
@@ -92721,23 +95108,10 @@ static struct directory_entry * _os_GetNewDirectory( struct sack_vfs_os_volume *
 			// have to allocate a block for the file, otherwise it would be deleted.
 // first_blk;
 			ent->first_block = DIR_ALLOCATING_MARK;
-			{
-				struct memoryTimelineNode time_;
-				struct memoryTimelineNode *time = &time_;
-				time_.index = 0;
-				ent->timelineEntry = getTimeEntry( time, vol, 0, NULL, 0 DBG_SRC );
-				// reset dirent_fpi afterward.
-				time->disk->dirent_fpi = dirblockFPI + sane_offsetof( struct directory_hash_lookup_block, entries[n] );;
-				// associate a time entry with this directory entry, and vice-versa.
+			ent->update_time = _os_GetCurrentTime();
 #ifdef DEBUG_TIMELINE_DIR_TRACKING
-				lprintf( "Set timeline %d to %d", (int)time->index, (int)time->disk->dirent_fpi );
+			lprintf( "direntry at %d  %d has time %lld", (int)this_dir_block, (int)n, (long long)dirblock->entries[n].update_time );
 #endif
-#ifdef DEBUG_TIMELINE_DIR_TRACKING
-				lprintf( "direntry at %d  %d is time %d", (int)this_dir_block, (int)n, (int)dirblock->entries[n].timelineEntry );
-#endif
-				// update drop the new entry.
-				updateTimeEntry( time, vol, TRUE DBG_SRC );
-			}
 			if( file ) {
 				int locks;
 				locks = GETMASK_( vol->seglock, seglock, cache ) + 1;
@@ -92759,18 +95133,14 @@ static struct directory_entry * _os_GetNewDirectory( struct sack_vfs_os_volume *
 	}
 	while( 1 );
 }
-static struct sack_vfs_os_file * CPROC sack_vfs_os_openfile_internal( struct sack_vfs_os_volume *vol, const char * filename, uint64_t version, LOGICAL create ) {
+static struct sack_vfs_os_file * CPROC sack_vfs_os_openfile_internal( struct sack_vfs_os_volume *vol, const char * filename ) {
 //New( struct sack_vfs_os_file );
 	struct sack_vfs_os_file *file = GetFromSet( VFS_OS_FILE, &l.files );
 	while( LockedExchange( &vol->lock, 1 ) ) Relinquish();
 	MemSet( file, 0, sizeof( struct sack_vfs_os_file ) );
-#ifdef XX_VIRTUAL_OBJECT_STORE
-	BLOCKINDEX offset;
-#endif
 	file->vol = vol;
  // default to internal buffer; might never have a real directory
 	file->entry = &file->entry_;
-	//file->sealant = NULL;
 	if( filename[0] == '.' && ( filename[1] == '\\' || filename[1] == '/' ) ) filename += 2;
 #ifdef DEBUG_FILE_OPEN
 	LoG( "sack_vfs open %s = %p on %s", filename, file, vol->volname );
@@ -92784,117 +95154,21 @@ static struct sack_vfs_os_file * CPROC sack_vfs_os_openfile_internal( struct sac
 			}
 			else _os_GetNewDirectory( vol, filename, file );
 		}
-	if( ( file->entry->first_block != DIR_ALLOCATING_MARK ) && create ) {
-		// if there is already data
-		file->flags.versioned = 1;
-	} else
-		file->flags.versioned = 0;
- // saved for versioning really
 	file->filesize_ = file->entry->filesize;
 	// update to the file's first block (allocating, data, whatever)
 	file->_first_block = file->block = file->entry->first_block;
-  // sort of a opened for write
-	if( create ) {
-		// this updates the timestamp of the file, and allocates a new one
-		//PDATALIST pdlTimes = CreateDataList( sizeof( uint64_t ) );
-		struct sack_vfs_os_volume* vol = file->vol;
-		struct memoryTimelineNode time;
-		//enum block_cache_entries  timeCache = BC( TIMELINE );
-		//BLOCKINDEX priorData = file->entry->first_block;
-		reloadTimeEntry( &time, vol, file->entry->timelineEntry VTReadWrite GRTENoLog  DBG_SRC );
-#ifdef _DEBUG
-		if( !time.disk->time ) DebugBreak();
-#endif
-		// open oldest by default, with no prior time set...
-		if( time.disk->priorTime ) {
-			BLOCKINDEX priorTime = time.disk->priorTime;
-			while( priorTime ) {
-				enum block_cache_entries cache;
-				struct storageTimelineNode* prior = getRawTimeEntry( vol, priorTime, &cache GRTENoLog DBG_SRC );
-				//prior->
-				priorTime = prior->priorTime;
-				//priorData = prior->priorData;
-				file->filesize_ = prior->priorDataSize;
-				if( prior->time <= version ) break;
-				dropRawTimeEntry( file->vol, cache GRTENoLog DBG_SRC );
-			}
-		}
-		dropRawTimeEntry( vol, time.diskCache GRTENoLog DBG_SRC );
-	}
 	//file->filename = StrDup( filename );
 	//file->fileName = !!filename;
-#ifdef XX_VIRTUAL_OBJECT_STORE
- // file->entry->name_offset;
-	offset = file->entry_.name_offset;
-	if( ( file->entry->name_offset ) & DIRENT_NAME_OFFSET_FLAG_SEALANT ) {
-		sack_vfs_os_read_internal( file, 0, &file->diskHeader, sizeof( file->diskHeader ) );
-		file->header = file->diskHeader;
-		file->fpi = file->header.sealant.avail + file->header.references.avail;
-		{
-			uint32_t sealLen = (offset & DIRENT_NAME_OFFSET_FLAG_SEALANT) >> DIRENT_NAME_OFFSET_FLAG_SEALANT_SHIFT;
-			if( sealLen ) {
-				file->seal = NewArray( uint8_t, sealLen );
-				//file->sealantLen = sealLen;
-				file->sealed = SACK_VFS_OS_SEAL_LOAD;
-			}
-			else {
-				file->seal = NULL;
-				//file->sealantLen = 0;
-				file->sealed = SACK_VFS_OS_SEAL_NONE;
-			}
-		}
-	}
-#endif
 	AddLink( &vol->files, file );
 	vol->lock = 0;
 	return file;
 }
 struct sack_vfs_os_file * CPROC sack_vfs_os_openfile( struct sack_vfs_os_volume *vol, const char * filename ) {
-	return sack_vfs_os_openfile_internal( vol, filename, 0, FALSE );
+	return sack_vfs_os_openfile_internal( vol, filename );
 }
 static struct sack_vfs_os_file * CPROC sack_vfs_os_open( uintptr_t psvInstance, const char * filename, const char *opts ) {
 	return sack_vfs_os_openfile( (struct sack_vfs_os_volume*)psvInstance, filename );
 }
-#ifdef XX_VIRTUAL_OBJECT_STORE
-static char * getFilename( const char *objBuf, size_t objBufLen
-	, char *sealBuf, size_t sealBufLen, LOGICAL owner
-	, char **idBuf, size_t *idBufLen ) {
-	if( sealBuf ) {
-		struct random_context *signEntropy = (struct random_context *)DequeLink( &l.plqCrypters );
-		char *fileKey;
-		size_t keyLen;
-		uint8_t outbuf[32];
-		if( !signEntropy )
-			signEntropy = SRG_CreateEntropy4( NULL, (uintptr_t)0 );
-		if( owner ) {
-			char *metakey = SRG_ID_Generator3();
-			SRG_ResetEntropy( signEntropy );
-			SRG_FeedEntropy( signEntropy, (const uint8_t*)metakey, 44 );
-			SRG_FeedEntropy( signEntropy, (const uint8_t*)sealBuf, sealBufLen );
-			SRG_GetEntropyBuffer( signEntropy, (uint32_t*)outbuf, 256 );
-		}
-		else {
-			SRG_ResetEntropy( signEntropy );
-			SRG_FeedEntropy( signEntropy, (const uint8_t*)sealBuf, sealBufLen );
-			SRG_GetEntropyBuffer( signEntropy, (uint32_t*)outbuf, 256 );
-		}
-		SRG_ResetEntropy( signEntropy );
-		SRG_FeedEntropy( signEntropy, (const uint8_t*)objBuf, objBufLen );
-		SRG_FeedEntropy( signEntropy, (const uint8_t*)outbuf, 32 );
-		fileKey = EncodeBase64Ex( outbuf, 32, &keyLen, (const char*)1 );
-		SRG_GetEntropyBuffer( signEntropy, (uint32_t*)outbuf, 256 );
-		SRG_DestroyEntropy( &signEntropy );
-		idBuf[0] = EncodeBase64Ex( outbuf, 256 / 8, idBufLen, (const char *)1 );
-		EnqueLink( &l.plqCrypters, signEntropy );
-		return fileKey;
-	}
-	else {
-		idBuf[0] = SRG_ID_Generator3();
-		idBufLen[0] = 42;
-		return idBuf[0];
-	}
-}
-#endif
 int CPROC sack_vfs_os_exists( struct sack_vfs_os_volume *vol, const char * file ) {
 	LOGICAL result;
 	while( LockedExchange( &vol->lock, 1 ) ) Relinquish();
@@ -92965,79 +95239,12 @@ size_t CPROC sack_vfs_os_write_internal( struct sack_vfs_os_file* file, const vo
 	size_t written = 0;
 	size_t ofs = file->fpi & BLOCK_MASK;
 	LOGICAL updated = FALSE;
+	(void)writeState;
 #ifdef DEBUG_DISK_DATA
 	lprintf( "Write to %p %d at %d", data_, length, file->fpi );
-	LogBinary( data, file->blockSize );
-#endif
-#ifdef XX_VIRTUAL_OBJECT_STORE
-	uint8_t* cdata;
-	size_t cdataLen;
-	if( file->readKey && !file->fpi ) {
-		enum block_cache_entries cache;
-		struct storageTimelineNode* time = getRawTimeEntry( file->vol, file->entry->timelineEntry, &cache GRTENoLog DBG_SRC );
-		SRG_XSWS_encryptData( (uint8_t*)data, length, time->time
-			, (const uint8_t*)file->readKey, file->readKeyLen
-			, &cdata, &cdataLen );
-		dropRawTimeEntry( file->vol, cache GRTENoLog DBG_SRC );
-		data = (const char*)cdata;
-		length = cdataLen;
-	}
-	else {
-		cdata = NULL;
-	}
+	LogBinary( data, length );
 #endif
 	while( LockedExchange( &file->vol->lock, 1 ) ) Relinquish();
-	if( file->entry->first_block != DIR_ALLOCATING_MARK )
-		if( file->flags.versioned )
-		{
-			// if versioned, but no limit, just do this.
-			if( file->entry->name_offset & DIRENT_NAME_OFFSET_VERSIONS ) {
-				// if there's a limit to the number of versions
-			}
-			{
-				int last = file->blockChainLength - 1;
-				enum block_cache_entries cache;
-				struct storageTimelineNode* timeline = getRawTimeEntry( file->vol, file->entry->timelineEntry, &cache GRTENoLog DBG_SRC );
-				timeline->priorDataPad = (uint16_t)( file->blockChain[last].size - ( file->entry->filesize & ( file->blockChain[last].size - 1 ) ) );
-				//timeline->priorData = file->entry->first_block;
-				timeline->priorData = file->entry->first_block;
-				timeline->priorDataSize = file->entry->filesize;
-				file->entry->first_block = DIR_ALLOCATING_MARK;
-				file->entry->filesize = 0;
-				file->filesize_ = 0;
-				file->blockChainLength = 0;
-				dropRawTimeEntry( file->vol, cache GRTENoLog DBG_SRC );
-			}
-			//lprintf( "this needs to result with the new timestamp" );
-			//file->entry->timelineEntry = file->entry->timelineEntry;
-			updated = TRUE;
-		} else {
-			// no versioning - so just keep 1 block so we get last write and first create
-			if( !( file->entry->name_offset & DIRENT_NAME_OFFSET_VERSIONS ) ) {
-				// don't have a new time block for write time; so create one
-				file->entry->timelineEntry = updateTimeEntryTime( NULL, file->vol, file->entry->timelineEntry, TRUE, NULL, 0 DBG_SRC );
-				file->entry->name_offset |= 1 << DIRENT_NAME_OFFSET_VERSION_SHIFT;
-			}
-			else {
-				// update the current time.
-				file->entry->timelineEntry = updateTimeEntryTime( NULL, file->vol, file->entry->timelineEntry, FALSE, NULL, 0 DBG_SRC );
-			}
-			//file->entry->timelineEntry = file->timeline.index;
-			updated = TRUE;
-		}
-#ifdef XX_VIRTUAL_OBJECT_STORE
-	if( (file->entry->name_offset) & DIRENT_NAME_OFFSET_FLAG_SEALANT ) {
-		char* filename;
-		size_t filenameLen = 64;
-		// read-only data block.
-		lprintf( "INCOMPLETE - TODO WRITE PATCH" );
-		char* sealer = getFilename( data, length, (char*)file->sealant, file->header.sealant.used, IS_OWNED( file ), &filename, &filenameLen );
-		struct sack_vfs_os_file* pFile = (struct sack_vfs_os_file*)sack_vfs_os_openfile( file->vol, filename );
-		pFile->sealant = (uint8_t*)sealer;
-		if( cdata ) Release( cdata );
-		return sack_vfs_os_write_internal( pFile, data, length, (POINTER)1 );
-	}
-#endif
 #ifdef DEBUG_FILE_OPS
 	LoG( "Write to file %p %" _size_f "  @%" _size_f, file, length, ofs );
 #endif
@@ -93065,13 +95272,7 @@ size_t CPROC sack_vfs_os_write_internal( struct sack_vfs_os_file* file, const vo
 				= _os_GetFreeBlock( file->vol, &cache, GFB_INIT_NONE, length > 4096 ? 4096 : length < 2048 ? BLOCK_SMALL_SIZE : 4096 );
 			else
 				file->block = vfs_os_GetNextBlock( file->vol, file->block, &cache, GFB_INIT_NONE, TRUE
-					,
-#ifdef XX_VIRTUAL_OBJECT_STORE
-					file->blockSize
-						? file->blockSize
-						:
-#endif
-					(length>4096)?4096:length<2048? BLOCK_SMALL_SIZE :4096, (int*)&blockSize );
+				, (length>4096)?4096:length<2048? BLOCK_SMALL_SIZE :4096, (int*)&blockSize );
 		}
 		else {
 			memcpy( block+ofs, data, length );
@@ -93090,13 +95291,6 @@ size_t CPROC sack_vfs_os_write_internal( struct sack_vfs_os_file* file, const vo
 	while( length ) {
 		enum block_cache_entries cache = BC( FILE );
 		uint8_t* block = (uint8_t*)vfs_os_BSEEK( file->vol, file->block,
-			/*
-#ifdef XX_VIRTUAL_OBJECT_STORE
-			file->blockSize
-			? file->blockSize
-			:
-#endif
-			*/
 			length > 4096 ? 4096 : length < 2048 ? BLOCK_SMALL_SIZE : 4096, &cache );
 		unsigned int blockSize = file->vol->sector_size[cache];
 		if( file->block == DIR_ALLOCATING_MARK ) {
@@ -93125,13 +95319,7 @@ size_t CPROC sack_vfs_os_write_internal( struct sack_vfs_os_file* file, const vo
 			length -= blockSize;
 			cache = BC( FILE );
 			file->block = vfs_os_GetNextBlock( file->vol, file->block, &cache, GFB_INIT_NONE, TRUE
-				,
-#ifdef XX_VIRTUAL_OBJECT_STORE
-				file->blockSize
-				? file->blockSize
-				:
-#endif
-				(length>4096)?4096:length<2048?BLOCK_SMALL_SIZE:4096, (int*)&blockSize );
+				, (length>4096)?4096:length<2048?BLOCK_SMALL_SIZE:4096, (int*)&blockSize );
 		}
 		else {
 			memcpy( block, data, length );
@@ -93146,20 +95334,12 @@ size_t CPROC sack_vfs_os_write_internal( struct sack_vfs_os_file* file, const vo
 			length = 0;
 		}
 	}
-#if 0
-	if( !writeState && file->sealant && (void*)file->sealant != (void*)data ) {
-		flushFileSuffix( file );
-		BLOCKINDEX saveSize = file->entry->filesize;
-		BLOCKINDEX saveFpi = file->fpi;
-		sack_vfs_os_write_internal( file, (char*)file->sealant, file->header.sealant.used, (POINTER)1 );
-		file->entry->filesize = saveSize;
-		file->fpi = saveFpi;
-	}
-#endif
+	if( written )
+		updated = TRUE;
 	if( updated ) {
+		file->entry->update_time = _os_GetCurrentTime();
 		SMUDGECACHE( file->vol, file->cache );
 	}
-	//if( cdata ) Release( cdata );
 	//if( !writeState )
 	file->vol->lock = 0;
 	return written;
@@ -93167,45 +95347,11 @@ size_t CPROC sack_vfs_os_write_internal( struct sack_vfs_os_file* file, const vo
 size_t CPROC sack_vfs_os_write( struct sack_vfs_os_file *file, const void * data_, size_t length ) {
 	return sack_vfs_os_write_internal( (struct sack_vfs_os_file* )file, data_, length, NULL );
 }
-#ifdef XX_VIRTUAL_OBJECT_STORE
-static enum sack_vfs_os_seal_states ValidateSeal( struct sack_vfs_os_file *file, char *data, size_t length ) {
-	BLOCKINDEX offset = (file->entry->name_offset );
-	uint32_t sealLen = (offset & DIRENT_NAME_OFFSET_FLAG_SEALANT) >> DIRENT_NAME_OFFSET_FLAG_SEALANT_SHIFT;
-// = (struct random_context *)DequeLink( &signingEntropies );
-	struct random_context *signEntropy;
-	uint8_t outbuf[32];
-	signEntropy = SRG_CreateEntropy4( NULL, (uintptr_t)0 );
-	SRG_ResetEntropy( signEntropy );
-	SRG_FeedEntropy( signEntropy, (const uint8_t*)file->sealant, file->header.sealant.used );
-	SRG_GetEntropyBuffer( signEntropy, (uint32_t*)outbuf, 256 );
-	if( (file->header.sealant.used != 32) || MemCmp( outbuf, file->sealant, 32 ) )
-		return SACK_VFS_OS_SEAL_INVALID;
-	SRG_ResetEntropy( signEntropy );
-	SRG_FeedEntropy( signEntropy, (const uint8_t*)data, length );
-	// DO NOT DOUBLE_PROCESS THIS DATA
-	SRG_FeedEntropy( signEntropy, (const uint8_t*)file->sealant, file->header.sealant.used );
-	SRG_GetEntropyBuffer( signEntropy, (uint32_t*)outbuf, 256 );
-	SRG_DestroyEntropy( &signEntropy );
-	{
-		enum sack_vfs_os_seal_states success = SACK_VFS_OS_SEAL_INVALID;
-		size_t len;
-		char *rid = EncodeBase64Ex( outbuf, 256 / 8, &len, (const char *)1 );
-		//if( StrCmp( file->filename, rid ) == 0 )
-		//	success = SACK_VFS_OS_SEAL_VALID;
-		Deallocate( char *, rid );
-		return success;
-	}
-}
-#endif
 size_t CPROC sack_vfs_os_read_internal( struct sack_vfs_os_file *file, uint64_t version, void * data_, size_t length ) {
 	char* data = (char*)data_;
 	size_t written = 0;
 	size_t ofs = file->fpi & BLOCK_MASK;
-#ifdef XX_VIRTUAL_OBJECT_STORE
-	if( (file->entry->name_offset ) & DIRENT_NAME_OFFSET_FLAG_READ_KEYED ) {
-		if( !file->readKey ) return 0;
-	}
-#endif
+	(void)version;
 	if( ( file->filesize_ ) < ( file->fpi + length ) ) {
 		if( ( file->filesize_ ) < file->fpi )
 			length = 0;
@@ -93264,40 +95410,6 @@ size_t CPROC sack_vfs_os_read_internal( struct sack_vfs_os_file *file, uint64_t 
 			length = 0;
 		}
 	}
-#ifdef XX_VIRTUAL_OBJECT_STORE
-	if( file->readKey
- //entry->filesize ) )
-	   && ( file->fpi == ( file->filesize_ ) )
-	   && ( (file->entry->name_offset)
-	      & DIRENT_NAME_OFFSET_FLAG_READ_KEYED) )
-	{
-		uint8_t *outbuf;
-		size_t outlen;
-		enum block_cache_entries cache;
-		struct storageTimelineNode* time = getRawTimeEntry( file->vol, file->entry->timelineEntry, &cache GRTENoLog DBG_SRC );
-		SRG_XSWS_decryptData( (uint8_t*)data, written, time->time
-		                    , (const uint8_t*)file->readKey, file->readKeyLen
-		                    , &outbuf, &outlen );
-		dropRawTimeEntry( file->vol, cache GRTENoLog DBG_SRC );
-		memcpy( data, outbuf, outlen );
-		Release( outbuf );
-		written = outlen;
-	}
-	if( file->sealant
-		&& (void*)file->sealant != (void*)data
- //file->entry->filesize ) ) {
-		&& length == ( file->filesize_ ) ) {
-		BLOCKINDEX saveSize = file->entry->filesize;
-		BLOCKINDEX saveFpi = file->fpi;
-		file->entry->filesize = ((file->entry->filesize
-			) + file->header.sealant.used + sizeof( BLOCKINDEX ))
-			;
-		sack_vfs_os_read_internal( file, 0, (char*)file->sealant, file->header.sealant.used );
-		file->entry->filesize = saveSize;
-		file->fpi = saveFpi;
-		file->sealed = ValidateSeal( file, data, length );
-	}
-#endif
 	return written;
 }
 size_t CPROC sack_vfs_os_read( struct sack_vfs_os_file* file, void* data_, size_t length ) {
@@ -93307,73 +95419,6 @@ size_t CPROC sack_vfs_os_read( struct sack_vfs_os_file* file, void* data_, size_
 	file->vol->lock = 0;
 	return result;
 }
-#ifdef XX_VIRTUAL_OBJECT_STORE
-static BLOCKINDEX sack_vfs_os_read_patches( struct sack_vfs_os_file *file ) {
-	size_t written = 0;
-	BLOCKINDEX saveFpi = file->fpi;
-	size_t length;
-	while( LockedExchange( &file->vol->lock, 1 ) ) Relinquish();
-//entry->filesize);
-	length = (size_t)(file->filesize_ );
-	if( !length ) { file->vol->lock = 0; return 0; }
-	sack_vfs_os_seek_internal( file, length, SEEK_SET );
-#if 0
-	if( file->sealant ) {
-		BLOCKINDEX saveSize = file->entry->filesize;
-		BLOCKINDEX patches;
-		//WriteIntoBlock( file, 0, 0, file->sealant, file->header.sealant.used );
-		file->entry->filesize = saveSize;
-		file->fpi = saveFpi;
-		file->sealed = SACK_VFS_OS_SEAL_LOAD;
-		return patches;
-	}
-#endif
-	file->vol->lock = 0;
-	return written;
-}
-static size_t sack_vfs_os_set_patch_block( struct sack_vfs_os_file *file, BLOCKINDEX patchBlock ) {
-	size_t written = 0;
-	size_t length;
-	BLOCKINDEX saveFpi = file->fpi;
-	while( LockedExchange( &file->vol->lock, 1 ) ) Relinquish();
-	length = (size_t)(file->entry->filesize);
-	if( !length ) { file->vol->lock = 0; return 0; }
-	sack_vfs_os_seek_internal( file, length, SEEK_SET );
-	if( file->header.sealant.avail ) {
-		sack_vfs_os_seek_internal( file, file->header.sealant.used, SEEK_CUR );
-		sack_vfs_os_write_internal( file, (char*)&patchBlock, sizeof( BLOCKINDEX ), NULL );
-		file->fpi = saveFpi;
-	} else {
-		BLOCKINDEX saveSize = file->entry->filesize;
-		sack_vfs_os_seek_internal( file, file->header.sealant.used, SEEK_CUR );
-		sack_vfs_os_write_internal( file, (char*)&patchBlock, sizeof( BLOCKINDEX ), NULL );
-		file->fpi = saveFpi;
-	}
-	file->vol->lock = 0;
-	return written;
-}
-static size_t sack_vfs_os_set_reference_block( struct sack_vfs_os_file *file, BLOCKINDEX patchBlock ) {
-	size_t written = 0;
-	size_t length;
-	BLOCKINDEX saveFpi = file->fpi;
-	while( LockedExchange( &file->vol->lock, 1 ) ) Relinquish();
-	length = (size_t)(file->entry->filesize);
-	if( !length ) { file->vol->lock = 0; return 0; }
-	sack_vfs_os_seek_internal( file, length, SEEK_SET );
-	if( file->sealant ) {
-		sack_vfs_os_seek_internal( file, file->header.sealant.used, SEEK_CUR );
-		sack_vfs_os_write_internal( file, (char*)&patchBlock, sizeof( BLOCKINDEX ), NULL );
-		file->fpi = saveFpi;
-	}
-	else {
-		sack_vfs_os_seek_internal( file, file->header.sealant.used, SEEK_CUR );
-		sack_vfs_os_write_internal( file, (char*)&patchBlock, sizeof( BLOCKINDEX ), NULL );
-		file->fpi = saveFpi;
-	}
-	file->vol->lock = 0;
-	return written;
-}
-#endif
 static void sack_vfs_os_unlink_file_entry( struct sack_vfs_os_volume *vol, struct sack_vfs_os_file *dirinfo, BLOCKINDEX first_block, LOGICAL deleted ) {
 	//FPI entFPI, struct directory_entry *entry, struct directory_entry *entkey
 	BLOCKINDEX block, _block;
@@ -93422,8 +95467,6 @@ static void sack_vfs_os_unlink_file_entry( struct sack_vfs_os_volume *vol, struc
 			} while( block != EOFBLOCK );
 		// this deletes the allocated name
 		// it also removes the directory entry from list of entries
- // timelineEntry type is larger than index in some configurations; but won't exceed those bounds
-		deleteTimelineIndex( vol, (BLOCKINDEX)dirinfo->entry->timelineEntry );
 		deleteDirectoryEntryName( vol, dirinfo, dirinfo->entry->name_offset & DIRENT_NAME_OFFSET_OFFSET, dirinfo->cache, dirinfo->dir_block );
 	}
 }
@@ -93497,6 +95540,7 @@ size_t CPROC sack_vfs_os_truncate_internal( struct sack_vfs_os_file *file ) {
 	if( file->entry->filesize != file->fpi ) {
 		file->filesize_ = file->entry->filesize = file->fpi;
 		_os_shrinkBAT( file );
+		file->entry->update_time = _os_GetCurrentTime();
 		SMUDGECACHE( file->vol, file->cache );
 	}
 	return (size_t)file->fpi;
@@ -93542,11 +95586,6 @@ int sack_vfs_os_close_internal( struct sack_vfs_os_file *file, int unlock ) {
 			SETMASK_( file->vol->seglock, seglock, file->cache, locks );
 		}
 	}
-	//Deallocate( char *, file->filename );
-#ifdef XX_VIRTUAL_OBJECT_STORE
-	if( file->sealant )
-		Deallocate( uint8_t*, file->sealant );
-#endif
 	if( file->vol->closed ) sack_vfs_os_unload_volume( file->vol );
 	if( unlock ) file->vol->lock = 0;
 	DeleteFromSet( VFS_OS_FILE, &l.files, file );
@@ -93629,21 +95668,8 @@ static int _os_iterate_find( struct sack_vfs_os_find_info *_info ) {
 			FPI name_ofs_ = name_ofs;
 			const char *filename, *filename_;
 			int l;
-			struct memoryTimelineNode time;
-			//enum block_cache_entries  timeCache = BC( TIMELINE );
-			reloadTimeEntry( &time, info->vol, (next_entries[n].timelineEntry) VTReadWrite GRTENoLog  DBG_SRC );
-			if( !time.disk->time ) DebugBreak();
-			if( time.disk->priorTime )
-			{
-				enum block_cache_entries cache;
-				struct storageTimelineNode* prior = getRawTimeEntry( info->vol, time.disk->priorTime, &cache GRTENoLog DBG_SRC );
-				while( prior->priorTime ) prior = getRawTimeEntry( info->vol, prior->priorTime, &cache GRTENoLog DBG_SRC );
-				info->ctime = (prior->time/1000000)<<8 | prior->timeTz;
-			}
-			else
-				info->ctime = (time.disk->time / 1000000) << 8 | time.disk->timeTz;
-			info->wtime = (time.disk->time / 1000000) << 8 | time.disk->timeTz;
-			dropRawTimeEntry( info->vol, time.diskCache GRTENoLog DBG_SRC );
+			info->ctime = _os_GetLocalTime( next_entries[n].update_time );
+			info->wtime = _os_GetLocalTime( next_entries[n].update_time );
 			// if file is deleted; don't check it's name.
 			info->filesize = (size_t)(next_entries[n].filesize);
 			if( (name_ofs) > info->vol->dwSize ) {
@@ -93831,70 +95857,11 @@ uintptr_t CPROC sack_vfs_os_file_ioctl_internal( struct sack_vfs_os_file* file, 
 	case SOSFSFIO_TAMPERED:
 	{
 		//struct sack_vfs_file *file = (struct sack_vfs_file *)psvInstance;
-#ifdef XX_VIRTUAL_OBJECT_STORE
-		int *result = va_arg( args, int* );
-		if( file->sealant ) {
-			switch( file->sealed ) {
-			case SACK_VFS_OS_SEAL_STORE:
-			case SACK_VFS_OS_SEAL_VALID:
-				(*result) = 1;
-            break;
-			default:
-				(*result) = 0;
-			}
-		}
-		else
-			(*result) = 1;
-#endif
 	}
 	break;
 	case SOSFSFIO_PROVIDE_SEALANT:
-#ifdef XX_VIRTUAL_OBJECT_STORE
-	{
-		const char *sealant = va_arg( args, const char * );
-		size_t sealantLen = va_arg( args, size_t );
-		lprintf( "This should be a higher level thing." );
-		//struct sack_vfs_file *file = (struct sack_vfs_file *)psvInstance;
-		{
-			size_t len;
-			if( file->sealant )
-				Release( file->sealant );
-			file->sealant = (uint8_t*)DecodeBase64Ex( sealant, sealantLen, &len, (const char*)1 );
-			_os_SetSmallBlockUsage( &file->header.sealant, (uint8_t)len );
-			//_os_UpdateFileBlocks( file );
-			if( file->sealed == SACK_VFS_OS_SEAL_NONE )
-				file->sealed = SACK_VFS_OS_SEAL_STORE;
-			else if( file->sealed == SACK_VFS_OS_SEAL_VALID || file->sealed == SACK_VFS_OS_SEAL_LOAD )
-				file->sealed = SACK_VFS_OS_SEAL_STORE_PATCH;
-			else
-				lprintf( "Unhandled SEAL state." );
-			//file->sealant = sealant;
-			//file->sealantLen = sealantLen;
-			// set the sealant length in the name offset.
-			file->entry->name_offset = (((file->entry->name_offset)
-				| ((len >> 2) << 17)) );
-		}
-	}
-#endif
 	break;
 	case SOSFSFIO_PROVIDE_READKEY:
-#ifdef XX_VIRTUAL_OBJECT_STORE
-	{
-		const char *sealant = va_arg( args, const char * );
-		size_t sealantLen = va_arg( args, size_t );
-		//struct sack_vfs_file *file = (struct sack_vfs_file *)psvInstance;
-		{
-			size_t len;
-			if( file->readKey )
-				Release( file->readKey );
-			file->readKey = (uint8_t*)DecodeBase64Ex( sealant, sealantLen, &len, (const char*)1 );
-			file->readKeyLen = (uint16_t)len;
-			// set the sealant length in the name offset.
-			file->entry->name_offset = (((file->entry->name_offset )
-				| DIRENT_NAME_OFFSET_FLAG_READ_KEYED) );
-		}
-	}
-#endif
 	break;
 	case SOSFSFIO_SET_TIME:
 	{
@@ -93908,7 +95875,7 @@ uintptr_t CPROC sack_vfs_os_file_ioctl_internal( struct sack_vfs_os_file* file, 
 		//uint64_t** timeArray = va_arg( args, uint64_t** );
 		//int8_t** tzArray = va_arg( args, int8_t** );
 		//size_t* timeCount  = va_arg( args, size_t* );
-		return file->entry->timelineEntry;
+		return _os_GetLocalTime( file->entry->update_time );
 	}
 	break;
 	case SOSFSFIO_GET_TIMES:
@@ -93922,8 +95889,6 @@ uintptr_t CPROC sack_vfs_os_file_ioctl_internal( struct sack_vfs_os_file* file, 
  // automatic managment is good enough?
 	case SOSFSFIO_SET_BLOCKSIZE:
 	{
-		//int size = va_arg( args, int );
-		//file->blockSize = size;
 	}
 	break;
 	}
@@ -93940,166 +95905,25 @@ uintptr_t CPROC sack_vfs_os_file_ioctl( struct sack_vfs_os_file *psvInstance, ui
 uintptr_t CPROC sack_vfs_os_system_ioctl_internal( struct sack_vfs_os_volume *vol, uintptr_t opCode, va_list args ) {
 	//va_list args;
 	//va_start( args, opCode );
+	(void)vol;
+	(void)args;
 	switch( opCode ) {
 	default:
 		// unhandled/ignored opcode
 		return FALSE;
 	case SOSFSSIO_OPEN_VERSION:
-		{
-			const char * name;name = va_arg( args, const char* );
-			uint64_t version = va_arg( args, uint64_t );
-			return (uintptr_t)sack_vfs_os_openfile_internal( vol, name, version, FALSE );
-		}
-		break;
 	case SOSFSSIO_NEW_VERSION:
-		{
-			const char * name;name = va_arg( args, const char* );
-			return (uintptr_t)sack_vfs_os_openfile_internal( vol, name, 0, TRUE );
-		}
-		break;
 	case SOSFSSIO_OPEN_TIMELINE:
-		{
-			return (uintptr_t)sack_vfs_os_get_time_cursor( vol );
-		}
-		break;
 	case SOSFSSIO_READ_TIMELINE:
-		{
-			struct sack_vfs_os_time_cursor* cursor;cursor = va_arg(args, struct sack_vfs_os_time_cursor* );
-			int step = va_arg( args, int );
-			uint64_t timestamp; timestamp = va_arg( args, uint64_t );
-			uint64_t* result_entry; result_entry = va_arg( args, uint64_t* );
-			const char ** filename;filename = va_arg( args, const char ** );
-			uint64_t* timestamp_result;timestamp_result = va_arg( args, uint64_t* );
-			int8_t* tz_result;tz_result = va_arg( args, int8_t* );
-			const char** buffer;buffer = va_arg( args, const char** );
-			size_t* size_result;size_result = va_arg( args, size_t* );
-			sack_vfs_os_read_time_cursor( cursor, step, timestamp, result_entry, filename, timestamp_result, tz_result, buffer, size_result );
-			return TRUE;
-		}
-		break;
 	case SOSFSSIO_LOAD_OBJECT:
 		return FALSE;
 	case SOSFSSIO_PATCH_OBJECT:
 		{
-		//LOGICAL owner;owner = va_arg( args, LOGICAL );  // seal input is a constant, generate random meta key
-		//char *objIdBuf;objIdBuf = va_arg( args, char * );
-		/*
-		size_t objIdBufLen = va_arg( args, size_t );
-		char *patchAuth = va_arg( args, char * );
-		size_t patchAuthLen = va_arg( args, size_t );
-		char *objBuf = va_arg( args, char * );
-		size_t objBufLen = va_arg( args, size_t );
-		char *sealBuf = va_arg( args, char * );
-		size_t sealBufLen = va_arg( args, size_t );
-		char *keyBuf = va_arg( args, char * );
-		size_t keyBufLen = va_arg( args, size_t );
-		char *idBuf = va_arg( args, char * );
-		size_t idBufLen = va_arg( args, size_t );
-		*/
-#ifdef XX_VIRTUAL_OBJECT_STORE
-		if( sack_vfs_os_exists( vol, objIdBuf ) ) {
-			struct sack_vfs_os_file* file = (struct sack_vfs_os_file*)sack_vfs_os_openfile( vol, objIdBuf );
-			BLOCKINDEX patchBlock = sack_vfs_os_read_patches( file );
-			enum block_cache_entries cacheSomething = BC(FILE);
-			if( !patchBlock ) {
-				patchBlock = _os_GetFreeBlock( vol, &cacheSomething, GFB_INIT_PATCHBLOCK, 4096 );
-			}
-			{
-				enum block_cache_entries cache;
-				struct directory_patch_block *newPatchblock;
-				cache = BC(FILE);
-				newPatchblock = BTSEEK( struct directory_patch_block *, vol, patchBlock, DIR_BLOCK_SIZE, cache );
-				while( 1 ) {
-					//char objId[45];
-					//size_t objIdLen;
-					char *seal = getFilename( objBuf, objBufLen, sealBuf, sealBufLen, FALSE, &idBuf, &idBufLen );
-					if( sack_vfs_os_exists( vol, idBuf ) ) {
- // accidental key collision.
-						if( !sealBuf ) {
- // try again.
-							continue;
-						}
-						else {
-							// deliberate key collision; and record already exists.
-							return TRUE;
-						}
-					}
-					else {
-						struct sack_vfs_os_file* file = (struct sack_vfs_os_file*)sack_vfs_os_openfile( vol, idBuf );
-						//  file->entry_fpi
-						newPatchblock->entries[newPatchblock->usedEntries].raw
-							= file->entry_fpi;
-						newPatchblock->usedEntries = (newPatchblock->usedEntries + 1);
-						SMUDGECACHE( vol, cache );
-						file->sealant = (uint8_t*)seal;
-						_os_SetSmallBlockUsage( &file->header.sealant, (uint8_t)strlen( seal ) );
-						//_os_UpdateFileBlocks( file );
-						sack_vfs_os_seek_internal( file, (size_t)GetBlockStart( file, FILE_BLOCK_DATA ), SEEK_SET );
-						sack_vfs_os_write_internal( file, objBuf, objBufLen, 0 );
-						sack_vfs_os_close_internal( file, FALSE );
-					}
-					return TRUE;
-				}
-			}
-		}
-#endif
  // object to patch was not found.
 		return FALSE;
 	}
 	break;
 	case SOSFSSIO_STORE_OBJECT:
-	#if 0
-	{
-  // seal input is a constant, generate random meta key
-		LOGICAL owner = va_arg( args, LOGICAL );
-		char *objBuf = va_arg( args, char * );
-		size_t objBufLen = va_arg( args, size_t );
-  // provided for re-write; provided also for private named objects
-		char *objIdBuf = va_arg( args, char * );
-		size_t objIdBufLen = va_arg( args, size_t );
-  // user provided sealant if any
-		char *sealBuf = va_arg( args, char * );
-		size_t sealBufLen = va_arg( args, size_t );
-  // encryption key
-		char *keyBuf = va_arg( args, char * );
-		size_t keyBufLen = va_arg( args, size_t );
-  // output buffer
-		char **idBuf = va_arg( args, char ** );
-		size_t *idBufLen = va_arg( args, size_t* );
-		while( 1 ) {
-			char *seal = getFilename( objBuf, objBufLen, sealBuf, sealBufLen, owner, idBuf, idBufLen );
-			if( sack_vfs_os_exists( vol, idBuf[0] ) ) {
- // accidental key collision.
-				if( !sealBuf ) {
- // try again.
-					continue;
-				}
-				else {
-					// deliberate key collision; and record already exists.
-					return TRUE;
-				}
-			}
-			else {
-				struct sack_vfs_os_file* file = (struct sack_vfs_os_file*)sack_vfs_os_openfile( vol, idBuf[0] );
-#ifdef XX_VIRTUAL_OBJECT_STORE
-				if( sealBuf ) {
-					file->sealant = (uint8_t*)seal;
-					_os_SetSmallBlockUsage( &file->header.sealant, (uint8_t)strlen( seal ) );
-					WriteIntoBlock( file, 0, 0, seal, strlen( seal ) );
-					//file->sealantLen = (uint8_t)strlen( seal );
-				} else {
-					file->sealant = NULL;
-					_os_SetSmallBlockUsage( &file->header.sealant, 0 );
-					//file->sealantLen = 0;
-				}
-#endif
-				sack_vfs_os_write_internal( file, objBuf, objBufLen, NULL );
-				sack_vfs_os_close_internal( file, FALSE );
-			}
-			return TRUE;
-		}
-	}
-#endif
 	break;
 	}
 	return 0;
@@ -94114,55 +95938,23 @@ uintptr_t CPROC sack_vfs_os_system_ioctl( struct sack_vfs_os_volume* vol, uintpt
 }
 LOGICAL sack_vfs_os_get_times( struct sack_vfs_os_file* file, uint64_t** timeArray, int8_t** tzArray, size_t* timeCount ) {
 	if( !timeArray ) return TRUE;
-	struct s_scratchTime {
-		uint64_t scratchTime;
-		uint8_t scratchTz;
-	} scratch;
-	PDATALIST pdlTimes = CreateDataList( sizeof( scratch ) );
-	struct sack_vfs_os_volume* vol = file->vol;
-	struct memoryTimelineNode time;
-	//enum block_cache_entries  timeCache = BC( TIMELINE );
-	reloadTimeEntry( &time, vol, file->entry->timelineEntry VTReadWrite GRTENoLog  DBG_SRC );
-	if( !time.disk->time ) DebugBreak();
-	scratch.scratchTime = time.disk->time;
-	scratch.scratchTz = time.disk->timeTz;
-	AddDataItem( &pdlTimes, &scratch );
-	if( time.disk->priorTime ) {
-		BLOCKINDEX priorTime = time.disk->priorTime;
-		while( priorTime ) {
-			enum block_cache_entries cache;
-			struct storageTimelineNode* prior = getRawTimeEntry( vol, priorTime, &cache GRTENoLog DBG_SRC );
-			scratch.scratchTime = prior->time;
-			scratch.scratchTz = prior->timeTz;
-			priorTime = prior->priorTime;
-			dropRawTimeEntry( file->vol, cache GRTENoLog DBG_SRC );
-			AddDataItem( &pdlTimes, &scratch );
-		}
+	timeArray[0] = NewArray( uint64_t, 1 );
+	timeArray[0][0] = file->entry->update_time;
+	if( tzArray ) {
+		tzArray[0] = NewArray( int8_t, 1 );
+		// stored times are UTC nanoseconds; this used to report the *reading* machine's
+		// zone, which said nothing about the writer.  Zero is the only honest answer.
+		tzArray[0][0] = 0;
 	}
-	dropRawTimeEntry( vol, time.diskCache GRTENoLog DBG_SRC );
-	timeArray[0] = NewArray( uint64_t, pdlTimes->Cnt );
-	tzArray[0] = NewArray( int8_t, pdlTimes->Cnt );
-	{
-		struct s_scratchTime* st;
-		INDEX idx;
-		DATA_FORALL( pdlTimes, idx, struct s_scratchTime*, st ) {
-			timeArray[0][idx] = st->scratchTime;
-			tzArray[0][idx] = st->scratchTz;
-		}
-	}
-	//MemCpy( timeArray[0], pdlTimes->data, pdlTimes->Cnt * sizeof( timeArray[0] ) );
-	timeCount[0] = pdlTimes->Cnt;
-	DeleteDataList( &pdlTimes );
+	if( timeCount ) timeCount[0] = 1;
 	return TRUE;
 }
+// timeVal is nanoseconds since the UNIX epoch, UTC; tz is vestigial and ignored.
 LOGICAL sack_vfs_os_set_time( struct sack_vfs_os_file* file, uint64_t timeVal, int8_t tz ) {
-	struct sack_vfs_os_volume* vol = file->vol;
-	struct memoryTimelineNode time;
-	//enum block_cache_entries  timeCache = BC( TIMELINE );
-	reloadTimeEntry( &time, vol, file->entry->timelineEntry VTReadWrite GRTENoLog  DBG_SRC );
-	//int tz = timeVal & 0xFF;
-	//timeVal = ( timeVal >> 8 ) * 1000000LL;
-	return setTimeEntryTime( &time, vol, timeVal, tz );
+	(void)tz;
+	file->entry->update_time = timeVal;
+	SMUDGECACHE( file->vol, file->cache );
+	return TRUE;
 }
 LOGICAL sack_vfs_os_halt( struct sack_vfs_os_volume* volume ) {
 	LOGICAL prior = volume->flags.halted;
@@ -94193,7 +95985,7 @@ static struct file_system_interface sack_vfs_os_fsi = {
                                                    , (LOGICAL(CPROC*)(uintptr_t, const char*))      sack_vfs_os_is_directory
                                                    , (LOGICAL(CPROC*)(uintptr_t, const char*, const char*))sack_vfs_os_rename
                                                    , (uintptr_t(CPROC*)(uintptr_t, uintptr_t, va_list))sack_vfs_os_file_ioctl_interface
-												   , (uintptr_t(CPROC*)(uintptr_t, uintptr_t, va_list))sack_vfs_os_system_ioctl_interface
+												   , NULL
 	, (uint64_t( CPROC*)(struct find_cursor* cursor)) sack_vfs_os_find_get_ctime
 	, (uint64_t( CPROC* )(struct find_cursor* cursor)) sack_vfs_os_find_get_wtime
 };
@@ -99364,6 +101156,8 @@ struct odbc_handle_tag{
 		BIT_FIELD bFailEnvOnDbcFail : 1;
 		// generate begintransaction and commit automatically.
 		BIT_FIELD bAutoTransact : 1;
+		BIT_FIELD bStartedAutoTransaction : 1;
+		BIT_FIELD bRestoreAutoTransact : 1;
  // use enter/leave critical section on this connector (auto transact protector)
 		volatile BIT_FIELD bThreadProtect : 1;
  // don't leave the connection open 100%; open when required and close when idle
@@ -99391,6 +101185,8 @@ struct odbc_handle_tag{
 	struct odbc_queue *queue;
 	void (CPROC*auto_commit_callback)(uintptr_t,PODBC);
 	uintptr_t auto_commit_callback_psv;
+	void (CPROC*auto_rollback_callback)(uintptr_t,PODBC);
+	uintptr_t auto_rollback_callback_psv;
 	void (CPROC*pCorruptionHandler)(uintptr_t psv, PODBC odbc);
 	uintptr_t psvCorruptionHandler;
 	void (*onOpen)( uintptr_t psv, PODBC odbc );
@@ -99715,7 +101511,7 @@ int xClose(sqlite3_file*file)
 				// they're the same structure type and everything, but C++ can't just assign them
 				// but C++ throws some warning about assignment with no trivial copy-assigment.
 				// (see above deleted operator)
-				memcpy( &check->locks_ , & my_file->locks_, sizeof( check->locks_ ) );
+				memcpy( (void*)&check->locks_, (const void*)&my_file->locks_, sizeof( check->locks_ ) );
 				my_file->locks = &check->locks_;
 			}
 			check->locks = my_file->locks;
@@ -100690,6 +102486,8 @@ struct odbc_handle_tag{
 		BIT_FIELD bFailEnvOnDbcFail : 1;
 		// generate begintransaction and commit automatically.
 		BIT_FIELD bAutoTransact : 1;
+		BIT_FIELD bStartedAutoTransaction : 1;
+		BIT_FIELD bRestoreAutoTransact : 1;
  // use enter/leave critical section on this connector (auto transact protector)
 		volatile BIT_FIELD bThreadProtect : 1;
  // don't leave the connection open 100%; open when required and close when idle
@@ -100717,6 +102515,8 @@ struct odbc_handle_tag{
 	struct odbc_queue *queue;
 	void (CPROC*auto_commit_callback)(uintptr_t,PODBC);
 	uintptr_t auto_commit_callback_psv;
+	void (CPROC*auto_rollback_callback)(uintptr_t,PODBC);
+	uintptr_t auto_rollback_callback_psv;
 	void (CPROC*pCorruptionHandler)(uintptr_t psv, PODBC odbc);
 	uintptr_t psvCorruptionHandler;
 	void (*onOpen)( uintptr_t psv, PODBC odbc );
@@ -101150,7 +102950,7 @@ struct pssql_global *global_sqlstub_data;
 //----------------------------------------------------------------------
 static void SqlStubInitLibrary( void );
 #ifndef __STATIC_GLOBALS__
-PRIORITY_PRELOAD( InitGlobalData, SQL_PRELOAD_PRIORITY )
+PRIORITY_PRELOAD( InitGlobalData, SQL_PRELOAD_PRIORITY - 3 )
 {
 	// is null initialized.
 	SimpleRegisterAndCreateGlobal( global_sqlstub_data );
@@ -102083,6 +103883,8 @@ void SetSQLLoggingDisable( PODBC odbc, LOGICAL bDisable )
 }
 void SetSQLThreadProtect( PODBC odbc, LOGICAL bEnable )
 {
+	if( !odbc )
+		odbc = g.odbc;
 	if( odbc )
 	{
 		EnterCriticalSec( &g.Init );
@@ -102098,22 +103900,39 @@ void SetSQLThreadProtect( PODBC odbc, LOGICAL bEnable )
 }
 void SetSQLAutoTransact( PODBC odbc, LOGICAL bEnable )
 {
+	if( !odbc )
+		odbc = g.odbc;
 	if( odbc )
-		if( odbc->flags.bAutoTransact = bEnable )
-			odbc->flags.bThreadProtect = 1;
+	{
+		odbc->flags.bAutoTransact = bEnable;
+		if( !bEnable )
+			odbc->flags.bRestoreAutoTransact = 0;
+		if( bEnable )
+			SetSQLThreadProtect( odbc, 1 );
+	}
 }
 void SetSQLAutoTransactCallback( PODBC odbc, void (CPROC*callback)(uintptr_t,PODBC), uintptr_t psv )
 {
+	if( !odbc )
+		odbc = g.odbc;
 	if( odbc )
 	{
-		if( callback ) {
-			odbc->flags.bAutoTransact = 1;
-			odbc->flags.bThreadProtect = 1;
-		}
+		if( callback )
+			SetSQLAutoTransact( odbc, 1 );
 		else
-			odbc->flags.bAutoTransact = 0;
+			SetSQLAutoTransact( odbc, 0 );
 		odbc->auto_commit_callback = callback;
 		odbc->auto_commit_callback_psv = psv;
+	}
+}
+void SetSQLRollbackCallback( PODBC odbc, void (CPROC*callback)(uintptr_t,PODBC), uintptr_t psv )
+{
+	if( !odbc )
+		odbc = g.odbc;
+	if( odbc )
+	{
+		odbc->auto_rollback_callback = callback;
+		odbc->auto_rollback_callback_psv = psv;
 	}
 }
 void SetSQLAutoClose( PODBC odbc, LOGICAL bEnable )
@@ -102440,8 +104259,8 @@ int OpenSQLConnectionEx( PODBC odbc DBG_PASS )
 #ifdef LOG_EVERYTHING
 			lprintf( "get hdbc" );
 #endif
-			if( rc = SQLAllocConnect( odbc->env,
-									  &odbc->hdbc ) )
+			if( ( rc = SQLAllocConnect( odbc->env,
+									  &odbc->hdbc ) ) )
 			{
 				lprintf( "Fatal error, Could not allocate SQL resource." );
 				SQLFreeEnv( odbc->env );
@@ -102714,8 +104533,27 @@ int OpenSQLConnection( PODBC odbc )
 	return OpenSQLConnectionEx( odbc DBG_SRC );
 }
 //----------------------------------------------------------------------
+static void StopAutoCommitThread( PODBC odbc, CTEXTSTR stalled_message )
+{
+ // either this is clear, called from thread, or called from user, and the thread needs to end.
+	if( odbc->auto_commit_thread )
+	{
+		uint32_t start = timeGetTime();
+		WakeThread( odbc->auto_commit_thread );
+		while( odbc->auto_commit_thread && ((start + 500) > timeGetTime()) ) {
+			Relinquish();
+		}
+		if( ((start + 500) < timeGetTime()) )
+			lprintf( "%s", stalled_message );
+	}
+}
+//----------------------------------------------------------------------
 void SQLCommit( PODBC odbc )
 {
+	if( !odbc )
+		odbc = g.odbc;
+	if( !odbc )
+		return;
 	// someone might not want it now, but we already started a thread for it....
 	//if( odbc->flags.bAutoTransact )
 	{
@@ -102731,25 +104569,59 @@ void SQLCommit( PODBC odbc )
 		if( odbc->last_command_tick )
 		{
 			int n = odbc->flags.bAutoTransact;
+			int restore_auto = !odbc->flags.bStartedAutoTransaction && odbc->flags.bRestoreAutoTransact;
 			odbc->last_command_tick = 0;
- // either this is clear, called from thread, or called from user, and the thread needs to end.
-			if( odbc->auto_commit_thread )
-			{
-				uint32_t start = timeGetTime();
-				WakeThread( odbc->auto_commit_thread );
-				while( odbc->auto_commit_thread && ((start + 500) > timeGetTime()) ) {
-					WakeableSleep( 1 );
-				}
-				if( ((start + 500) < timeGetTime()) )
-					lprintf( "Auto commit thread stalled." );
-			}
+			StopAutoCommitThread( odbc, "Auto commit thread stalled." );
 			// need to end the thread here too....
 			odbc->flags.bAutoTransact = 0;
 			// the commit command itself will cause SQLCommit to be called - so we turn off autotransact and would create a transaction thread etc...
 			SQLCommand( odbc, "COMMIT" );
-			odbc->flags.bAutoTransact = n;
+			odbc->flags.bAutoTransact = restore_auto || n;
+			odbc->flags.bRestoreAutoTransact = 0;
+			odbc->flags.bStartedAutoTransaction = 0;
 			if( odbc->auto_commit_callback )
 				odbc->auto_commit_callback( odbc->auto_commit_callback_psv, odbc );
+		}
+		if( odbc->flags.bThreadProtect )
+		{
+			odbc->nProtect--;
+			LeaveCriticalSec( &odbc->cs );
+		}
+	}
+}
+void SQLRollback( PODBC odbc )
+{
+	if( !odbc )
+		odbc = g.odbc;
+	if( !odbc )
+		return;
+	// someone might not want it now, but we already started a thread for it....
+	//if( odbc->flags.bAutoTransact )
+	{
+		if( odbc->flags.bThreadProtect )
+		{
+			EnterCriticalSec( &odbc->cs );
+			odbc->nProtect++;
+		}
+		// we will own the odbc here, so the timer will either block, or
+		// have completed, releasing this.
+		// maybe we don't have a pending commit.... (wouldn't if the timer hit just before we ran)
+ // otherwise we won't need a commit
+		if( odbc->last_command_tick )
+		{
+			int n = odbc->flags.bAutoTransact;
+			int restore_auto = !odbc->flags.bStartedAutoTransaction && odbc->flags.bRestoreAutoTransact;
+			odbc->last_command_tick = 0;
+			StopAutoCommitThread( odbc, "Auto commit thread stalled in rollback." );
+			// need to end the thread here too....
+			odbc->flags.bAutoTransact = 0;
+			// the commit command itself will cause SQLCommit to be called - so we turn off autotransact and would create a transaction thread etc...
+			SQLCommand( odbc, "ROLLBACK" );
+			odbc->flags.bAutoTransact = restore_auto || n;
+			odbc->flags.bRestoreAutoTransact = 0;
+			odbc->flags.bStartedAutoTransaction = 0;
+			if( odbc->auto_rollback_callback )
+				odbc->auto_rollback_callback( odbc->auto_rollback_callback_psv, odbc );
 		}
 		if( odbc->flags.bThreadProtect )
 		{
@@ -102900,6 +104772,20 @@ static void BeginTransactEx( PODBC odbc, int force )
 		odbc = g.odbc;
 	if( !odbc )
 		return;
+	if( force && odbc->last_command_tick )
+	{
+		if( odbc->flags.bStartedAutoTransaction ) {
+			lprintf( "SQLBeginTransact requested while auto transaction is pending; committing auto transaction first." );
+			SQLCommit( odbc );
+		}
+		else
+		{
+			lprintf( "SQLBeginTransact requested while explicit transaction is already pending." );
+			return;
+		}
+	}
+	if( force )
+		StopAutoCommitThread( odbc, "Auto commit thread stalled before explicit transaction." );
 	if( odbc->flags.bAutoTransact || force )
 	{
 		uint32_t newtick = timeGetTime();
@@ -102914,11 +104800,18 @@ static void BeginTransactEx( PODBC odbc, int force )
 		{
 			int prior;
 			odbc->last_command_tick = newtick;
+			odbc->flags.bStartedAutoTransaction = !force;
 			if( !force && !odbc->auto_commit_thread )
 			{
 				odbc->auto_commit_thread = ThreadTo( CommitThread, (uintptr_t)odbc );
 			}
 			prior = odbc->flags.bAutoTransact;
+			if( force )
+				odbc->flags.bRestoreAutoTransact = 0;
+			if( force && prior ) {
+				lprintf( "SQLBeginTransact suspending AutoTransact until commit or rollback." );
+				odbc->flags.bRestoreAutoTransact = 1;
+			}
 			odbc->flags.bAutoTransact = 0;
 #if defined( USE_SQLITE ) || defined( USE_SQLITE_INTERFACE )
 			if( odbc->flags.bSQLite_native )
@@ -102935,11 +104828,16 @@ static void BeginTransactEx( PODBC odbc, int force )
 			{
 				SQLCommand( odbc, "START TRANSACTION" );
 			}
-			odbc->flags.bAutoTransact = prior;
+			if( !force )
+				odbc->flags.bAutoTransact = prior;
 		}
  // update the tick.
 		else
+		{
+			if( !force && !odbc->flags.bStartedAutoTransaction )
+				lprintf( "AutoTransact command observed while explicit transaction is pending." );
 			odbc->last_command_tick = newtick;
+		}
 		//lprintf( "%p gets %lu", odbc, odbc->last_command_tick );
 	}
 	//else
@@ -102950,7 +104848,7 @@ void SQLBeginTransact( PODBC odbc ) {
 	BeginTransactEx( odbc, 1 );
 }
 //----------------------------------------------------------------------
-static int __DoSQLQueryExx( PODBC odbc, PCOLLECT collection, CTEXTSTR query, size_t queryLength, PDATALIST pdlParams DBG_PASS );
+static int __DoSQLQueryExx( PODBC odbc, PCOLLECT collection, CTEXTSTR query, size_t queryLength, PNVDATALIST pdlParams DBG_PASS );
 void DispatchPriorRequests( PODBC odbc )
 {
 	PCOLLECT collection, next;
@@ -103580,11 +105478,14 @@ int DumpInfoEx( PODBC odbc, PVARTEXT pvt, SQLSMALLINT type, SQLHANDLE *handle, L
 				//
 				//return 0;
 			}
+			//  (S1000)[5014]:[ma-3.1.15][10.11.13-MariaDB-0ubuntu0.24.04.1]Write error: Broken pipe (32)
 			// native 2003 == could not connect... (do not retry)
 			// native 2013 == lost connection during query.
 			// state 08S01, native 5014 == (mariadb) Connection reset by peer (104)
+			// state S1000, native 5014 == (mariadb) Connection reset by peer (104)
 			if( ( ( strcmp( statecode, "S1T00" ) == 0 ) ||
-				 ( strcmp( statecode, "08S01" ) == 0 ) )
+				 ( strcmp( statecode, "08S01" ) == 0 ) ||
+				 ( strcmp( statecode, "S1000" ) == 0 ) )
 				&& ( native == 2013 || native == 5014 ) )
 			{
 				if( g.feedback_handler ) g.feedback_handler( "SQL Connection Lost...\nWaiting for reconnect..." );
@@ -103712,19 +105613,33 @@ void ReleaseODBC( PODBC odbc )
 void CloseDatabaseEx( PODBC odbc, LOGICAL ReleaseConnection )
 {
 	uint32_t tick = (uint32_t)timeGetTime64();
+	if( !odbc )
+		return;
 	ReleaseODBC( odbc );
-	odbc->flags.bClosed = 1;
 	odbc->flags.bAutoCheckpoint = 0;
-	odbc->last_command_tick = 0;
 	while( ( ((uint32_t)timeGetTime64() - tick) < 100 ) && odbc->auto_checkpoint_thread ) {
 		WakeThread( odbc->auto_checkpoint_thread );
 		Relinquish();
 	}
-	if( odbc->auto_commit_thread )
+	if( odbc->last_command_tick && odbc->flags.bStartedAutoTransaction )
 	{
+		// Auto-transact batches short bursts and is expected to flush as a
+		// commit; only user-started transactions fall through to rollback.
 		SQLCommit( odbc );
-		WakeThread( odbc->auto_commit_thread );
 	}
+	else if( odbc->last_command_tick )
+	{
+		// Closing a connection with an open transaction rolls it back; do it
+		// explicitly so the rollback callback observes the same outcome.
+		SQLRollback( odbc );
+	}
+	else if( odbc->auto_commit_thread )
+	{
+		if( odbc->auto_commit_thread )
+			WakeThread( odbc->auto_commit_thread );
+	}
+	odbc->last_command_tick = 0;
+	odbc->flags.bClosed = 1;
 #if defined( USE_SQLITE ) || defined( USE_SQLITE_INTERFACE )
 	if( odbc->flags.bSQLite_native )
 	{
@@ -104756,7 +106671,8 @@ int __GetSQLResult( PODBC odbc, PCOLLECT collection, int bMore )
 									if( strcmp( (const char *)state, "01004" ) == 0 ){
 										useCollector = TRUE;
 										if( !pvtDataCollector ) pvtDataCollector = VarTextCreate();
-										VarTextAddData( pvtDataCollector, byResult, ResultLen );
+										VarTextAddData( pvtDataCollector, byResult, colsize );
+										rc = SQL_SUCCESS_WITH_INFO;
 									}else {
 										break;
 									}
@@ -104769,6 +106685,7 @@ int __GetSQLResult( PODBC odbc, PCOLLECT collection, int bMore )
 							}
 							else {
 								if( pvtDataCollector && useCollector ){
+									VarTextAddData(pvtDataCollector, byResult, ResultLen);
 									PTEXT data = VarTextPeek( pvtDataCollector );
 									val->stringLen = GetTextSize( data );
 									val->string = NewArray( char, val->stringLen );
@@ -105167,7 +107084,7 @@ int __GetSQLResult( PODBC odbc, PCOLLECT collection, int bMore )
 	//}
 	return retry;
 }
-void ReleaseSQLRecord( PDATALIST pdlResults );
+void ReleaseSQLRecord( PNVDATALIST pdlResults );
 int FetchSQLRecordJS( PODBC odbc, PDATALIST *ppdlRecord ) {
 	if( ppdlRecord ) {
 		if( !odbc )
@@ -105311,7 +107228,7 @@ int GetSQLResult( CTEXTSTR *result )
 }
 //-----------------------------------------------------------------------
 #if defined USE_ODBC
-static void __DoODBCBinding( HSTMT hstmt, PDATALIST pdlItems ) {
+static void __DoODBCBinding( HSTMT hstmt, PNVDATALIST pdlItems ) {
 	INDEX idx;
 	struct jsox_value_container *val;
 	DATA_FORALL( pdlItems, idx, struct jsox_value_container *, val ) {
@@ -105439,7 +107356,7 @@ static void __DoODBCBinding( HSTMT hstmt, PDATALIST pdlItems ) {
 }
 #endif
 #if defined( USE_SQLITE ) || defined( USE_SQLITE_INTERFACE )
-static void __DoSQLiteBinding( sqlite3_stmt *db, PDATALIST pdlItems ) {
+static void __DoSQLiteBinding( sqlite3_stmt *db, PNVDATALIST pdlItems ) {
 	INDEX idx;
 	struct jsox_value_container *val;
 	DATA_FORALL( pdlItems, idx, struct jsox_value_container *, val ) {
@@ -105490,7 +107407,7 @@ static void __DoSQLiteBinding( sqlite3_stmt *db, PDATALIST pdlItems ) {
 }
 #endif
 //-----------------------------------------------------------------------
-int __DoSQLQueryExx( PODBC odbc, PCOLLECT collection, CTEXTSTR query, size_t queryLength, PDATALIST pdlParams DBG_PASS )
+int __DoSQLQueryExx( PODBC odbc, PCOLLECT collection, CTEXTSTR query, size_t queryLength, PNVDATALIST pdlParams DBG_PASS )
 {
 	size_t queryLen;
 	PTEXT tmp = NULL;
@@ -105635,7 +107552,7 @@ int __DoSQLQueryExx( PODBC odbc, PCOLLECT collection, CTEXTSTR query, size_t que
 			//DebugBreak();
 			tmp = sqlite3_errmsg(odbc->db);
 			// this will have to have a Char based version
-			if( strnicmp( tmp, "no such table", 13 ) == 0 )
+			if( StrCaseCmpEx( tmp, "no such table", 13 ) == 0 )
 				vtprintf( collection->pvt_errorinfo, "(S0002)" );
 			vtprintf( collection->pvt_errorinfo, "Result of prepare failed? (%d) %s at-or near char %" _size_f "[%" _cstring_f "] in [%" _string_f "]", rc3, tmp, tail - query, tail, query );
 			if( EnsureLogOpen(odbc ) )
@@ -105868,7 +107785,7 @@ void ReleaseSQLResults( PDATALIST *ppdlResults ) {
 	//jsox_dispose_message( ppdlResults );
 }
 //-----------------------------------------------------------------------
-void ReleaseSQLRecord( PDATALIST pdlResults ) {
+void ReleaseSQLRecord( PNVDATALIST pdlResults ) {
 	//lprintf( "Releasing SQL record properly? %p", pdlResults, pdlResults->Cnt );
 	if( pdlResults ) {
 		INDEX idx;
@@ -105893,7 +107810,7 @@ int SQLRecordQuery_js( PODBC odbc
                      , CTEXTSTR query
                      , size_t queryLen
                      , PDATALIST *pdlResults
-                     , PDATALIST pdlParams
+                     , PNVDATALIST pdlParams
                      DBG_PASS )
 {
 	PODBC use_odbc;
@@ -105980,7 +107897,7 @@ int SQLRecordQuery_v4( PODBC odbc
 	, CTEXTSTR **result
 	, size_t **resultLengths
 	, CTEXTSTR **fields
-	, PDATALIST pdlParams
+	, PNVDATALIST pdlParams
 	DBG_PASS )
 {
 	PODBC use_odbc;
@@ -110164,6 +112081,8 @@ struct odbc_handle_tag{
 		BIT_FIELD bFailEnvOnDbcFail : 1;
 		// generate begintransaction and commit automatically.
 		BIT_FIELD bAutoTransact : 1;
+		BIT_FIELD bStartedAutoTransaction : 1;
+		BIT_FIELD bRestoreAutoTransact : 1;
  // use enter/leave critical section on this connector (auto transact protector)
 		volatile BIT_FIELD bThreadProtect : 1;
  // don't leave the connection open 100%; open when required and close when idle
@@ -110191,6 +112110,8 @@ struct odbc_handle_tag{
 	struct odbc_queue *queue;
 	void (CPROC*auto_commit_callback)(uintptr_t,PODBC);
 	uintptr_t auto_commit_callback_psv;
+	void (CPROC*auto_rollback_callback)(uintptr_t,PODBC);
+	uintptr_t auto_rollback_callback_psv;
 	void (CPROC*pCorruptionHandler)(uintptr_t psv, PODBC odbc);
 	uintptr_t psvCorruptionHandler;
 	void (*onOpen)( uintptr_t psv, PODBC odbc );
@@ -111556,6 +113477,75 @@ SQLGETOPTION_PROC( int, SACK_GetProfileBlob )( CTEXTSTR pSection, CTEXTSTR pOptn
    return SACK_GetProfileBlobOdbc( og.Option, pSection, pOptname, pBuffer, pnBuffer );
 }
 //------------------------------------------------------------------------
+// Plain read of an option's string value.
+//
+// Unlike SACK_GetProfileString(), these do not take a default, and reading is not a write:
+// when the option does not exist it is NOT created/materialized in the option tree, and nothing
+// is stored.  The value comes back by reference like SACK_GetProfileBlob() does, so no maximum
+// option length has to be known up front; the returned buffer is allocated and belongs to the
+// caller ( Release() it ).  Length is in characters, and the buffer is null terminated as a
+// convenience even though the length is returned.
+//
+// Returns TRUE when the option exists and has a value ( an empty value still reads TRUE with
+// length 0, so "missing" and "present but empty" stay distinguishable ), else FALSE with the
+// caller's pointer left untouched.
+SQLGETOPTION_PROC( int, SACK_ReadPrivateProfileStringOdbc )( PODBC odbc, CTEXTSTR pSection, CTEXTSTR pOptname, TEXTCHAR **pBuffer, size_t *pnBuffer, CTEXTSTR pINIFile )
+{
+	POPTION_TREE_NODE optval;
+	LOGICAL drop_odbc = FALSE;
+	int success = FALSE;
+	EnterCriticalSec( &og.cs_option );
+	if( !odbc )
+	{
+		odbc = GetOptionODBC( GetDefaultOptionDatabaseDSN() );
+		drop_odbc = TRUE;
+	}
+	if( !pINIFile )
+		pINIFile = DEFAULT_PUBLIC_KEY;
+	else
+	{
+		TEXTCHAR buf[128];
+		pINIFile = ResolveININame( odbc, pSection, buf, pINIFile );
+	}
+	// bCreate FALSE - a read must not add the option to the tree.
+	optval = GetOptionIndexExx( odbc, OPTION_ROOT_VALUE, NULL, pINIFile, pSection, pOptname, FALSE, FALSE DBG_SRC );
+	if( optval )
+	{
+		TEXTCHAR *value = NULL;
+		size_t len = 0;
+		if( ( GetOptionStringValueEx( odbc, optval, &value, &len DBG_SRC ) != INVALID_INDEX ) && value )
+		{
+			// value points into an internal rotating result buffer; return a copy the caller owns.
+			if( pBuffer )
+			{
+				(*pBuffer) = NewArray( TEXTCHAR, len + 1 );
+				if( len )
+					MemCpy( (*pBuffer), value, len * sizeof( TEXTCHAR ) );
+				(*pBuffer)[len] = 0;
+			}
+			if( pnBuffer )
+				(*pnBuffer) = len;
+			success = TRUE;
+		}
+	}
+	if( drop_odbc )
+		DropOptionODBC( odbc );
+	LeaveCriticalSec( &og.cs_option );
+	return success;
+}
+SQLGETOPTION_PROC( int, SACK_ReadPrivateProfileString )( CTEXTSTR pSection, CTEXTSTR pOptname, TEXTCHAR **pBuffer, size_t *pnBuffer, CTEXTSTR pINIFile )
+{
+	return SACK_ReadPrivateProfileStringOdbc( og.Option, pSection, pOptname, pBuffer, pnBuffer, pINIFile );
+}
+SQLGETOPTION_PROC( int, SACK_ReadProfileStringOdbc )( PODBC odbc, CTEXTSTR pSection, CTEXTSTR pOptname, TEXTCHAR **pBuffer, size_t *pnBuffer )
+{
+	return SACK_ReadPrivateProfileStringOdbc( odbc, pSection, pOptname, pBuffer, pnBuffer, NULL );
+}
+SQLGETOPTION_PROC( int, SACK_ReadProfileString )( CTEXTSTR pSection, CTEXTSTR pOptname, TEXTCHAR **pBuffer, size_t *pnBuffer )
+{
+	return SACK_ReadPrivateProfileStringOdbc( og.Option, pSection, pOptname, pBuffer, pnBuffer, NULL );
+}
+//------------------------------------------------------------------------
 SQLGETOPTION_PROC( int32_t, SACK_GetProfileIntEx )( CTEXTSTR pSection, CTEXTSTR pOptname, int32_t defaultval, LOGICAL bQuiet )
 {
    return SACK_GetPrivateProfileIntEx( pSection, pOptname, defaultval, NULL, bQuiet );
@@ -111850,7 +113840,7 @@ static void CloseAllODBC( CTEXTSTR dsn ) {
 		LIST_FORALL( tracker->outstanding, idx, PODBC, odbc ) {
 			CloseDatabaseEx( odbc, FALSE );
 		}
-		while( odbc = (PODBC)DequeLink( &tracker->available ) ) {
+		while( (odbc = (PODBC)DequeLink( &tracker->available )) ) {
 			CloseDatabaseEx( odbc, FALSE );
 			AddLink( &list, odbc );
 		}
@@ -112969,16 +114959,16 @@ TRANSLATION_PROC void TRANSLATION_API LoadTranslationDataFromFile( FILE *file );
 /*
    return: PLIST is a list of PTranslation
 */
-TRANSLATION_PROC PLIST TRANSLATION_API GetTranslations( void );
+TRANSLATION_PROC PNVLIST TRANSLATION_API GetTranslations( void );
 TRANSLATION_PROC CTEXTSTR TRANSLATION_API GetTranslationName( struct translation *translation );
 /*
 	return: PLIST of CTEXTSTR which are result strings of this translation
 */
-TRANSLATION_PROC PLIST TRANSLATION_API GetTranslationStrings( struct translation *translation );
+TRANSLATION_PROC PNVLIST TRANSLATION_API GetTranslationStrings( struct translation *translation );
 /*
   return: PLIST of CTEXTSTR which are source index strings
   */
-TRANSLATION_PROC PLIST TRANSLATION_API GetTranslationIndexStrings( );
+TRANSLATION_PROC PNVLIST TRANSLATION_API GetTranslationIndexStrings( );
 SACK_TRANSLATION_NAMESPACE_END
 USE_TRANSLATION_NAMESPACE
 #endif
@@ -113038,7 +115028,7 @@ static CTEXTSTR SaveString( PSTRINGSPACE *root, uint32_t index, CTEXTSTR text )
 		space = New( STRINGSPACE );
 		space->nextname = 0;
 		//lprintf( "Adding new namespace %p", space );
-		if( space->next = root[0] )
+		if( ( space->next = root[0] ) )
 			root[0]->me = &space->next;
 		space->me = root;
 		root[0] = space;
@@ -113317,17 +115307,17 @@ CTEXTSTR GetTranslationName( struct translation *translation )
 	return translation->name;
 }
 //---------------------------------------------------------------------------
-PLIST GetTranslations( void )
+PNVLIST GetTranslations( void )
 {
 	return translate_local.translations;
 }
 //---------------------------------------------------------------------------
-PLIST GetTranslationStrings( struct translation *translation )
+PNVLIST GetTranslationStrings( struct translation *translation )
 {
 	return translation->strings;
 }
 //---------------------------------------------------------------------------
-PLIST GetTranslationIndexStrings( void )
+PNVLIST GetTranslationIndexStrings( void )
 {
 	return translate_local.index_list;
 }
@@ -113725,7 +115715,16 @@ void InvokeDeadstart( void )
 			sigemptyset(&sact.sa_mask);
 			//sigaddset( &sact.sa_mask, SIGINT );
 			sact.sa_flags = SA_SIGINFO | SA_NODEFER;
+			// NOTE: __MAC__ and __LINUX__ are both defined on macOS, so the
+			// restorer must be excluded specifically for the Apple/BSD case.
+#if defined( __MAC__ )
+			// BSD/macOS `struct sigaction` has no sa_restorer member; the
+			// handler pointers live in the __sigaction_u union and the field
+			// is already zeroed by the MemSet above.
+#else
+			// glibc/Linux: clear the (obsolete) restorer trampoline pointer.
 			sact.sa_restorer = NULL;
+#endif
 			// this means I have to generate a terminate myself....
 			//sigaction(SIGINT, &sact, &l.prior_sigint);
 			//fprintf( stderr, "Registered sigint handler...\n");
